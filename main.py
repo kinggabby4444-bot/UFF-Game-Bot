@@ -4526,10 +4526,8 @@ def main():
             # timer will be (re)scheduled automatically when that round
             # ends, via _scramble_handle_win()/scramble_timeout_callback().
 
-    print("GAME BOT: starting polling", flush=True)
-    print("🤖 UFF Game Bot is running...", flush=True)
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    return app
 
 
 if __name__ == "__main__":
-    main()
+    pass
