@@ -83,14 +83,20 @@ async def health(request):
 
 
 async def game_webhook(request):
-    data = await request.json()
-    game_runner.submit_update(data)
+    try:
+        data = await request.json()
+        game_runner.submit_update(data)
+    except Exception:
+        logger.exception("Failed to submit update to game bot")
     return web.Response(text="OK")
 
 
 async def ads_webhook(request):
-    data = await request.json()
-    ads_runner.submit_update(data)
+    try:
+        data = await request.json()
+        ads_runner.submit_update(data)
+    except Exception:
+        logger.exception("Failed to submit update to ads bot")
     return web.Response(text="OK")
 
 
