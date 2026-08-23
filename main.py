@@ -708,21 +708,22 @@ async def _scramble_auto_continue(context: ContextTypes.DEFAULT_TYPE, chat_id, w
 
 
 async def start_scramble_round(context: ContextTypes.DEFAULT_TYPE, chat):
-    if db.get_config("scramble_maintenance_mode", "0") == "1":
+    maintenance = await asyncio.to_thread(db.get_config, "scramble_maintenance_mode", "0")
+    if maintenance == "1":
         return "maintenance"
 
-    if db.scramble_get_round(chat.id):
+    if await asyncio.to_thread(db.scramble_get_round, chat.id):
         return False
 
-    word = scramble_random_word(chat.id)
+    word = await asyncio.to_thread(scramble_random_word, chat.id)
     if not word:
         return None
 
     scrambled = scramble_letters(word)
-    db.scramble_start_round(chat.id, word, scrambled)
+    await asyncio.to_thread(db.scramble_start_round, chat.id, word, scrambled)
 
     if chat.type != ChatType.PRIVATE:
-        db.scramble_register_group(chat.id, chat.title or str(chat.id))
+        await asyncio.to_thread(db.scramble_register_group, chat.id, chat.title or str(chat.id))
 
     await safe_send(
         context.bot,
@@ -747,10 +748,10 @@ async def wordscramble_command(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     user = update.effective_user
-    db.scramble_increment_played(user.id, chat.id, user.first_name)
+    await asyncio.to_thread(db.scramble_increment_played, user.id, chat.id, user.first_name)
 
-    if _slowmode_enabled(chat.id) and not db.scramble_get_round(chat.id):
-        interval = db.get_scramble_slowmode(chat.id)[0]
+    if _slowmode_enabled(chat.id) and not await asyncio.to_thread(db.scramble_get_round, chat.id):
+        interval = (await asyncio.to_thread(db.get_scramble_slowmode, chat.id))[0]
         await update.message.reply_text(
             f"🐢 Slow mode is on - a new round starts automatically every {_format_duration_words(interval)}. Please wait."
         )
@@ -795,7 +796,7 @@ async def _scramble_handle_win(context: ContextTypes.DEFAULT_TYPE, chat, user, m
     - Neither: winner message + "Play again with /wordscramble", no
       auto-continuation - unchanged normal/manual behaviour.
     """
-    word = db.scramble_claim_round(chat.id)
+    word = await asyncio.to_thread(db.scramble_claim_round, chat.id)
     if not word:
         return
 
@@ -805,13 +806,13 @@ async def _scramble_handle_win(context: ContextTypes.DEFAULT_TYPE, chat, user, m
 
     reward = get_scramble_reward()
 
-    db.scramble_reset_all_streaks_in_chat(chat.id, user.id)
-    new_streak = db.scramble_record_win(user.id, chat.id, user.first_name, reward)
+    await asyncio.to_thread(db.scramble_reset_all_streaks_in_chat, chat.id, user.id)
+    new_streak = await asyncio.to_thread(db.scramble_record_win, user.id, chat.id, user.first_name, reward)
 
     bonus = SCRAMBLE_STREAK_MILESTONES.get(new_streak)
     total = reward
     if bonus:
-        db.scramble_add_bonus(user.id, chat.id, user.first_name, bonus)
+        await asyncio.to_thread(db.scramble_add_bonus, user.id, chat.id, user.first_name, bonus)
         total += bonus
 
     mention = f'<a href="tg://user?id={user.id}">{esc(user.first_name)}</a>'
@@ -824,7 +825,7 @@ async def _scramble_handle_win(context: ContextTypes.DEFAULT_TYPE, chat, user, m
         lines.append(f"🔥 {new_streak}-win streak! Bonus: +{DOLLAR}{bonus}")
         lines.append(f"Total: {DOLLAR}{total}")
 
-    slow = db.get_scramble_slowmode(chat.id)
+    slow = await asyncio.to_thread(db.get_scramble_slowmode, chat.id)
     slow_enabled = bool(slow and slow[1])
 
     if slow_enabled:
@@ -834,7 +835,7 @@ async def _scramble_handle_win(context: ContextTypes.DEFAULT_TYPE, chat, user, m
         schedule_slowmode_next_round(context.job_queue, chat.id, interval_seconds)
         return
 
-    _, auto_enabled, _ = db.scramble_get_auto_mode(chat.id)
+    _, auto_enabled, _ = await asyncio.to_thread(db.scramble_get_auto_mode, chat.id)
 
     if auto_enabled:
         await safe_send(context.bot, chat.id, text="\n".join(lines), parse_mode="HTML")
@@ -847,7 +848,7 @@ async def _scramble_handle_win(context: ContextTypes.DEFAULT_TYPE, chat, user, m
 
 
 async def _scramble_process_guess(update: Update, context: ContextTypes.DEFAULT_TYPE, chat, user, message):
-    round_row = db.scramble_get_round(chat.id)
+    round_row = await asyncio.to_thread(db.scramble_get_round, chat.id)
     if not round_row:
         return
 
@@ -859,7 +860,7 @@ async def _scramble_process_guess(update: Update, context: ContextTypes.DEFAULT_
     if not guess_clean:
         return
 
-    db.scramble_increment_played(user.id, chat.id, user.first_name)
+    await asyncio.to_thread(db.scramble_increment_played, user.id, chat.id, user.first_name)
 
     if guess_clean == word_lower:
         await _scramble_handle_win(context, chat, user, message, text)
