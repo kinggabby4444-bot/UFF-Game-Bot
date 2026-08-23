@@ -37,7 +37,7 @@ if not DATABASE_URL:
 
 _pool = psycopg2.pool.ThreadedConnectionPool(
     minconn=1,
-    maxconn=int(os.environ.get("DB_POOL_MAX", "10")),
+    maxconn=int(os.environ.get("GAME_DB_POOL_MAX", "10")),
     dsn=DATABASE_URL,
 )
 
