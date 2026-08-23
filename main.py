@@ -3008,7 +3008,7 @@ async def pre_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user is None:
         return
 
-    if not is_owner(user.id) and db.is_user_banned(user.id):
+    if not is_owner(user.id) and await asyncio.to_thread(db.is_user_banned, user.id):
         is_command = bool(
             update.effective_message
             and update.effective_message.text
@@ -3032,16 +3032,16 @@ async def pre_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
         raise ApplicationHandlerStop
 
     if chat is not None and chat.type != ChatType.PRIVATE:
-        if db.is_group_banned(chat.id):
+        if await asyncio.to_thread(db.is_group_banned, chat.id):
             try:
                 await context.bot.leave_chat(chat.id)
             except (Forbidden, BadRequest):
                 pass
             raise ApplicationHandlerStop
 
-        db.register_group(chat.id, chat.title or str(chat.id))
+        await asyncio.to_thread(db.register_group, chat.id, chat.title or str(chat.id))
 
-    if not is_bot_admin_or_owner(user.id) and db.get_config("maintenance_mode", "0") == "1":
+    if not is_bot_admin_or_owner(user.id) and await asyncio.to_thread(db.get_config, "maintenance_mode", "0") == "1":
         is_command = bool(
             update.effective_message
             and update.effective_message.text
@@ -3064,7 +3064,7 @@ async def pre_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
         raise ApplicationHandlerStop
 
-    db.add_user(user.id, user.first_name, user.username)
+    await asyncio.to_thread(db.add_user, user.id, user.first_name, user.username)
 
 
 async def on_bot_membership_change(update: Update, context: ContextTypes.DEFAULT_TYPE):
