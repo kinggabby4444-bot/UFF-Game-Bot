@@ -2837,9 +2837,8 @@ def main():
             "will NOT run. Install with: pip install \"python-telegram-bot[job-queue]\""
         )
 
-    print("📢 UFFAdsBot is running...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    return app
 
 
 if __name__ == "__main__":
-    main()
+    pass
