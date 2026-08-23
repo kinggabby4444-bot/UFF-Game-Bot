@@ -1,5 +1,7 @@
 import os
+import asyncio
 import logging
+import threading
 from aiohttp import web
 
 from telegram import Update
@@ -23,66 +25,92 @@ GAME_WEBHOOK_PATH = "/webhook/game"
 ADS_WEBHOOK_PATH = "/webhook/ads"
 
 
+class BotRunner:
+    """Runs a PTB Application in its own thread with its own event loop,
+    so blocking (synchronous psycopg2) database calls inside its handlers
+    only ever block THIS bot's thread - never the shared aiohttp server
+    that answers Telegram's webhook requests and Render's health checks."""
+
+    def __init__(self, name, build_app_fn, webhook_path):
+        self.name = name
+        self.build_app_fn = build_app_fn
+        self.webhook_path = webhook_path
+        self.loop = None
+        self.app = None
+        self.ready = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self):
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        self.app = self.build_app_fn()
+        self.loop.run_until_complete(self._startup())
+        self.ready.set()
+        self.loop.run_forever()
+
+    async def _startup(self):
+        await self.app.initialize()
+        await self.app.bot.set_webhook(
+            url=BASE_URL + self.webhook_path,
+            allowed_updates=Update.ALL_TYPES,
+        )
+        await self.app.start()
+        logger.info(f"{self.name}: initialized, webhook set, started.")
+
+    def start(self):
+        self.thread.start()
+        self.ready.wait(timeout=60)
+
+    def submit_update(self, data):
+        update = Update.de_json(data, self.app.bot)
+        asyncio.run_coroutine_threadsafe(self.app.process_update(update), self.loop)
+
+    def stop(self):
+        async def _shutdown():
+            await self.app.stop()
+            await self.app.shutdown()
+        fut = asyncio.run_coroutine_threadsafe(_shutdown(), self.loop)
+        fut.result(timeout=30)
+        self.loop.call_soon_threadsafe(self.loop.stop)
+
+
+game_runner = BotRunner("GAME BOT", game_bot_module.main, GAME_WEBHOOK_PATH)
+ads_runner = BotRunner("ADS BOT", ads_bot_module.main, ADS_WEBHOOK_PATH)
+
+
 async def health(request):
     return web.Response(text="OK")
 
 
 async def game_webhook(request):
-    app = request.app["game_app"]
     data = await request.json()
-    update = Update.de_json(data, app.bot)
-    await app.process_update(update)
+    game_runner.submit_update(data)
     return web.Response(text="OK")
 
 
 async def ads_webhook(request):
-    app = request.app["ads_app"]
     data = await request.json()
-    update = Update.de_json(data, app.bot)
-    await app.process_update(update)
+    ads_runner.submit_update(data)
     return web.Response(text="OK")
 
 
 async def on_startup(app):
-    game_app = app["game_app"]
-    ads_app = app["ads_app"]
-
-    await game_app.initialize()
-    await ads_app.initialize()
-
-    await game_app.bot.set_webhook(url=BASE_URL + GAME_WEBHOOK_PATH, allowed_updates=Update.ALL_TYPES)
-    await ads_app.bot.set_webhook(url=BASE_URL + ADS_WEBHOOK_PATH, allowed_updates=Update.ALL_TYPES)
-
-    await game_app.start()
-    await ads_app.start()
-
-    logger.info("Both bots initialized, webhooks set, and started.")
+    await asyncio.to_thread(game_runner.start)
+    await asyncio.to_thread(ads_runner.start)
 
 
 async def on_cleanup(app):
-    game_app = app["game_app"]
-    ads_app = app["ads_app"]
-    await game_app.stop()
-    await ads_app.stop()
-    await game_app.shutdown()
-    await ads_app.shutdown()
+    await asyncio.to_thread(game_runner.stop)
+    await asyncio.to_thread(ads_runner.stop)
 
 
 def build_web_app():
-    game_app = game_bot_module.main()
-    ads_app = ads_bot_module.main()
-
     web_app = web.Application()
-    web_app["game_app"] = game_app
-    web_app["ads_app"] = ads_app
-
     web_app.router.add_get("/health", health)
     web_app.router.add_post(GAME_WEBHOOK_PATH, game_webhook)
     web_app.router.add_post(ADS_WEBHOOK_PATH, ads_webhook)
-
     web_app.on_startup.append(on_startup)
     web_app.on_cleanup.append(on_cleanup)
-
     return web_app
 
 
