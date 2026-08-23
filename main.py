@@ -4398,7 +4398,10 @@ async def claimeddailyreward_command(update: Update, context: ContextTypes.DEFAU
 
 
 def main():
+    print("GAME BOT: main() started", flush=True)
+
     db.create_tables()
+    print("GAME BOT: database tables created", flush=True)
 
     app = (
         Application.builder()
@@ -4409,6 +4412,8 @@ def main():
         .pool_timeout(20)
         .build()
     )
+
+    print("GAME BOT: application built", flush=True)
 
     app.add_error_handler(error_handler)
 
@@ -4521,7 +4526,8 @@ def main():
             # timer will be (re)scheduled automatically when that round
             # ends, via _scramble_handle_win()/scramble_timeout_callback().
 
-    print("🤖 UFF Game Bot is running...")
+    print("GAME BOT: starting polling", flush=True)
+    print("🤖 UFF Game Bot is running...", flush=True)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
