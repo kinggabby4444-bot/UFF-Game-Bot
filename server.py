@@ -43,9 +43,13 @@ class BotRunner:
     def _run(self):
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
-        self.app = self.build_app_fn()
-        self.loop.run_until_complete(self._startup())
-        self.ready.set()
+        try:
+            self.app = self.build_app_fn()
+            self.loop.run_until_complete(self._startup())
+        except Exception:
+            logger.exception(f"{self.name}: failed to start")
+        finally:
+            self.ready.set()
         self.loop.run_forever()
 
     async def _startup(self):
@@ -62,15 +66,23 @@ class BotRunner:
         self.ready.wait(timeout=60)
 
     def submit_update(self, data):
+        if self.app is None or self.loop is None:
+            logger.error(f"{self.name}: not ready, dropping update")
+            return
         update = Update.de_json(data, self.app.bot)
         asyncio.run_coroutine_threadsafe(self.app.process_update(update), self.loop)
 
     def stop(self):
+        if self.app is None or self.loop is None:
+            return
         async def _shutdown():
             await self.app.stop()
             await self.app.shutdown()
-        fut = asyncio.run_coroutine_threadsafe(_shutdown(), self.loop)
-        fut.result(timeout=30)
+        try:
+            fut = asyncio.run_coroutine_threadsafe(_shutdown(), self.loop)
+            fut.result(timeout=30)
+        except Exception:
+            logger.exception(f"{self.name}: error during shutdown")
         self.loop.call_soon_threadsafe(self.loop.stop)
 
 

@@ -1,12 +1,5 @@
 """
 @UFFAdsBot - the Advertisement Management Bot for @Uff_GameBot.
-
-Handles: advertisers submitting ad requests, owner/admin approval,
-payment proof upload and confirmation, advertisement rates, and the
-owner commands for browsing/searching/broadcasting to applications.
-
-Shares its PostgreSQL database with @Uff_GameBot (same DATABASE_URL) via
-ads_database.py - see that file's docstring for what's shared vs owned.
 """
 
 import os
@@ -43,12 +36,6 @@ logger = logging.getLogger(__name__)
 
 
 async def safe_call(coro_func, *args, retries=2, delay=2, **kwargs):
-    """Retries a Telegram API call on transient timeouts/network
-    hiccups instead of letting one bad request silently drop a step of
-    the advertisement submission conversation (or any other reply) -
-    mirrors @Uff_GameBot's safe_send() helper. Returns None (and logs)
-    if every attempt fails; callers that don't need the result can
-    just await it and ignore the return value."""
     for attempt in range(retries + 1):
         try:
             return await coro_func(*args, **kwargs)
@@ -58,10 +45,6 @@ async def safe_call(coro_func, *args, retries=2, delay=2, **kwargs):
                 return None
             await asyncio.sleep(delay)
 
-
-# ---------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------
 
 BOT_TOKEN = os.environ.get("ADS_BOT_TOKEN") or os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
@@ -79,7 +62,7 @@ try:
 except ValueError:
     raise RuntimeError(f"OWNER_ID must be a number, got: {_owner_id_raw!r}")
 
-OWNER_USERNAME = os.environ.get("OWNER_USERNAME", "")  # for the Contact Support button
+OWNER_USERNAME = os.environ.get("OWNER_USERNAME", "")
 
 
 def is_owner(user_id) -> bool:
@@ -91,9 +74,6 @@ def is_owner_or_admin(user_id) -> bool:
 
 
 def esc(text) -> str:
-    """HTML-escape user-supplied text before it goes into a
-    parse_mode='HTML' message - same rationale/pattern as @Uff_GameBot's
-    esc() helper: unescaped '<'/'>'/'&' breaks Telegram's HTML parser."""
     if text is None:
         return ""
     return html_lib.escape(str(text), quote=False)
@@ -123,10 +103,6 @@ def owner_or_admin_only(func):
     return wrapper
 
 
-# ---------------------------------------------------------------------
-# Currency display helper (used by rate commands and the duration menu)
-# ---------------------------------------------------------------------
-
 CURRENCY_SYMBOLS = {"NGN": "₦", "USD": "$", "GBP": "£", "EUR": "€"}
 
 
@@ -137,10 +113,6 @@ def format_price(price, currency) -> str:
         return f"{symbol}{price}"
     return f"{price} {currency}"
 
-
-# ---------------------------------------------------------------------
-# Conversation states (the "Submit Advertisement" flow)
-# ---------------------------------------------------------------------
 
 (ASK_BUSINESS, ASK_LINK, ASK_TYPE, ASK_DURATION, ASK_TEXT, ASK_NOTES, PREVIEW) = range(7)
 
@@ -154,9 +126,6 @@ def type_keyboard():
 
 
 def duration_keyboard():
-    """Built live from whatever /setrate has configured - any duration
-    is allowed, not just a fixed list, and a newly added/changed/removed
-    rate is reflected immediately without a restart."""
     rows = db.get_rates_with_currency()
     keyboard = []
     for days, price, currency in rows:
@@ -197,15 +166,7 @@ def preview_text(data: dict) -> str:
 """
 
 
-# ---------------------------------------------------------------------
-# /start and the main menu
-# ---------------------------------------------------------------------
-
 def _support_contact_url():
-    """The Contact Support button's destination - a DB-backed override
-    set via /changecontactsupport, falling back to the OWNER_USERNAME
-    env var if nothing's been configured yet. Accepts either a bare
-    @username or a full link."""
     contact = db.get_config("support_contact", OWNER_USERNAME)
     if not contact:
         return None
@@ -229,11 +190,6 @@ def main_menu_keyboard():
 
 @owner_only
 async def changecontactsupport_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Usage: /changecontactsupport <@username or link>
-    Persists to bot_config (survives restarts) and takes effect
-    immediately everywhere the Contact Support button is shown. Safe to
-    re-run any time - it updates the same setting rather than creating
-    a new one."""
     if not context.args:
         current = db.get_config("support_contact", OWNER_USERNAME) or "(not set)"
         await update.message.reply_text(
@@ -303,14 +259,6 @@ Use <b>Advertisement Rates</b> any time to see current prices.
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles /start, including the ?start=submitad deep link used by
-    @Uff_GameBot's ad footer ("Place your links here 👉") - that link
-    opens this bot with a submitad payload, which drops the tapper
-    straight into the existing Submit Advertisement flow instead of
-    the welcome menu. Registered as a submit_conversation entry point
-    (not a separate CommandHandler) so the resulting ASK_LINK state is
-    actually tracked - a bare /start still shows the normal welcome
-    menu and ends any conversation tracking."""
     if context.args and context.args[0] == "submitad":
         return await submit_entry(update, context)
 
@@ -329,15 +277,10 @@ def rates_text() -> str:
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Standalone /help - same content as the ❓ Help button on /start,
-    just reachable directly as a command too."""
     await update.message.reply_html(HELP_TEXT, reply_markup=main_menu_keyboard())
 
 
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles the /start menu buttons that AREN'T part of the submit
-    conversation (rates, help) - the submit button is handled by the
-    ConversationHandler's own entry point below."""
     query = update.callback_query
     await query.answer()
 
@@ -349,9 +292,6 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @owner_only
 async def setrates_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Legacy single-currency (NGN) rate setter - kept for backward
-    compatibility. Prefer /setrate <days> <amount> [currency], which
-    also supports other currencies and shows in /rates."""
     if not context.args:
         current = "\n".join(f"{d} Day{'s' if d != 1 else ''} = {p}" for d, p in db.get_rates())
         await update.message.reply_text(
@@ -382,10 +322,6 @@ async def setrates_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @owner_only
 async def setrate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Usage: /setrate <duration_days> <amount> [currency]
-    Creates a new rate, or updates the existing one for that duration
-    if it already exists. Any duration is allowed - not limited to a
-    fixed list. currency defaults to NGN if omitted."""
     if len(context.args) < 2:
         await update.message.reply_text(
             "Usage: /setrate <duration_days> <amount> [currency]\n"
@@ -418,7 +354,6 @@ async def setrate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @owner_only
 async def deleterate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Usage: /deleterate <duration_days>"""
     if not context.args or not context.args[0].isdigit():
         await update.message.reply_text("Usage: /deleterate <duration_days>\nExample: /deleterate 14")
         return
@@ -435,9 +370,6 @@ async def deleterate_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 @owner_only
 async def rates_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Usage: /rates - lists every currently configured advertisement
-    rate (with currency), regardless of what the public-facing 'menu:rates'
-    button on /start shows."""
     rows = db.get_rates_with_currency()
     if not rows:
         await update.message.reply_text("No advertisement rates configured yet. Use /setrate to add one.")
@@ -450,13 +382,7 @@ async def rates_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_html("\n".join(lines))
 
 
-# ---------------------------------------------------------------------
-# Submit Advertisement conversation
-# ---------------------------------------------------------------------
-
 async def submit_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Entry point - reachable both from /submitad and from the 📝
-    Submit Advertisement button on /start."""
     query = update.callback_query
     user = update.effective_user
 
@@ -592,7 +518,6 @@ async def preview_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ASK_BUSINESS
 
-    # action == "submit"
     data = context.user_data["ad_draft"]
     application_id = db.create_application(
         applicant_id=user.id,
@@ -644,22 +569,12 @@ submit_conversation = ConversationHandler(
     },
     fallbacks=[
         CommandHandler("cancel", cancel_command),
-        # "start" is also a fallback (not just an entry_point) so it
-        # works even when a user is stuck mid-conversation (e.g. they
-        # abandoned the form partway and come back later) - without
-        # this, /start was unreachable once someone was inside any
-        # ASK_* state, since fallbacks (not entry_points) are what get
-        # checked for a currently-active conversation.
         CommandHandler("start", start_command),
     ],
     name="submit_ad_conversation",
     per_message=False,
 )
 
-
-# ---------------------------------------------------------------------
-# Owner notification + approve/reject
-# ---------------------------------------------------------------------
 
 def application_detail_text(app_row) -> str:
     (aid, applicant_id, applicant_name, applicant_username, business_name,
@@ -789,13 +704,6 @@ async def send_payment_instructions(context, application_id, applicant_id, price
 
 
 async def payment_method_choice_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fixed: the Telegram Stars branch previously had a misindented
-    `return` that fell OUTSIDE its `if`, so it ran unconditionally right
-    after the Stars check regardless of which method was actually
-    chosen - meaning every method other than Stars silently short-
-    circuited before ever reaching its own instructions. Each branch
-    below now handles its own case and returns only from inside it.
-    Telegram Gifts and Telegram Stars behaviour is unchanged."""
     query = update.callback_query
     await query.answer()
 
@@ -881,11 +789,6 @@ async def change_payment_method_callback(update: Update, context: ContextTypes.D
 
 
 async def approve_application(context, application_id, actor_id):
-    """Shared approval logic - marks approved, audits, notifies the
-    applicant, and sends payment instructions. Used by both the ✅
-    Approve button (decision_callback) and /approveall, so nothing is
-    skipped or duplicated between the two paths. Returns False if the
-    application no longer exists."""
     db.set_application_status(application_id, "approved", decided_by=actor_id)
     db.audit(actor_id, "approve_application", f"Application #{application_id}")
 
@@ -917,12 +820,6 @@ async def approve_application(context, application_id, actor_id):
 
 
 async def reject_application(context, application_id, actor_id, reason="Application rejected."):
-    """Shared rejection logic - marks rejected, audits, and notifies the
-    applicant with the given reason. Used by both the free-text
-    reject-reason flow (reject_reason_message) and /rejectall (which
-    has no interactive reason step, so it falls back to a generic
-    default reason unless one is given as command arguments). Returns
-    False if the application no longer exists."""
     db.set_application_status(application_id, "rejected", decided_by=actor_id, reject_reason=reason)
     db.audit(actor_id, "reject_application", f"Application #{application_id}: {reason}")
 
@@ -971,10 +868,6 @@ async def decision_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if action == "reject":
-        # Not a ConversationHandler state - "awaiting a reason" is
-        # tracked via the user_data flag below, checked by the
-        # standalone reject_reason_message handler on the owner's next
-        # private text message.
         context.user_data["reject_application_id"] = application_id
         await query.answer()
         await query.edit_message_text(
@@ -985,10 +878,6 @@ async def decision_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @owner_only
 async def approveall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Approves every application currently at status='pending', using
-    the exact same approve_application() logic as the individual ✅
-    Approve button - so nothing about notifications or payment
-    instructions is skipped."""
     ids = db.get_pending_application_ids()
     if not ids:
         await update.message.reply_text("No pending applications to approve.")
@@ -1004,10 +893,6 @@ async def approveall_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 @owner_only
 async def rejectall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Rejects every application currently at status='pending'. Any
-    text after the command is used as the rejection reason sent to
-    every applicant; otherwise a generic default is used (there's no
-    interactive per-application reason step for a bulk action)."""
     ids = db.get_pending_application_ids()
     if not ids:
         await update.message.reply_text("No pending applications to reject.")
@@ -1024,11 +909,9 @@ async def rejectall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def reject_reason_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Standalone (not part of the submit ConversationHandler) - the
-    owner types a free-text reason after tapping ❌ Reject."""
     application_id = context.user_data.pop("reject_application_id", None)
     if application_id is None:
-        return False  # not currently awaiting a reject reason from this user
+        return False
 
     reason = update.message.text.strip()
     await reject_application(context, application_id, update.effective_user.id, reason)
@@ -1038,12 +921,6 @@ async def reject_reason_message(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def coupon_code_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """If the sender has an application awaiting payment and what they
-    just sent matches a real coupon code, apply it. Otherwise this is a
-    no-op (not every stray message from an approved advertiser is a
-    coupon attempt) - so unlike the other standalone handlers, "no
-    match" here isn't distinguishable from "not a coupon", and both
-    return False to let the dispatcher move on quietly."""
     user = update.effective_user
     text = update.message.text.strip()
 
@@ -1054,7 +931,7 @@ async def coupon_code_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     code = text.upper()
     coupon_row = db.get_coupon(code)
     if not coupon_row:
-        return False  # not a coupon code - probably just a normal message, ignore quietly
+        return False
 
     valid, reason = db.is_coupon_valid(code)
     if not valid:
@@ -1078,13 +955,6 @@ async def coupon_code_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def private_text_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Every plain private text message that ISN'T part of the submit
-    ConversationHandler passes through here once, in a fixed order, so
-    the stateful standalone flows (reject reason, custom start time,
-    payment method config, coupon code) never fight over the same
-    MessageHandler slot."""
-
-    # Don't process messages here while the user is submitting an advertisement.
     if context.user_data.get("ad_draft") is not None:
         return
     if await reject_reason_message(update, context):
@@ -1120,10 +990,6 @@ async def contact_advertiser_callback(update: Update, context: ContextTypes.DEFA
         await query.answer(f"No public username - their Telegram ID is {applicant_id}", show_alert=True)
 
 
-# ---------------------------------------------------------------------
-# Payment proof upload (advertiser side)
-# ---------------------------------------------------------------------
-
 def payment_decision_keyboard(payment_id):
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Payment Confirmed", callback_data=f"paydecide:confirm:{payment_id}"),
@@ -1132,10 +998,6 @@ def payment_decision_keyboard(payment_id):
 
 
 def payment_review_keyboard(payment_id):
-    """First-look gate shown to the owner the moment a receipt/photo
-    arrives - separate from payment_decision_keyboard() above, which
-    only appears afterward once the owner taps ▶️ Next here. Nothing is
-    sent to the applicant until one of these two is tapped."""
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("▶️ Next", callback_data=f"payreview:next:{payment_id}"),
         InlineKeyboardButton("❌ Decline", callback_data=f"payreview:decline:{payment_id}"),
@@ -1143,23 +1005,13 @@ def payment_review_keyboard(payment_id):
 
 
 async def payment_proof_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fires on any photo/document sent to the bot in DM. If the sender
-    has an application awaiting payment (status='approved'), treat it as
-    payment proof; otherwise ignore (not every DM upload is payment
-    proof - e.g. it could be unrelated noise).
-
-    Sends a generic "please wait" acknowledgment immediately (so the
-    applicant isn't left wondering if anything happened), but the
-    SPECIFIC verification outcome ("received, verifying" vs "invalid")
-    still only goes out once the owner taps ▶️ Next / ❌ Decline on the
-    receipt - see payment_review_callback."""
     user = update.effective_user
     message = update.message
 
     app_row = db.get_latest_approved_application(user.id)
 
     if not app_row:
-        return  # no approved-and-awaiting-payment application - not payment proof
+        return
 
     application_id = app_row[0]
 
@@ -1194,12 +1046,6 @@ async def payment_proof_upload(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def payment_review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles the ▶️ Next / ❌ Decline gate on a freshly-uploaded
-    receipt - the applicant hears nothing until one of these is tapped.
-    Next reveals the existing ✅ Payment Confirmed / ❌ Payment Rejected
-    controls (payment_decision_keyboard) for the owner to actually
-    verify the payment afterward; Decline ends it immediately and lets
-    the applicant try uploading a different proof."""
     query = update.callback_query
     user = update.effective_user
 
@@ -1237,13 +1083,9 @@ async def payment_review_callback(update: Update, context: ContextTypes.DEFAULT_
             logger.error(f"Failed to reveal decision keyboard for payment {payment_id}: {e}")
         return
 
-    # action == "decline"
     db.set_payment_status(payment_id, "rejected", confirmed_by=user.id)
     db.audit(user.id, "decline_payment_proof", f"Payment #{payment_id}, Application #{application_id}")
     if application_id:
-        # Put the application back to 'approved' (awaiting payment) so
-        # the applicant can upload a corrected proof instead of being
-        # stuck at 'awaiting_payment' forever with no way to retry.
         db.set_application_status(application_id, "approved", decided_by=user.id)
 
     if applicant_id:
@@ -1354,19 +1196,15 @@ async def paystart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def custom_start_time_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Standalone handler (not a ConversationHandler state) for the
-    owner's reply after tapping 🗓 Custom Start Time - mirrors the
-    reject-reason pattern: a user_data flag set by the button, consumed
-    here on the owner's next private text message."""
     payment_id = context.user_data.pop("awaiting_custom_start_for_payment", None)
     if payment_id is None:
-        return False  # not awaiting a custom start time - let other handlers try
+        return False
 
     text = update.message.text.strip()
     try:
         start_at = datetime.strptime(text, "%Y-%m-%d %H:%M")
     except ValueError:
-        context.user_data["awaiting_custom_start_for_payment"] = payment_id  # let them retry
+        context.user_data["awaiting_custom_start_for_payment"] = payment_id
         await update.message.reply_text(
             "❌ Couldn't parse that. Please send it as YYYY-MM-DD HH:MM, e.g. 2026-08-10 14:00."
         )
@@ -1382,27 +1220,12 @@ async def custom_start_time_message(update: Update, context: ContextTypes.DEFAUL
 
 
 def _publish_to_sponsored_slot(ad_text, ad_link):
-    """Drops an ad straight into the Sponsored Ad slot on
-    @Uff_GameBot's /leaderboard, /topplayers, and /topgroups, using the
-    applicant's own advertisement text as the visible label and their
-    submitted link/username as the hidden target (Telegram's
-    [label](target) hidden-link format - @Uff_GameBot's
-    /changesponsoredad already parses this exact syntax). Both bots
-    read/write the same bot_config table, so this takes effect
-    immediately with no restart needed on either side. Shared by both
-    'Start Immediately' (finalize_subscription) and the scheduled-
-    activation background job (job_activate_scheduled_ads), so a
-    Custom Start Time ad gets the identical handoff once its scheduled
-    time actually arrives."""
     db.set_config("sponsored_ad_override", f"[{ad_text}]({ad_link})")
     db.set_config("sponsored_ad_enabled", "1")
     db.set_config("ads_enabled", "1")
 
 
 async def finalize_subscription(context, payment_id, start_at, actor_id):
-    """Creates the ad_subscriptions row, generates an invoice, redeems
-    any applied coupon, and sends the advertiser their receipt. Shared
-    by both the 'Start Immediately' and 'Custom Start Time' paths."""
     payment_row = db.get_payment(payment_id)
     application_id = payment_row[1]
     app_row = db.get_application(application_id)
@@ -1416,11 +1239,7 @@ async def finalize_subscription(context, payment_id, start_at, actor_id):
     base_price, currency = rate_row if rate_row else (0, "NGN")
     amount_paid = final_price if final_price is not None else base_price
 
-    now = datetime.now()  # single reference point for this whole call,
-    # so "Start Immediately" (start_at passed in as datetime.now() by
-    # the caller) can never be evaluated against a LATER "now" here -
-    # it's always active the instant it's created, not dependent on
-    # how much time this function itself takes to run.
+    now = datetime.now()
     end_at = start_at + timedelta(days=duration_days)
     status_value = "active" if start_at <= now else "scheduled"
 
@@ -1431,10 +1250,6 @@ async def finalize_subscription(context, payment_id, start_at, actor_id):
     )
 
     if status_value == "active":
-        # "Go live now" (Start Immediately) - drop this ad straight
-        # into the Sponsored Ad slot immediately. Custom Start Time
-        # ads get the same handoff later, from job_activate_scheduled_ads
-        # once their scheduled time actually arrives.
         _publish_to_sponsored_slot(ad_text, ad_link)
 
     db.set_application_status(application_id, "payment_confirmed", decided_by=actor_id)
@@ -1480,10 +1295,6 @@ and /receipts to see your past invoices.
 
     return subscription_id, status_value
 
-
-# ---------------------------------------------------------------------
-# Owner commands: applications / open / approved / rejected / payments
-# ---------------------------------------------------------------------
 
 APPLICATIONS_PAGE_SIZE = 20
 
@@ -1623,10 +1434,6 @@ async def searchads_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html("\n".join(lines))
 
 
-# ---------------------------------------------------------------------
-# Payment Management System (owner-only)
-# ---------------------------------------------------------------------
-
 PAYMENT_METHOD_FIELDS = {
     "bank": ["Bank Name", "Account Name", "Account Number"],
     "paystack": ["Public Key", "Secret Key", "Webhook Secret"],
@@ -1727,7 +1534,7 @@ async def paymentmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     db.audit(update.effective_user.id, "set_payment_mode", mode)
     await update.message.reply_text(f"✅ Payment mode set to: {mode}")
 
-    
+
 @owner_only
 async def setstarsrecipient_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -1741,6 +1548,7 @@ async def setstarsrecipient_command(update: Update, context: ContextTypes.DEFAUL
     await update.message.reply_text(
         f"✅ Telegram Stars recipient set to @{username}"
     )
+
 
 @owner_only
 async def setgiftsrecipient_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1756,6 +1564,7 @@ async def setgiftsrecipient_command(update: Update, context: ContextTypes.DEFAUL
         f"✅ Telegram Gifts recipient set to @{username}"
     )
 
+
 async def _start_payment_config(update, context, method_key):
     fields = PAYMENT_METHOD_FIELDS[method_key]
     context.user_data["payment_config"] = {"method": method_key, "fields": fields, "answers": {}, "index": 0}
@@ -1764,11 +1573,6 @@ async def _start_payment_config(update, context, method_key):
 
 @owner_only
 async def setbank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Usage: /setbank <Bank Name> | <Account Name> | <Account Number>
-    One-line config (no back-and-forth) - saves immediately, enables
-    Bank Transfer, and the details show automatically the next time
-    someone selects Bank Transfer. Safe to re-run any time to update
-    the details later."""
     text = update.message.text or ""
     _, _, rest = text.partition(" ")
     rest = rest.strip()
@@ -1809,11 +1613,6 @@ async def setbank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @owner_only
 async def setpayment_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Usage: /setpayment <Method Name> | <Field: Value> | <Field: Value> ...
-    Generic one-line configurator for ANY payment method - new or
-    existing (Paystack, Flutterwave, Crypto, or something you invent).
-    Saves, enables, and immediately becomes visible to advertisers.
-    Re-run any time with the same method name to update its details."""
     text = update.message.text or ""
     _, _, rest = text.partition(" ")
     rest = rest.strip()
@@ -1884,6 +1683,8 @@ async def setcrypto_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Configuring Crypto [TON Coin Only].\n\n"
         "TON Wallet Address:"
     )
+
+
 @owner_only
 async def fixcrypto_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     updated = db.rename_payment_method(
@@ -1899,6 +1700,7 @@ async def fixcrypto_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "❌ Could not find crypto_ton."
         )
+
 
 @owner_only
 async def addstars_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1933,11 +1735,8 @@ async def addgifts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("⚠️ Telegram Gifts is already a payment method.")
 
+
 async def payment_config_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Standalone handler consuming the answers for /setpaystack,
-    /setflutterwave, /setcrypto - one field per message, same pattern as
-    the other stateful standalone flows. Returns True if it consumed
-    the message."""
     state = context.user_data.get("payment_config")
     if not state:
         return False
@@ -1951,7 +1750,6 @@ async def payment_config_message(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text(f"{state['fields'][state['index']]}:")
         return True
 
-    # All fields collected - save and finish.
     method_key = state["method"]
     db.add_payment_method(method_key)
     db.set_payment_method_config(method_key, json.dumps(state["answers"]))
@@ -1961,10 +1759,6 @@ async def payment_config_message(update: Update, context: ContextTypes.DEFAULT_T
     await update.message.reply_text(f"✅ {method_key.capitalize()} configured and enabled.")
     return True
 
-
-# ---------------------------------------------------------------------
-# /broadcast
-# ---------------------------------------------------------------------
 
 BROADCAST_AUDIENCES = {
     "everyone": None,
@@ -2003,10 +1797,6 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"📣 Broadcast sent to {sent} recipient(s). {failed} failed to deliver.")
 
 
-# ---------------------------------------------------------------------
-# Subscription & Billing System
-# ---------------------------------------------------------------------
-
 STATUS_EMOJI = {
     "active": "🟢", "scheduled": "🟡", "expiring_soon": "🟠",
     "expired": "🔴", "paused": "⏸", "cancelled": "❌",
@@ -2018,8 +1808,6 @@ def subscription_summary_line(row) -> str:
     emoji = STATUS_EMOJI.get(status, "•")
     return f"{emoji} #{sid} - {esc(business_name)} ({duration_days}d, {esc(status)})"
 
-
-# --- Coupons (owner-only) ---
 
 @owner_only
 async def createcoupon_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2093,8 +1881,6 @@ async def deletecoupon_command(update: Update, context: ContextTypes.DEFAULT_TYP
     await update.message.reply_text(f"✅ Coupon {code} deleted." if removed else f"❌ No coupon named {code}.")
 
 
-# --- Promotional offers (owner-only) ---
-
 @owner_only
 async def createoffer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 3:
@@ -2144,8 +1930,6 @@ async def deleteoffer_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text("✅ Offer deleted." if removed else "❌ No offer with that ID.")
 
 
-# --- Invoices / receipts ---
-
 def invoice_text(row) -> str:
     (inv_id, application_id, subscription_id, business_name, advertiser_name,
      advertiser_username, advertiser_id, duration_days, amount_paid,
@@ -2187,7 +1971,6 @@ async def invoice_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def receipts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Not owner-only - any advertiser can pull up their own receipts."""
     rows = db.get_advertiser_invoices(update.effective_user.id)
     if not rows:
         await update.message.reply_text("You don't have any receipts yet.")
@@ -2201,8 +1984,6 @@ async def receipts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_html("\n".join(lines))
 
-
-# --- Owner financial reports ---
 
 @owner_only
 async def revenue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2224,8 +2005,6 @@ New Advertisers: {r['new_advertisers']}
 """
     await update.message.reply_html(text)
 
-
-# --- Advertiser dashboard ---
 
 async def myads_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -2279,8 +2058,6 @@ async def myads_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# --- Renewal flow ---
-
 async def renew_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -2300,14 +2077,9 @@ async def renew_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def renew_duration_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Reuses the adduration: callback pattern from the submit flow, but
-    only proceeds down the renewal path if renew_subscription_id is set
-    - otherwise it's a normal new-submission duration pick and this
-    handler does nothing (the ConversationHandler's own state handler
-    handles that case)."""
     subscription_id = context.user_data.get("renew_subscription_id")
     if subscription_id is None:
-        return  # not a renewal in progress - let the submit conversation handle it
+        return
 
     query = update.callback_query
     await query.answer()
@@ -2320,8 +2092,6 @@ async def renew_duration_callback(update: Update, context: ContextTypes.DEFAULT_
      old_duration, start_at, end_at, status, created_at, total_views, total_clicks,
      r7, r3, r24, rex, renewed_from) = sub_row
 
-    # Renewal reuses the same ad content and skips straight to payment -
-    # it's already been content-approved once.
     new_application_id = db.create_application(
         applicant_id=applicant_id, applicant_name=update.effective_user.first_name,
         applicant_username=update.effective_user.username, business_name=business_name,
@@ -2335,8 +2105,6 @@ async def renew_duration_callback(update: Update, context: ContextTypes.DEFAULT_
     await query.edit_message_text(f"✅ Renewal set up for {days} Days. Amount due: {format_price(price, currency)}")
     await send_payment_instructions(context, new_application_id, applicant_id, price, currency)
 
-
-# --- Subscription management (owner commands) ---
 
 @owner_or_admin_only
 async def subscriptions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2473,8 +2241,6 @@ Remaining Days: {remaining_days}
     await update.message.reply_html(text)
 
 
-# --- Exports (owner-only, CSV always available; XLSX if openpyxl is installed) ---
-
 def _write_csv(path, header, rows):
     import csv
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -2522,17 +2288,8 @@ async def exportpayments_command(update: Update, context: ContextTypes.DEFAULT_T
     )
 
 
-# ---------------------------------------------------------------------
-# /allcommands
-# ---------------------------------------------------------------------
-
 @owner_only
 async def allcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Owner-only categorized reference of every command registered in
-    this bot. This list is maintained by hand alongside main() below -
-    whenever a command is added there, it should be added here too so
-    the two stay in sync. Never lists payment credentials/values, only
-    command names."""
     text = """
 📖 <b>UFFAdsBot Commands</b>
 
@@ -2597,18 +2354,11 @@ async def allcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_html(text)
 
 
-# ---------------------------------------------------------------------
-# Background jobs - scheduler, expiry, reminders
-# ---------------------------------------------------------------------
-
 async def job_activate_scheduled_ads(context: ContextTypes.DEFAULT_TYPE):
     for subscription_id in db.get_subscriptions_needing_activation():
         db.set_subscription_status(subscription_id, "active")
         logger.info(f"Activated subscription #{subscription_id}")
 
-        # Same "go live" handoff as Start Immediately - now that this
-        # Custom Start Time ad's scheduled moment has actually arrived,
-        # drop it into the Sponsored Ad slot too.
         sub_row = db.get_subscription(subscription_id)
         if sub_row:
             ad_link, ad_text = sub_row[4], sub_row[5]
@@ -2628,9 +2378,6 @@ async def job_mark_expiring_soon(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def job_send_reminders(context: ContextTypes.DEFAULT_TYPE):
-    """Checks every active/expiring_soon subscription against the
-    7-day/3-day/24-hour/at-expiry reminder thresholds, sending each one
-    at most once (tracked via the reminder_*_sent flags)."""
     now = datetime.now()
 
     for row in db.get_subscriptions_expiring_within(24 * 7 + 1):
@@ -2685,16 +2432,7 @@ async def renew_dismiss_callback(update: Update, context: ContextTypes.DEFAULT_T
     await query.edit_message_text("No problem - you can renew any time from /myads.")
 
 
-# ---------------------------------------------------------------------
-# Startup
-# ---------------------------------------------------------------------
-
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    """Log unhandled errors instead of letting them vanish silently -
-    without this, a raised exception during e.g. the submission
-    conversation just gets printed by PTB's default handling and the
-    user never finds out their message was dropped. Logs only
-    update_id/chat/user identifiers, never raw update content."""
     update_id = getattr(update, "update_id", "?")
     chat_id = getattr(getattr(update, "effective_chat", None), "id", "?")
     logger.error(
@@ -2720,11 +2458,6 @@ def main():
 
     app.add_handler(submit_conversation)
 
-    # NOTE: "start" is no longer registered as a separate CommandHandler
-    # here - it's now one of submit_conversation's entry_points (above)
-    # so that the ?start=submitad deep link's resulting ASK_LINK state
-    # is properly tracked. A bare /start still works exactly as before;
-    # start_command handles both cases.
     app.add_handler(CommandHandler("setrates", setrates_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("applications", applications_command))
@@ -2739,7 +2472,6 @@ def main():
     app.add_handler(CommandHandler("rejectall", rejectall_command))
     app.add_handler(CommandHandler("changecontactsupport", changecontactsupport_command))
 
-    # Payment Management System
     app.add_handler(CommandHandler("paymentmethods", paymentmethods_command))
     app.add_handler(CommandHandler("addpayment", addpayment_command))
     app.add_handler(CommandHandler("removepayment", removepayment_command))
@@ -2757,12 +2489,10 @@ def main():
     app.add_handler(CommandHandler("addgifts", addgifts_command))
     app.add_handler(CommandHandler("fixcrypto", fixcrypto_command))
 
-    # Advertisement Rates
     app.add_handler(CommandHandler("setrate", setrate_command))
     app.add_handler(CommandHandler("deleterate", deleterate_command))
     app.add_handler(CommandHandler("rates", rates_admin_command))
 
-    # Subscription & Billing System
     app.add_handler(CommandHandler("createcoupon", createcoupon_command))
     app.add_handler(CommandHandler("coupons", coupons_command))
     app.add_handler(CommandHandler("deletecoupon", deletecoupon_command))
@@ -2802,19 +2532,8 @@ def main():
     app.add_handler(CallbackQueryHandler(applications_page_callback, pattern="^adlist:"))
     app.add_handler(CallbackQueryHandler(renew_callback, pattern="^renew:"))
     app.add_handler(CallbackQueryHandler(renew_dismiss_callback, pattern="^renew_dismiss$"))
-    # Renewal duration picks reuse the submit flow's adduration: pattern,
-    # so this handler must be registered BEFORE the submit_conversation
-    # would otherwise see it - but since submit_conversation only reacts
-    # while a user is actually inside it, and renewal duration picks
-    # happen outside that conversation, there's no real conflict; this
-    # is registered explicitly for clarity and because
-    # renew_duration_callback itself checks user_data before acting.
     app.add_handler(CallbackQueryHandler(renew_duration_callback, pattern="^adduration:"))
 
-    # Reject-reason text, custom start-time text, payment-method config
-    # answers, and coupon codes all arrive as plain private messages
-    # outside the submit conversation, so they're funneled through one
-    # dispatcher rather than as separate competing handlers.
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
         private_text_dispatcher,
@@ -2824,8 +2543,6 @@ def main():
         payment_proof_upload,
     ))
 
-    # Background jobs - scheduler, expiry, reminders. Requires the
-    # job-queue extra: pip install "python-telegram-bot[job-queue]"
     if app.job_queue is not None:
         app.job_queue.run_repeating(job_activate_scheduled_ads, interval=60, first=10)
         app.job_queue.run_repeating(job_expire_ads, interval=60, first=15)

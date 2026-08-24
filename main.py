@@ -284,9 +284,6 @@ def _build_medium_words():
         mw.MILITARY_WARFARE, mw.WEDDING_FAMILY, mw.DINING_RESTAURANT,
         mw.PHOTOGRAPHY_MEDIA, mw.OUTDOORS_CAMPING, mw.FASHION_STYLE_EXTRA,
         mw.HOLIDAYS_FESTIVALS, mw.SCIENCE_LAB_EXTRA,
-        # Words added via the /addwords owner command - see
-        # _read_owner_added_words()/_write_owner_added_words() below,
-        # which append to this exact list inside medium_words_raw.py.
         getattr(mw, "OWNER_ADDED", []),
     ]
     seen = set()
@@ -317,13 +314,6 @@ def _merge_all_words():
 WORDS = _merge_all_words()
 
 
-# =======================================================================
-# /addwords - owner command to add new words to medium_words_raw.py's
-# OWNER_ADDED list without touching/reordering any existing category.
-# Words are appended, never removed or overwritten, and take effect
-# immediately (word pool rebuilt in-process right after saving).
-# =======================================================================
-
 WORDS_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "medium_words_raw.py")
 
 _OWNER_ADDED_MARKER = "OWNER_ADDED = ["
@@ -347,10 +337,6 @@ def _read_owner_added_words():
 
 
 def _write_owner_added_words(words):
-    """Rewrites ONLY the OWNER_ADDED = [ ... ] block in place - every
-    other line/category in medium_words_raw.py is left byte-for-byte
-    untouched. If the marker doesn't exist yet (file predates this
-    feature), it's appended at the end of the file instead."""
     with open(WORDS_FILE_PATH, "r", encoding="utf-8") as f:
         content = f.read()
 
@@ -374,11 +360,6 @@ def _write_owner_added_words(words):
 
 @owner_only
 async def addwords_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Usage: /addwords word1, word2, word3
-    Adds single alphabetic words to the word pool (used by both the
-    Word Game and Word Scramble) without deleting or reordering
-    anything already there. Duplicates (case-insensitive, checked
-    against the ENTIRE existing pool) are skipped and reported."""
     if not context.args:
         await update.message.reply_text(
             "Usage: /addwords word1, word2, word3\n"
@@ -519,7 +500,6 @@ def scramble_random_word(chat_id):
 
 
 def _parse_duration(text):
-    """Parses '2m' / '5h' / '1d' -> seconds. Returns None if invalid."""
     if not text:
         return None
     m = re.fullmatch(r"(\d+)([mhd])", text.strip().lower())
@@ -543,10 +523,6 @@ def _format_duration(seconds):
 
 
 def _format_duration_words(seconds):
-    """Same idea as _format_duration() but spelled out in full words
-    (e.g. '4 minutes', '1 hour') - used in the player-facing Slow Mode
-    messages, which must always echo back the EXACT duration the owner
-    configured with /slowmode on <time>."""
     if not seconds or seconds <= 0:
         return "0 seconds"
     if seconds % 86400 == 0:
@@ -600,20 +576,6 @@ def schedule_scramble_timeout(context: ContextTypes.DEFAULT_TYPE, chat_id):
 
 
 def restore_stale_scramble_rounds(job_queue):
-    """Called once at startup, before anything else touches Word
-    Scramble. A round's 2-minute expiration timer lives only in the
-    in-memory job queue - it does NOT survive a bot restart/redeploy.
-    Without this, a round that was active when the bot restarted would
-    stay marked active in the database forever, since
-    start_scramble_round() refuses to start a new round while one is
-    already active in that chat - permanently stuck.
-
-    For every round still marked active at startup: if its 2 minutes
-    have already elapsed, it's cleared immediately (silently - no
-    "Time's up" spam for something that happened before the bot came
-    back up). Otherwise its remaining time is rescheduled exactly like
-    a normal timeout, so players can keep answering it right up to the
-    real 2-minute mark."""
     if job_queue is None:
         return
 
@@ -642,11 +604,11 @@ async def scramble_timeout_callback(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
     chat_id = job.chat_id
 
-    word = db.scramble_claim_round(chat_id)
+    word = await asyncio.to_thread(db.scramble_claim_round, chat_id)
     if not word:
         return
 
-    slow = db.get_scramble_slowmode(chat_id)
+    slow = await asyncio.to_thread(db.get_scramble_slowmode, chat_id)
     slow_enabled = bool(slow and slow[1])
 
     text = (
@@ -661,7 +623,7 @@ async def scramble_timeout_callback(context: ContextTypes.DEFAULT_TYPE):
         schedule_slowmode_next_round(context.job_queue, chat_id, interval_seconds)
         return
 
-    _, auto_enabled, _ = db.scramble_get_auto_mode(chat_id)
+    _, auto_enabled, _ = await asyncio.to_thread(db.scramble_get_auto_mode, chat_id)
     if not auto_enabled:
         text += "\n\nPlay again with /wordscramble"
 
@@ -671,25 +633,17 @@ async def scramble_timeout_callback(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _scramble_auto_continue(context: ContextTypes.DEFAULT_TYPE, chat_id, won: bool, chat_obj=None):
-    """If this chat is in per-chat Automatic Mode, records the round
-    result and either starts the next round immediately (win, or a miss
-    that hasn't hit the 3-in-a-row threshold yet) or turns Automatic
-    Mode off (3 consecutive unanswered auto rounds). No-op if this chat
-    isn't in Automatic Mode. Callers already make sure this is never
-    reached while Slow Mode is active for the chat - Slow Mode always
-    takes priority and uses its own scheduling
-    (schedule_slowmode_next_round)."""
-    _, auto_enabled, _ = db.scramble_get_auto_mode(chat_id)
+    _, auto_enabled, _ = await asyncio.to_thread(db.scramble_get_auto_mode, chat_id)
     if not auto_enabled:
         return
 
-    result = db.scramble_record_round_result(chat_id, won)
+    result = await asyncio.to_thread(db.scramble_record_round_result, chat_id, won)
     if result is None:
         return
     _, new_miss_streak = result
 
     if not won and new_miss_streak >= 3:
-        db.scramble_set_auto_enabled(chat_id, False)
+        await asyncio.to_thread(db.scramble_set_auto_enabled, chat_id, False)
         await safe_send(
             context.bot,
             chat_id,
@@ -774,28 +728,6 @@ async def wordscramble_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def _scramble_handle_win(context: ContextTypes.DEFAULT_TYPE, chat, user, message, guessed_word_case):
-    """Shared winning logic. Race-safe via scramble_claim_round().
-
-    NOTE: this deliberately does NOT call db.award_coins() anymore -
-    Word Scramble winnings are tracked ONLY in the scramble_* tables
-    (scramble_chat_stats/scramble_global_stats via scramble_record_win/
-    scramble_add_bonus below), so they never mix into the Word Game's
-    chat_scores/global_scores tables (which power /leaderboard,
-    /topplayers, /topgroups). Word Scramble has its own leaderboard
-    commands (/scrambleleaderboard, /scrambletopplayers,
-    /scrambletopgroups) for that.
-
-    Message/continuation behaviour depends on the chat's mode - Slow
-    Mode always takes priority over Automatic Mode, and the two never
-    run at the same time:
-    - Slow Mode ON: winner message + "new word in <interval>" footer
-      (no "Play again" line); next round is scheduled after that exact
-      interval via schedule_slowmode_next_round().
-    - Automatic Mode ON (Slow Mode OFF): winner message only (no
-      "Play again" line); next round starts immediately.
-    - Neither: winner message + "Play again with /wordscramble", no
-      auto-continuation - unchanged normal/manual behaviour.
-    """
     word = await asyncio.to_thread(db.scramble_claim_round, chat.id)
     if not word:
         return
@@ -882,7 +814,7 @@ async def scramble_private_text(update: Update, context: ContextTypes.DEFAULT_TY
     if not message or not message.text:
         return
     user = update.effective_user
-    if db.get_pending_input(user.id):
+    if await asyncio.to_thread(db.get_pending_input, user.id):
         return
     await _scramble_process_guess(update, context, update.effective_chat, user, message)
 
@@ -922,8 +854,6 @@ async def scramblehelp_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 def format_scramble_board(rows, title, position_info=None, requester_name=None) -> str:
-    """rows: [(name, wins, earned, current_streak), ...]. Win counts
-    are intentionally not shown - only 💵 earned and streak."""
     text = f"🔤 <b>{title}</b>\n\n"
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
 
@@ -948,8 +878,8 @@ def format_scramble_board(rows, title, position_info=None, requester_name=None) 
 async def scrambleleaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = update.effective_user
-    rows = db.scramble_get_chat_leaderboard(chat_id)
-    position_info = db.scramble_get_chat_position(chat_id, user.id)
+    rows = await asyncio.to_thread(db.scramble_get_chat_leaderboard, chat_id)
+    position_info = await asyncio.to_thread(db.scramble_get_chat_position, chat_id, user.id)
 
     await update.message.reply_html(
         format_scramble_board(rows, "Word Scramble - This Chat", position_info, user.first_name),
@@ -967,7 +897,6 @@ def scramble_topplayers_keyboard():
 
 
 def format_scramble_top_players(rows, title, position_info, requester_name, position_label) -> str:
-    """Win counts intentionally not shown - only 💵 earned and streak."""
     text = f"🔤 <b>{title}</b>\n\n"
 
     if not rows:
@@ -1003,7 +932,7 @@ async def scrambletopplayers_command(update: Update, context: ContextTypes.DEFAU
 
 
 async def scrambletopgroups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rows = db.scramble_get_top_groups(10)
+    rows = await asyncio.to_thread(db.scramble_get_top_groups, 10)
     if not rows:
         await update.message.reply_text("No Word Scramble activity recorded yet.")
         return
@@ -1028,7 +957,7 @@ async def scramblestopgame_command(update: Update, context: ContextTypes.DEFAULT
         return
 
     chat = update.effective_chat
-    word = db.scramble_claim_round(chat.id)
+    word = await asyncio.to_thread(db.scramble_claim_round, chat.id)
     cancel_scramble_timeout(context, chat.id)
 
     if not word:
@@ -1042,7 +971,7 @@ async def scramblestopgame_command(update: Update, context: ContextTypes.DEFAULT
 
 @owner_only
 async def scramblestats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    s = db.scramble_get_stats()
+    s = await asyncio.to_thread(db.scramble_get_stats)
     text = f"""
 📊 <b>Word Scramble Statistics</b>
 
@@ -1101,7 +1030,7 @@ async def scrambleforceend_command(update: Update, context: ContextTypes.DEFAULT
         )
         return
 
-    word = db.scramble_claim_round(target_chat_id)
+    word = await asyncio.to_thread(db.scramble_claim_round, target_chat_id)
     cancel_scramble_timeout(context, target_chat_id)
 
     if not word:
@@ -1121,21 +1050,13 @@ async def scrambleforceend_command(update: Update, context: ContextTypes.DEFAULT
 
 @owner_only
 async def scramblestopallgroups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Owner-only. Force-ends every currently active Word Scramble
-    round in EVERY group/DM at once, cancels each one's round timer,
-    and engages Word Scramble maintenance mode so nothing - manual
-    /wordscramble, Automatic Mode, Slow Mode, or /scramblemode - can
-    immediately start another round anywhere. Does not touch
-    /scrambleforceend, which still targets one chat at a time. Run
-    /scramblemaintenance off when you're ready to let Word Scramble
-    resume everywhere."""
     db.set_config("scramble_maintenance_mode", "1")
 
-    chat_ids = db.get_all_active_scramble_chats()
+    chat_ids = await asyncio.to_thread(db.get_all_active_scramble_chats)
     stopped = 0
 
     for chat_id in chat_ids:
-        word = db.scramble_claim_round(chat_id)
+        word = await asyncio.to_thread(db.scramble_claim_round, chat_id)
         cancel_scramble_timeout(context, chat_id)
         if word:
             stopped += 1
@@ -1207,11 +1128,6 @@ async def scrambleallcommands_command(update: Update, context: ContextTypes.DEFA
     await update.message.reply_html(text)
 
 
-# ---------------------------------------------------------------------
-# /slowmode - per-chat auto-start, timed from when the previous round
-# ended (owner only)
-# ---------------------------------------------------------------------
-
 def _slowmode_next_job_name(chat_id):
     return f"slowmode_next_{chat_id}"
 
@@ -1236,33 +1152,20 @@ def schedule_slowmode_next_round(job_queue, chat_id, interval_seconds):
 
 
 async def slowmode_next_round_callback(context: ContextTypes.DEFAULT_TYPE):
-    """Fires exactly once, <interval> after the PREVIOUS Word Scramble
-    round in this chat ended (win or timeout) - this is a one-shot
-    self-rescheduling timer, not a fixed repeating schedule, so the
-    next round always lands exactly <interval> after the last one
-    finished. Every round itself still expires after the normal fixed
-    2-minute SCRAMBLE_ROUND_SECONDS timer (schedule_scramble_timeout,
-    unchanged) - Slow Mode's interval only controls the gap BETWEEN
-    rounds, never how long a round lasts.
-
-    Self-retries (instead of dying) if Slow Mode was turned off mid-
-    flight, a round is somehow already active, a global scramble stop
-    (/scramblestopallgroups -> maintenance mode) is in effect, or the
-    chat couldn't be fetched - so a chat's Slow Mode schedule can never
-    permanently get stuck."""
     chat_id = context.job.chat_id
 
-    slow = db.get_scramble_slowmode(chat_id)
+    slow = await asyncio.to_thread(db.get_scramble_slowmode, chat_id)
     if not slow or not slow[1]:
         return
 
     interval_seconds = slow[0]
 
-    if db.get_config("scramble_maintenance_mode", "0") == "1":
+    maintenance = await asyncio.to_thread(db.get_config, "scramble_maintenance_mode", "0")
+    if maintenance == "1":
         schedule_slowmode_next_round(context.job_queue, chat_id, interval_seconds)
         return
 
-    if db.scramble_get_round(chat_id):
+    if await asyncio.to_thread(db.scramble_get_round, chat_id):
         return
 
     try:
@@ -1275,20 +1178,6 @@ async def slowmode_next_round_callback(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def slowmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Usage (run inside the target group, by a group admin or the
-    bot owner):
-    /slowmode on 2m - next Word Scramble round is sent exactly 2
-        minutes after the previous one ends (win or timeout);
-        /wordscramble is disabled while this is on
-    /slowmode on 5m
-    /slowmode off
-
-    Every individual round still lasts a maximum of exactly 2 minutes
-    (SCRAMBLE_ROUND_SECONDS) - the configured duration here only
-    controls the wait BETWEEN rounds, never how long players have to
-    answer. Turning Slow Mode on also turns per-chat Automatic Mode
-    off in this chat, since the two must never run at the same time -
-    Slow Mode always takes priority."""
     if update.effective_chat.type == ChatType.PRIVATE:
         await update.message.reply_text("🐢 Run /slowmode inside the group you want to apply it to.")
         return
@@ -1300,7 +1189,7 @@ async def slowmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
     if not context.args:
-        current = db.get_scramble_slowmode(chat_id)
+        current = await asyncio.to_thread(db.get_scramble_slowmode, chat_id)
         status = f"on, every {_format_duration_words(current[0])}" if current and current[1] else "off"
         await update.message.reply_text(
             f"Usage: /slowmode on <time>  (e.g. /slowmode on 2m)\n/slowmode off\n\nCurrently: {status}"
@@ -1310,7 +1199,7 @@ async def slowmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode = context.args[0].lower()
 
     if mode == "off":
-        db.set_scramble_slowmode(chat_id, 0, enabled=False)
+        await asyncio.to_thread(db.set_scramble_slowmode, chat_id, 0, False)
         cancel_slowmode_next_job(context.job_queue, chat_id)
         await update.message.reply_text("🐢 Slowmode turned off.")
         return
@@ -1324,26 +1213,17 @@ async def slowmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Invalid duration. Use e.g. 2m, 5m, 1h.")
         return
 
-    db.set_scramble_slowmode(chat_id, seconds, enabled=True)
-    # Slow Mode always takes priority over Automatic Mode - the two
-    # must never schedule rounds at the same time.
-    db.scramble_set_auto_enabled(chat_id, False)
+    await asyncio.to_thread(db.set_scramble_slowmode, chat_id, seconds, True)
+    await asyncio.to_thread(db.scramble_set_auto_enabled, chat_id, False)
 
-    if not db.scramble_get_round(chat_id):
+    if not await asyncio.to_thread(db.scramble_get_round, chat_id):
         schedule_slowmode_next_round(context.job_queue, chat_id, seconds)
-    # else: a round is already active - the next one is scheduled
-    # automatically (using this new interval) as soon as it ends, via
-    # _scramble_handle_win()/scramble_timeout_callback().
 
     await update.message.reply_text(
         f"🐢 Slowmode on - manual starts are paused; a new Word Scramble round starts here "
         f"automatically every {_format_duration_words(seconds)}."
     )
 
-
-# ---------------------------------------------------------------------
-# /scramblemode - global auto-start across every group (owner, DM only)
-# ---------------------------------------------------------------------
 
 SCRAMBLE_MODE_JOB_NAME = "scramble_mode_global"
 
@@ -1368,30 +1248,19 @@ def schedule_scramblemode_job(job_queue, interval_seconds):
 
 
 async def scramblemode_tick_callback(context: ContextTypes.DEFAULT_TYPE):
-    """Fires every <interval> and tries to start a round in EVERY
-    group the bot is currently in. A group with a round already active
-    is silently skipped (start_scramble_round() no-ops it) - manual
-    /wordscramble use is never blocked between ticks. Each individual
-    round started this way still expires after its own fixed 2-minute
-    timer (schedule_scramble_timeout, called from inside
-    start_scramble_round), so a round can never outlive its slot even
-    if nobody answers before the next tick."""
-    for chat_id, title in db.get_current_groups():
+    groups = await asyncio.to_thread(db.get_current_groups)
+    for chat_id, title in groups:
         fake_chat = SimpleNamespace(id=chat_id, type=ChatType.GROUP, title=title)
         try:
             result = await start_scramble_round(context, fake_chat)
             if result is True:
-                db.scramble_reset_manual_streak(chat_id)
+                await asyncio.to_thread(db.scramble_reset_manual_streak, chat_id)
         except Exception as e:
             logger.error(f"scramblemode tick failed for chat {chat_id}: {e}")
 
 
 @owner_only
 async def scramblemode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Usage (my DM only):
-    /scramblemode 1h - auto-starts a Word Scramble round in every
-    group every hour (m/h/d units). /scramblemode off to disable.
-    Manual /wordscramble use in any group is never blocked by this."""
     if update.effective_chat.type != ChatType.PRIVATE:
         await update.message.reply_text("🌐 Run /scramblemode in my DM.")
         return
@@ -1429,10 +1298,6 @@ async def scramblemode_command(update: Update, context: ContextTypes.DEFAULT_TYP
         f"Manual /wordscramble still works normally in between."
     )
 
-
-# ---------------------------------------------------------------------
-# /scrambletopup - adjusts ONLY the Word Scramble global balance
-# ---------------------------------------------------------------------
 
 @owner_only
 async def scrambletopup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1473,13 +1338,6 @@ async def scrambletopup_command(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 
-# ---------------------------------------------------------------------
-# /scrambleautomaticmode - manual on/off override for Automatic Mode.
-# Automatic Mode is NEVER turned on by the bot itself anymore (it used
-# to auto-activate after 5 consecutive manual /wordscramble starts) -
-# this command is now the only way to turn it on or off.
-# ---------------------------------------------------------------------
-
 async def scrambleautomaticmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == ChatType.PRIVATE:
         await update.message.reply_text("🤖 Run /scrambleautomaticmode inside the group you want to control.")
@@ -1494,7 +1352,7 @@ async def scrambleautomaticmode_command(update: Update, context: ContextTypes.DE
     chat_id = update.effective_chat.id
 
     if not context.args or context.args[0].lower() not in ("on", "off"):
-        _, enabled, _ = db.scramble_get_auto_mode(chat_id)
+        _, enabled, _ = await asyncio.to_thread(db.scramble_get_auto_mode, chat_id)
         await update.message.reply_text(
             f"Usage: /scrambleautomaticmode on|off\nCurrently: {'on' if enabled else 'off'}"
         )
@@ -1509,14 +1367,9 @@ async def scrambleautomaticmode_command(update: Update, context: ContextTypes.DE
         )
         return
 
-    db.scramble_set_auto_enabled(chat_id, mode == "on")
+    await asyncio.to_thread(db.scramble_set_auto_enabled, chat_id, mode == "on")
     await update.message.reply_text(f"🤖 Automatic Mode turned {mode}.")
 
-
-# ---------------------------------------------------------------------
-# /scrambleusers - owner-only directory of every Word Scramble
-# participant (used the command or guessed a word)
-# ---------------------------------------------------------------------
 
 SCRAMBLEUSERS_PAGE_SIZE = 20
 
@@ -1629,12 +1482,6 @@ def is_valid_english_word(text: str) -> bool:
 
 
 def random_word(chat_id, exclude=None):
-    """Pick a word for chat_id without repeating any word already used
-    in that chat's current cycle. Once every word in the pool has been
-    used, the cycle resets. `used_words` is a Postgres table keyed by
-    (chat_id, word), so this is restart-safe and per-chat - a group
-    that stopped partway through the pool resumes exactly where it left
-    off, whenever it next plays, with no time-based reset."""
     used = db.get_used_words(chat_id)
 
     choices = [w for w in WORDS if w not in used and w != exclude]
@@ -1697,15 +1544,15 @@ async def explain_timeout_callback(context: ContextTypes.DEFAULT_TYPE):
     leader_id = job.data["leader_id"]
     leader_name = job.data["leader_name"]
 
-    game = db.get_game(chat_id)
+    game = await asyncio.to_thread(db.get_game, chat_id)
     if not game or game[1] != leader_id:
         return
 
-    if db.is_explaining_started(chat_id):
+    if await asyncio.to_thread(db.is_explaining_started, chat_id):
         return
 
-    db.clear_leader(chat_id)
-    db.set_explaining_started(chat_id, False)
+    await asyncio.to_thread(db.clear_leader, chat_id)
+    await asyncio.to_thread(db.set_explaining_started, chat_id, False)
 
     await safe_send(
         context.bot,
@@ -1741,14 +1588,10 @@ def settings_keyboard(user_id):
     ])
 
 
-# ---------------------------------------------------------------------
-# Basic commands
-# ---------------------------------------------------------------------
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
 
-    db.add_user(user.id, user.first_name)
+    await asyncio.to_thread(db.add_user, user.id, user.first_name)
 
     if context.args:
         first_arg = context.args[0]
@@ -1760,33 +1603,29 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 subscription_id = None
 
             if subscription_id is not None:
-                ad_info = db.get_ad_business_name(subscription_id)
+                ad_info = await asyncio.to_thread(db.get_ad_business_name, subscription_id)
                 if ad_info:
                     business_name, ad_link = ad_info
-                    db.record_ad_click(subscription_id)
+                    await asyncio.to_thread(db.record_ad_click, subscription_id)
                     safe_href = html_lib.escape(str(ad_link), quote=True)
                     await update.message.reply_html(
                         f'👉 <a href="{safe_href}">Continue to {esc(business_name)}</a>'
                     )
                     return
-            # falls through to the sender's own profile below, unchanged,
-            # if the adclick_ payload didn't resolve to a real ad
 
         else:
-            # /start <username or ID> - anyone can look up any player's
-            # public profile (Balance/Level/Rank) this way.
             target_arg = first_arg.lstrip("@")
 
             if target_arg.isdigit():
-                row = db.get_user_by_id(int(target_arg))
+                row = await asyncio.to_thread(db.get_user_by_id, int(target_arg))
             else:
-                row = db.get_user_by_username(target_arg)
+                row = await asyncio.to_thread(db.get_user_by_username, target_arg)
 
             if not row:
                 await update.message.reply_text(f"❌ No player found matching {first_arg}.")
                 return
 
-            target_player = db.get_user(row[0])
+            target_player = await asyncio.to_thread(db.get_user, row[0])
             if not target_player:
                 await update.message.reply_text(f"❌ No player found matching {first_arg}.")
                 return
@@ -1802,7 +1641,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 """)
             return
 
-    player = db.get_user(user.id)
+    player = await asyncio.to_thread(db.get_user, user.id)
 
     welcome_text = f"""
 🎮 <b>Welcome Back, Warrior!</b>
@@ -1830,7 +1669,7 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user = update.effective_user
-    db.add_user(user.id, user.first_name)
+    await asyncio.to_thread(db.add_user, user.id, user.first_name)
 
     await update.message.reply_html(
         "⚙️ <b>Settings</b>\n\n"
@@ -1849,9 +1688,9 @@ async def claimdailyreward_command(update: Update, context: ContextTypes.DEFAULT
         return
 
     user = update.effective_user
-    db.add_user(user.id, user.first_name)
+    await asyncio.to_thread(db.add_user, user.id, user.first_name)
 
-    result = db.claim_daily_reward(user.id, user.first_name, user.username)
+    result = await asyncio.to_thread(db.claim_daily_reward, user.id, user.first_name, user.username)
 
     if result[0]:
         amount = int(db.get_config("reward_daily", db.DAILY_REWARD))
@@ -1859,10 +1698,6 @@ async def claimdailyreward_command(update: Update, context: ContextTypes.DEFAULT
 
     await update.message.reply_html(format_daily_reward_text(result))
 
-
-# ---------------------------------------------------------------------
-# Word game: /wordgame
-# ---------------------------------------------------------------------
 
 async def is_chat_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     chat = update.effective_chat
@@ -1883,7 +1718,7 @@ async def word_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = update.effective_chat.id
 
-    existing = db.get_game(chat_id)
+    existing = await asyncio.to_thread(db.get_game, chat_id)
     if existing and existing[1] is not None:
         if not await is_chat_admin(update, context):
             await update.message.reply_text(
@@ -1892,7 +1727,7 @@ async def word_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         cancel_explain_timeout(context, chat_id)
 
-    db.start_game(chat_id)
+    await asyncio.to_thread(db.start_game, chat_id)
 
     await update.message.reply_html(
         """
@@ -1937,10 +1772,6 @@ Come back in {hours} hrs {minutes} mins to claim again.
 """
 
 
-# ---------------------------------------------------------------------
-# Button callbacks
-# ---------------------------------------------------------------------
-
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
 
@@ -1956,8 +1787,8 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer()
             await query.edit_message_text(SCRAMBLE_GROUPS_ONLY_TEXT, parse_mode="HTML")
             return
-        if _slowmode_enabled(chat.id) and not db.scramble_get_round(chat.id):
-            interval = db.get_scramble_slowmode(chat.id)[0]
+        if _slowmode_enabled(chat.id) and not await asyncio.to_thread(db.scramble_get_round, chat.id):
+            interval = (await asyncio.to_thread(db.get_scramble_slowmode, chat.id))[0]
             await query.answer(
                 f"🐢 Slow mode is on - a new round starts automatically every {_format_duration_words(interval)}.",
                 show_alert=True,
@@ -1977,7 +1808,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "🛠️ Word Scramble is currently under maintenance.", show_alert=True
             )
         else:
-            db.scramble_reset_manual_streak(chat.id)
+            await asyncio.to_thread(db.scramble_reset_manual_streak, chat.id)
             await query.answer("🎮 Word Scramble started - check the chat!")
         return
 
@@ -1990,8 +1821,8 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=scramble_topplayers_keyboard(),
             )
             return
-        rows = db.scramble_get_chat_leaderboard(chat.id, limit=15)
-        position_info = db.scramble_get_chat_position(chat.id, user.id)
+        rows = await asyncio.to_thread(db.scramble_get_chat_leaderboard, chat.id, 15)
+        position_info = await asyncio.to_thread(db.scramble_get_chat_position, chat.id, user.id)
         await query.edit_message_text(
             format_scramble_top_players(rows, "Top 15 - This Chat", position_info, user.first_name, "Your Position"),
             parse_mode="HTML",
@@ -2002,8 +1833,8 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "stp_global":
         await query.answer()
-        rows = db.scramble_get_global_leaderboard(limit=15)
-        position_info = db.scramble_get_global_position(user.id)
+        rows = await asyncio.to_thread(db.scramble_get_global_leaderboard, 15)
+        position_info = await asyncio.to_thread(db.scramble_get_global_position, user.id)
         await query.edit_message_text(
             format_scramble_top_players(rows, "Top 15 - Global", position_info, user.first_name, "Your Global Position"),
             parse_mode="HTML",
@@ -2014,7 +1845,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "profile":
         await query.answer()
-        player = db.get_user(user.id)
+        player = await asyncio.to_thread(db.get_user, user.id)
 
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("⬅ Back", callback_data="home")]
@@ -2039,7 +1870,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "home":
         await query.answer()
-        player = db.get_user(user.id)
+        player = await asyncio.to_thread(db.get_user, user.id)
 
         await query.edit_message_text(
             f"""
@@ -2060,7 +1891,7 @@ Tap a button below to continue your adventure!
 
     if query.data == "daily_reward":
         await query.answer()
-        result = db.claim_daily_reward(user.id, user.first_name, user.username)
+        result = await asyncio.to_thread(db.claim_daily_reward, user.id, user.first_name, user.username)
 
         if result[0]:
             amount = int(db.get_config("reward_daily", db.DAILY_REWARD))
@@ -2082,8 +1913,8 @@ Tap a button below to continue your adventure!
             await query.answer()
             await query.edit_message_text(SCRAMBLE_GROUPS_ONLY_TEXT, parse_mode="HTML")
             return
-        if _slowmode_enabled(chat.id) and not db.scramble_get_round(chat.id):
-            interval = db.get_scramble_slowmode(chat.id)[0]
+        if _slowmode_enabled(chat.id) and not await asyncio.to_thread(db.scramble_get_round, chat.id):
+            interval = (await asyncio.to_thread(db.get_scramble_slowmode, chat.id))[0]
             await query.answer(
                 f"🐢 Slow mode is on - a new round starts automatically every {_format_duration_words(interval)}.",
                 show_alert=True,
@@ -2103,14 +1934,14 @@ Tap a button below to continue your adventure!
                 "🛠️ Word Scramble is currently under maintenance.", show_alert=True
             )
         else:
-            db.scramble_reset_manual_streak(chat.id)
+            await asyncio.to_thread(db.scramble_reset_manual_streak, chat.id)
             await query.answer("🎮 Word Scramble started - check the chat!")
         return
 
     if query.data == "leaderboard":
         await query.answer()
-        rows = db.get_global_leaderboard()
-        position_info = db.get_global_position(user.id)
+        rows = await asyncio.to_thread(db.get_global_leaderboard)
+        position_info = await asyncio.to_thread(db.get_global_position, user.id)
 
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("⬅ Back", callback_data="home")]
@@ -2126,7 +1957,7 @@ Tap a button below to continue your adventure!
 
     if query.data == "toggle_auto_lead":
         await query.answer()
-        db.toggle_auto_lead(user.id)
+        await asyncio.to_thread(db.toggle_auto_lead, user.id)
         await query.edit_message_reply_markup(
             reply_markup=settings_keyboard(user.id)
         )
@@ -2134,8 +1965,8 @@ Tap a button below to continue your adventure!
 
     if query.data == "lb_chat":
         await query.answer()
-        rows = db.get_chat_leaderboard(chat.id)
-        position_info = db.get_chat_position(chat.id, user.id)
+        rows = await asyncio.to_thread(db.get_chat_leaderboard, chat.id)
+        position_info = await asyncio.to_thread(db.get_chat_position, chat.id, user.id)
         await query.edit_message_text(
             format_board(rows, "Leaderboard - This Chat", position_info, user.first_name),
             parse_mode="HTML",
@@ -2146,8 +1977,8 @@ Tap a button below to continue your adventure!
 
     if query.data == "lb_global":
         await query.answer()
-        rows = db.get_global_leaderboard()
-        position_info = db.get_global_position(user.id)
+        rows = await asyncio.to_thread(db.get_global_leaderboard)
+        position_info = await asyncio.to_thread(db.get_global_position, user.id)
         await query.edit_message_text(
             format_board(rows, "Leaderboard - Global", position_info, user.first_name),
             parse_mode="HTML",
@@ -2181,8 +2012,8 @@ Tap a button below to continue your adventure!
             )
             return
 
-        rows = db.get_chat_leaderboard(chat.id, limit=15)
-        position_info = db.get_chat_position(chat.id, user.id)
+        rows = await asyncio.to_thread(db.get_chat_leaderboard, chat.id, 15)
+        position_info = await asyncio.to_thread(db.get_chat_position, chat.id, user.id)
         await query.edit_message_text(
             format_top_players(rows, "Top 15 - This Chat", position_info, user.first_name, "Your Position"),
             parse_mode="HTML",
@@ -2209,8 +2040,8 @@ Tap a button below to continue your adventure!
             )
             return
 
-        rows = db.get_global_leaderboard(limit=15)
-        position_info = db.get_global_position(user.id)
+        rows = await asyncio.to_thread(db.get_global_leaderboard, 15)
+        position_info = await asyncio.to_thread(db.get_global_position, user.id)
         await query.edit_message_text(
             format_top_players(rows, "Top 15 - Global", position_info, user.first_name, "Your Global Position"),
             parse_mode="HTML",
@@ -2218,8 +2049,6 @@ Tap a button below to continue your adventure!
             link_preview_options=LinkPreviewOptions(is_disabled=True),
         )
         return
-
-    # --- Owner-only paginated /users and /groups lists ------------------
 
     if query.data.startswith("ulpg:"):
         if not is_owner(user.id):
@@ -2247,8 +2076,6 @@ Tap a button below to continue your adventure!
         await query.edit_message_text(header, parse_mode="HTML", reply_markup=keyboard)
         return
 
-    # --- Owner-only paginated /botgroups list (Feature 1) ---------------
-
     if query.data.startswith("bglpg:"):
         if not is_owner(user.id):
             await query.answer("🚫 Owner only.", show_alert=True)
@@ -2270,7 +2097,7 @@ Tap a button below to continue your adventure!
         target_chat_id = int(chat_id_str)
         page = int(page_str)
 
-        details = db.get_group_full_details(target_chat_id)
+        details = await asyncio.to_thread(db.get_group_full_details, target_chat_id)
         if not details:
             await query.answer("❌ Group data not found.", show_alert=True)
             return
@@ -2313,8 +2140,6 @@ Tap a button below to continue your adventure!
         )
         return
 
-    # --- Owner-only interactive rankings (drill-down detail views) -----
-
     if query.data == "tp_back":
         await query.answer()
         await query.edit_message_text(
@@ -2354,7 +2179,7 @@ Tap a button below to continue your adventure!
             return
         _, uid_str, scope, ctx_str = query.data.split(":")
         target_id = int(uid_str)
-        profile = db.get_full_player_profile(target_id)
+        profile = await asyncio.to_thread(db.get_full_player_profile, target_id)
 
         if not profile:
             await query.answer("❌ Player data not found.", show_alert=True)
@@ -2418,7 +2243,7 @@ Tap a button below to continue your adventure!
         backscope = parts[2] if len(parts) > 2 else "top"
         backpage = int(parts[3]) if len(parts) > 3 else 0
 
-        details = db.get_group_details(target_chat_id)
+        details = await asyncio.to_thread(db.get_group_details, target_chat_id)
 
         if not details:
             await query.answer("❌ Group data not found.", show_alert=True)
@@ -2458,8 +2283,6 @@ Tap a button below to continue your adventure!
         )
         return
 
-    # --- Owner-only paginated /scrambleusers list -----------------------
-
     if query.data.startswith("sulpg:"):
         if not is_owner(user.id):
             await query.answer("🚫 Owner only.", show_alert=True)
@@ -2482,14 +2305,14 @@ Tap a button below to continue your adventure!
         target_chat_id = int(chat_id_str)
         page = int(page_str)
 
-        detail = db.get_scramble_participant_detail(target_id, target_chat_id)
+        detail = await asyncio.to_thread(db.get_scramble_participant_detail, target_id, target_chat_id)
         if not detail:
             await query.answer("❌ Not found.", show_alert=True)
             return
 
         name, played, wins, earned_in_chat = detail
-        global_balance = db.scramble_get_global_earned(target_id)
-        group_details = db.get_group_details(target_chat_id)
+        global_balance = await asyncio.to_thread(db.scramble_get_global_earned, target_id)
+        group_details = await asyncio.to_thread(db.get_group_details, target_chat_id)
         group_label = esc(group_details[1] or "Untitled Group") if group_details else "DM"
 
         text = f"""
@@ -2505,10 +2328,8 @@ Tap a button below to continue your adventure!
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
         return
 
-    # --- Word game callbacks ------------------------------------------
-
     if query.data == "volunteer":
-        game = db.get_game(chat.id)
+        game = await asyncio.to_thread(db.get_game, chat.id)
 
         if game and game[1] is not None:
             await query.answer(
@@ -2516,10 +2337,10 @@ Tap a button below to continue your adventure!
             )
             return
 
-        word = random_word(chat.id)
-        db.set_leader(chat.id, user.id, user.first_name, word)
-        db.set_explaining_started(chat.id, False)
-        db.start_explain_log(chat.id, user.id)
+        word = await asyncio.to_thread(random_word, chat.id)
+        await asyncio.to_thread(db.set_leader, chat.id, user.id, user.first_name, word)
+        await asyncio.to_thread(db.set_explaining_started, chat.id, False)
+        await asyncio.to_thread(db.start_explain_log, chat.id, user.id)
         schedule_explain_timeout(context, chat.id, user.id, user.first_name)
 
         await query.answer()
@@ -2535,7 +2356,7 @@ Tap a button below to continue your adventure!
         return
 
     if query.data in ("see_word", "write_word", "change_word", "drop_lead"):
-        game = db.get_game(chat.id)
+        game = await asyncio.to_thread(db.get_game, chat.id)
 
         if not game or game[1] is None:
             await query.answer("❌ There's no active round.", show_alert=True)
@@ -2551,7 +2372,7 @@ Tap a button below to continue your adventure!
 
         if query.data == "see_word":
             word = game[3]
-            db.set_explaining_started(chat.id, True)
+            await asyncio.to_thread(db.set_explaining_started, chat.id, True)
             cancel_explain_timeout(context, chat.id)
             await query.answer(
                 f"🎯 Your word is:\n\n{word}",
@@ -2560,9 +2381,9 @@ Tap a button below to continue your adventure!
             return
 
         if query.data == "write_word":
-            db.set_explaining_started(chat.id, True)
+            await asyncio.to_thread(db.set_explaining_started, chat.id, True)
             cancel_explain_timeout(context, chat.id)
-            db.set_pending_input(user.id, chat.id, "write_word")
+            await asyncio.to_thread(db.set_pending_input, user.id, chat.id, "write_word")
             try:
                 await context.bot.send_message(
                     chat_id=user.id,
@@ -2580,8 +2401,8 @@ Tap a button below to continue your adventure!
             return
 
         if query.data == "change_word":
-            new_word = random_word(chat.id, exclude=game[3])
-            db.set_word(chat.id, new_word)
+            new_word = await asyncio.to_thread(random_word, chat.id, game[3])
+            await asyncio.to_thread(db.set_word, chat.id, new_word)
 
             await query.answer(
                 "🔄 Word changed successfully!",
@@ -2596,8 +2417,8 @@ Tap a button below to continue your adventure!
 
         if query.data == "drop_lead":
             leader_name = game[2]
-            db.clear_leader(chat.id)
-            db.set_explaining_started(chat.id, False)
+            await asyncio.to_thread(db.clear_leader, chat.id)
+            await asyncio.to_thread(db.set_explaining_started, chat.id, False)
             cancel_explain_timeout(context, chat.id)
 
             await query.answer()
@@ -2613,13 +2434,9 @@ Who wants to explain?
             return
 
 
-# ---------------------------------------------------------------------
-# Private-chat text: handles the "Write Word" DM reply
-# ---------------------------------------------------------------------
-
 async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    pending = db.get_pending_input(user.id)
+    pending = await asyncio.to_thread(db.get_pending_input, user.id)
 
     if not pending:
         return
@@ -2635,16 +2452,16 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        game = db.get_game(chat_id)
+        game = await asyncio.to_thread(db.get_game, chat_id)
         if not game or game[1] != user.id:
             await update.message.reply_text(
                 "❌ You're not currently leading a round in that group."
             )
-            db.clear_pending_input(user.id)
+            await asyncio.to_thread(db.clear_pending_input, user.id)
             return
 
-        db.set_word(chat_id, word)
-        db.clear_pending_input(user.id)
+        await asyncio.to_thread(db.set_word, chat_id, word)
+        await asyncio.to_thread(db.clear_pending_input, user.id)
 
         await update.message.reply_text(
             f"✅ Word set! Players in the group will now try to guess it."
@@ -2659,10 +2476,6 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
-# ---------------------------------------------------------------------
-# Group-chat text: guess detection + accidental reveal detection
-# ---------------------------------------------------------------------
-
 async def group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message or not message.text:
@@ -2671,7 +2484,7 @@ async def group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
 
-    game = db.get_game(chat.id)
+    game = await asyncio.to_thread(db.get_game, chat.id)
     if not game or game[1] is None or not game[4]:
         return
 
@@ -2685,9 +2498,9 @@ async def group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     word_pattern = re.compile(r"\b" + re.escape(word_lower) + r"\b")
 
     if text_lower == "hint" and user.id != leader_id:
-        log = db.get_explain_log(chat.id, leader_id)
+        log = await asyncio.to_thread(db.get_explain_log, chat.id, leader_id)
         if log:
-            leader_message_id = db.get_leader_message_id(chat.id)
+            leader_message_id = await asyncio.to_thread(db.get_leader_message_id, chat.id)
             hints_text = format_numbered_hints(log, chat, leader_message_id)
             await safe_send(
                 context.bot,
@@ -2711,9 +2524,9 @@ async def group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except (Forbidden, BadRequest):
                 pass
 
-            db.award_coins(leader_id, chat.id, leader_name, -1)
-            db.clear_leader(chat.id)
-            db.set_explaining_started(chat.id, False)
+            await asyncio.to_thread(db.award_coins, leader_id, chat.id, leader_name, -1)
+            await asyncio.to_thread(db.clear_leader, chat.id)
+            await asyncio.to_thread(db.set_explaining_started, chat.id, False)
             cancel_explain_timeout(context, chat.id)
 
             await safe_send(
@@ -2727,16 +2540,17 @@ async def group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=volunteer_keyboard(),
             )
         else:
-            if not db.get_explain_log(chat.id, leader_id):
-                db.set_leader_message_id(chat.id, message.message_id)
-            db.append_explain_log(chat.id, leader_id, text)
+            existing_log = await asyncio.to_thread(db.get_explain_log, chat.id, leader_id)
+            if not existing_log:
+                await asyncio.to_thread(db.set_leader_message_id, chat.id, message.message_id)
+            await asyncio.to_thread(db.append_explain_log, chat.id, leader_id, text)
         return
 
     guess_clean = re.sub(r"[^\w\s]", "", text_lower).strip()
     if guess_clean == word_lower:
         winner = user
 
-        if not db.is_explaining_started(chat.id):
+        if not await asyncio.to_thread(db.is_explaining_started, chat.id):
             cheat_penalty = get_reward("cheat")
 
             try:
@@ -2744,11 +2558,11 @@ async def group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except (Forbidden, BadRequest):
                 pass
 
-            db.award_coins(winner.id, chat.id, winner.first_name, cheat_penalty)
-            db.clear_leader(chat.id)
-            db.set_explaining_started(chat.id, False)
+            await asyncio.to_thread(db.award_coins, winner.id, chat.id, winner.first_name, cheat_penalty)
+            await asyncio.to_thread(db.clear_leader, chat.id)
+            await asyncio.to_thread(db.set_explaining_started, chat.id, False)
             cancel_explain_timeout(context, chat.id)
-            db.clear_stop_votes(chat.id)
+            await asyncio.to_thread(db.clear_stop_votes, chat.id)
 
             await safe_send(
                 context.bot,
@@ -2764,18 +2578,18 @@ async def group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_react(context.bot, chat.id, message.message_id, "🎉")
 
         win_reward = get_reward("win")
-        db.award_coins(winner.id, chat.id, winner.first_name, win_reward)
-        db.award_coins(leader_id, chat.id, leader_name, win_reward)
+        await asyncio.to_thread(db.award_coins, winner.id, chat.id, winner.first_name, win_reward)
+        await asyncio.to_thread(db.award_coins, leader_id, chat.id, leader_name, win_reward)
 
-        db.increment_stat("games_played", 1)
-        db.increment_stat("words_solved", 1)
-        db.increment_group_games(chat.id)
-        db.increment_user_game_stats(winner.id, played=1, won=1)
-        db.increment_user_game_stats(leader_id, played=1, won=0)
+        await asyncio.to_thread(db.increment_stat, "games_played", 1)
+        await asyncio.to_thread(db.increment_stat, "words_solved", 1)
+        await asyncio.to_thread(db.increment_group_games, chat.id)
+        await asyncio.to_thread(db.increment_user_game_stats, winner.id, 1, 1)
+        await asyncio.to_thread(db.increment_user_game_stats, leader_id, 1, 0)
 
         cancel_explain_timeout(context, chat.id)
 
-        auto_lead = db.get_auto_lead(winner.id)
+        auto_lead = await asyncio.to_thread(db.get_auto_lead, winner.id)
 
         result_text = (
             f"🎉 {winner.first_name} found the word!\n\n"
@@ -2785,10 +2599,10 @@ async def group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         if auto_lead:
-            new_word = random_word(chat.id)
-            db.set_leader(chat.id, winner.id, winner.first_name, new_word)
-            db.set_explaining_started(chat.id, False)
-            db.start_explain_log(chat.id, winner.id)
+            new_word = await asyncio.to_thread(random_word, chat.id)
+            await asyncio.to_thread(db.set_leader, chat.id, winner.id, winner.first_name, new_word)
+            await asyncio.to_thread(db.set_explaining_started, chat.id, False)
+            await asyncio.to_thread(db.start_explain_log, chat.id, winner.id)
 
             await safe_send(context.bot, chat.id, text=result_text)
 
@@ -2804,7 +2618,7 @@ async def group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
             if sent is None:
-                db.clear_leader(chat.id)
+                await asyncio.to_thread(db.clear_leader, chat.id)
                 await safe_send(
                     context.bot,
                     chat.id,
@@ -2814,8 +2628,8 @@ async def group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 schedule_explain_timeout(context, chat.id, winner.id, winner.first_name)
         else:
-            db.clear_leader(chat.id)
-            db.set_explaining_started(chat.id, False)
+            await asyncio.to_thread(db.clear_leader, chat.id)
+            await asyncio.to_thread(db.set_explaining_started, chat.id, False)
 
             await safe_send(context.bot, chat.id, text=result_text)
             await safe_send(
@@ -2826,7 +2640,7 @@ async def group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    if db.is_explaining_started(chat.id) and is_close_guess(guess_clean, word_lower):
+    if await asyncio.to_thread(db.is_explaining_started, chat.id) and is_close_guess(guess_clean, word_lower):
         await safe_react(context.bot, chat.id, message.message_id, "👀")
         return
 
@@ -2839,17 +2653,17 @@ async def hint_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat = update.effective_chat
-    game = db.get_game(chat.id)
+    game = await asyncio.to_thread(db.get_game, chat.id)
 
     if not game or game[1] is None:
         await update.message.reply_text("❌ There's no active round right now.")
         return
 
     leader_id, leader_name = game[1], game[2]
-    log = db.get_explain_log(chat.id, leader_id)
+    log = await asyncio.to_thread(db.get_explain_log, chat.id, leader_id)
 
     if log:
-        leader_message_id = db.get_leader_message_id(chat.id)
+        leader_message_id = await asyncio.to_thread(db.get_leader_message_id, chat.id)
         hints_text = format_numbered_hints(log, chat, leader_message_id)
         await update.message.reply_html(
             f"💡 <b>Hints from {esc(leader_name)}:</b>\n\n{hints_text}",
@@ -2869,7 +2683,7 @@ async def autolead_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user = update.effective_user
-    db.add_user(user.id, user.first_name)
+    await asyncio.to_thread(db.add_user, user.id, user.first_name)
 
     await update.message.reply_html(
         "⚙️ <b>Auto-Lead</b>\n\n"
@@ -2910,10 +2724,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(text)
 
 
-# ---------------------------------------------------------------------
-# Leaderboards
-# ---------------------------------------------------------------------
-
 def format_board(rows, title, position_info=None, requester_name=None):
     text = f"🏆 <b>{title}</b>\n\n"
 
@@ -2949,8 +2759,8 @@ def leaderboard_keyboard():
 async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = update.effective_user
-    rows = db.get_chat_leaderboard(chat_id)
-    position_info = db.get_chat_position(chat_id, user.id)
+    rows = await asyncio.to_thread(db.get_chat_leaderboard, chat_id)
+    position_info = await asyncio.to_thread(db.get_chat_position, chat_id, user.id)
 
     await update.message.reply_html(
         format_board(rows, "Leaderboard - This Chat", position_info, user.first_name),
@@ -2967,8 +2777,8 @@ async def chat_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user = update.effective_user
-    rows = db.get_chat_leaderboard(update.effective_chat.id)
-    position_info = db.get_chat_position(update.effective_chat.id, user.id)
+    rows = await asyncio.to_thread(db.get_chat_leaderboard, update.effective_chat.id)
+    position_info = await asyncio.to_thread(db.get_chat_position, update.effective_chat.id, user.id)
     await update.message.reply_html(
         format_board(rows, "Group Leaderboard", position_info, user.first_name),
         link_preview_options=LinkPreviewOptions(is_disabled=True),
@@ -2977,17 +2787,13 @@ async def chat_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def global_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    rows = db.get_global_leaderboard()
-    position_info = db.get_global_position(user.id)
+    rows = await asyncio.to_thread(db.get_global_leaderboard)
+    position_info = await asyncio.to_thread(db.get_global_position, user.id)
     await update.message.reply_html(
         format_board(rows, "Global Leaderboard", position_info, user.first_name),
         link_preview_options=LinkPreviewOptions(is_disabled=True),
     )
 
-
-# ---------------------------------------------------------------------
-# App setup
-# ---------------------------------------------------------------------
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     update_id = getattr(update, "update_id", "?")
@@ -2998,10 +2804,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ---------------------------------------------------------------------
-# Global gate
-# ---------------------------------------------------------------------
-
 async def pre_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat = update.effective_chat
@@ -3009,7 +2811,8 @@ async def pre_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user is None:
         return
 
-    if not is_owner(user.id) and await asyncio.to_thread(db.is_user_banned, user.id):
+    user_banned = await asyncio.to_thread(db.is_user_banned, user.id)
+    if not is_owner(user.id) and user_banned:
         is_command = bool(
             update.effective_message
             and update.effective_message.text
@@ -3033,7 +2836,8 @@ async def pre_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
         raise ApplicationHandlerStop
 
     if chat is not None and chat.type != ChatType.PRIVATE:
-        if await asyncio.to_thread(db.is_group_banned, chat.id):
+        group_banned = await asyncio.to_thread(db.is_group_banned, chat.id)
+        if group_banned:
             try:
                 await context.bot.leave_chat(chat.id)
             except (Forbidden, BadRequest):
@@ -3042,7 +2846,8 @@ async def pre_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await asyncio.to_thread(db.register_group, chat.id, chat.title or str(chat.id))
 
-    if not is_bot_admin_or_owner(user.id) and await asyncio.to_thread(db.get_config, "maintenance_mode", "0") == "1":
+    maintenance_mode = await asyncio.to_thread(db.get_config, "maintenance_mode", "0")
+    if not is_bot_admin_or_owner(user.id) and maintenance_mode == "1":
         is_command = bool(
             update.effective_message
             and update.effective_message.text
@@ -3069,11 +2874,6 @@ async def pre_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_bot_membership_change(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fires when the bot itself is added to / removed from a chat.
-    Auto-leaves banned groups, registers new groups right away, marks
-    a group as 'removed' when the bot is kicked/leaves (feeds
-    /botgroups), and notifies the owner on a genuinely NEW add (not a
-    status change like member->administrator)."""
     result = update.my_chat_member
     if result.new_chat_member.user.id != context.bot.id:
         return
@@ -3083,13 +2883,13 @@ async def on_bot_membership_change(update: Update, context: ContextTypes.DEFAULT
     new_status = result.new_chat_member.status
 
     if new_status in ("member", "administrator"):
-        if db.is_group_banned(chat.id):
+        if await asyncio.to_thread(db.is_group_banned, chat.id):
             try:
                 await context.bot.leave_chat(chat.id)
             except (Forbidden, BadRequest):
                 pass
             return
-        db.register_group(chat.id, chat.title or str(chat.id))
+        await asyncio.to_thread(db.register_group, chat.id, chat.title or str(chat.id))
 
         if old_status in ("left", "kicked"):
             try:
@@ -3107,12 +2907,8 @@ async def on_bot_membership_change(update: Update, context: ContextTypes.DEFAULT
         return
 
     if new_status in ("left", "kicked"):
-        db.mark_group_left(chat.id)
+        await asyncio.to_thread(db.mark_group_left, chat.id)
 
-
-# ---------------------------------------------------------------------
-# /topgroups and /topplayers (work in both groups and DMs)
-# ---------------------------------------------------------------------
 
 def owner_top_groups_keyboard():
     rows = db.get_top_groups_full(10)
@@ -3215,10 +3011,6 @@ async def topplayers_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
-# ---------------------------------------------------------------------
-# /stopvote and /stopgame
-# ---------------------------------------------------------------------
-
 def _join_names(names):
     if len(names) == 1:
         return names[0]
@@ -3235,25 +3027,25 @@ async def stopvote_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
 
-    game = db.get_game(chat.id)
+    game = await asyncio.to_thread(db.get_game, chat.id)
     if not game or game[1] is None:
         await update.message.reply_text("❌ There's no active round to stop.")
         return
 
-    added = db.add_stop_vote(chat.id, user.id, user.first_name)
+    added = await asyncio.to_thread(db.add_stop_vote, chat.id, user.id, user.first_name)
     if not added:
         await update.message.reply_text("⚠️ You've already voted to stop this game.")
         return
 
-    count = db.get_stop_vote_count(chat.id)
+    count = await asyncio.to_thread(db.get_stop_vote_count, chat.id)
 
     if count >= 3:
-        names = db.get_stop_vote_names(chat.id)
+        names = await asyncio.to_thread(db.get_stop_vote_names, chat.id)
 
-        db.clear_leader(chat.id)
-        db.set_explaining_started(chat.id, False)
+        await asyncio.to_thread(db.clear_leader, chat.id)
+        await asyncio.to_thread(db.set_explaining_started, chat.id, False)
         cancel_explain_timeout(context, chat.id)
-        db.clear_stop_votes(chat.id)
+        await asyncio.to_thread(db.clear_stop_votes, chat.id)
 
         await safe_send(
             context.bot,
@@ -3281,25 +3073,21 @@ async def stopgame_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat = update.effective_chat
-    game = db.get_game(chat.id)
+    game = await asyncio.to_thread(db.get_game, chat.id)
     if not game or game[1] is None:
         await update.message.reply_text("❌ There's no active round to stop.")
         return
 
-    db.clear_leader(chat.id)
-    db.set_explaining_started(chat.id, False)
+    await asyncio.to_thread(db.clear_leader, chat.id)
+    await asyncio.to_thread(db.set_explaining_started, chat.id, False)
     cancel_explain_timeout(context, chat.id)
-    db.clear_stop_votes(chat.id)
+    await asyncio.to_thread(db.clear_stop_votes, chat.id)
 
     await update.message.reply_html(
         "🛑 <b>Game stopped.</b>\n\nWho wants to explain?",
         reply_markup=volunteer_keyboard(),
     )
 
-
-# =======================================================================
-# Advertisement Manager system
-# =======================================================================
 
 def _ad_inquiry_message() -> str:
     return (
@@ -3599,10 +3387,6 @@ async def changesponsoredad_command(update: Update, context: ContextTypes.DEFAUL
     await update.message.reply_text(f"✅ Sponsored Ad updated to: {value}")
 
 
-# =======================================================================
-# OWNER ADMIN PANEL
-# =======================================================================
-
 @owner_only
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_users = db.get_user_count()
@@ -3711,9 +3495,6 @@ def build_groups_list_page(page: int):
 
 
 def build_botgroups_list_page(page: int):
-    """Owner-only /botgroups: paginated, tabular (🎮 word game / 🔤
-    scramble game counts per row), 🟢/🔴 current-vs-removed status,
-    each row clickable to inspect + a Join Group link."""
     total = db.get_botgroups_count()
     offset = page * BOTGROUPS_PAGE_SIZE
     rows = db.get_botgroups_page(offset, BOTGROUPS_PAGE_SIZE)
@@ -3752,9 +3533,6 @@ def build_botgroups_list_page(page: int):
 
 @owner_only
 async def botgroups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Owner-only. Shows total groups ever, currently in, and removed
-    from - in a tappable, tabular list with per-group Word Game and
-    Word Scramble activity, and a Join Group link on each detail view."""
     header, keyboard = build_botgroups_list_page(0)
     if header is None:
         await update.message.reply_text("No groups registered yet.")
@@ -4506,10 +4284,6 @@ def main():
     ), group=1)
 
     if app.job_queue is not None:
-        # Must run first: restores/expires any Word Scramble round that
-        # was still active when the bot last stopped, since its
-        # in-memory 2-minute timer did not survive the restart. Without
-        # this, that chat's Word Scramble would be stuck forever.
         restore_stale_scramble_rounds(app.job_queue)
 
         if db.get_config("scramble_mode_enabled", "0") == "1":
@@ -4522,10 +4296,6 @@ def main():
         for chat_id, interval_seconds in db.get_all_active_slowmode_chats():
             if not db.scramble_get_round(chat_id):
                 schedule_slowmode_next_round(app.job_queue, chat_id, interval_seconds)
-            # else: that chat's round survived restore_stale_scramble_rounds()
-            # above (still within its 2-minute window) - its Slow Mode
-            # timer will be (re)scheduled automatically when that round
-            # ends, via _scramble_handle_win()/scramble_timeout_callback().
 
     return app
 
