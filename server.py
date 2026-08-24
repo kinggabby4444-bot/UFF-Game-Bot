@@ -2,6 +2,7 @@ import os
 import asyncio
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from aiohttp import web
 
 from telegram import Update
@@ -31,10 +32,11 @@ class BotRunner:
     only ever block THIS bot's thread - never the shared aiohttp server
     that answers Telegram's webhook requests and Render's health checks."""
 
-    def __init__(self, name, build_app_fn, webhook_path):
+    def __init__(self, name, build_app_fn, webhook_path, max_db_workers=8):
         self.name = name
         self.build_app_fn = build_app_fn
         self.webhook_path = webhook_path
+        self.max_db_workers = max_db_workers
         self.loop = None
         self.app = None
         self.ready = threading.Event()
@@ -43,6 +45,14 @@ class BotRunner:
     def _run(self):
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
+        # Cap concurrent asyncio.to_thread() workers to the DB pool size,
+        # so under a burst of messages, extra DB calls queue and wait
+        # for a free connection instead of all firing at once and
+        # exhausting the pool (PoolError). Without this, to_thread's
+        # default executor allows far more concurrent threads than the
+        # pool has connections.
+        executor = ThreadPoolExecutor(max_workers=self.max_db_workers)
+        self.loop.set_default_executor(executor)
         try:
             self.app = self.build_app_fn()
             self.loop.run_until_complete(self._startup())
@@ -86,8 +96,11 @@ class BotRunner:
         self.loop.call_soon_threadsafe(self.loop.stop)
 
 
-game_runner = BotRunner("GAME BOT", game_bot_module.main, GAME_WEBHOOK_PATH)
-ads_runner = BotRunner("ADS BOT", ads_bot_module.main, ADS_WEBHOOK_PATH)
+GAME_DB_WORKERS = int(os.environ.get("GAME_DB_POOL_MAX", "10"))
+ADS_DB_WORKERS = int(os.environ.get("ADS_DB_POOL_MAX", "5"))
+
+game_runner = BotRunner("GAME BOT", game_bot_module.main, GAME_WEBHOOK_PATH, max_db_workers=GAME_DB_WORKERS)
+ads_runner = BotRunner("ADS BOT", ads_bot_module.main, ADS_WEBHOOK_PATH, max_db_workers=ADS_DB_WORKERS)
 
 
 async def health(request):
