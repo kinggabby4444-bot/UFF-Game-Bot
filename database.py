@@ -26,6 +26,8 @@ _pool = psycopg2.pool.ThreadedConnectionPool(
     minconn=1,
     maxconn=int(os.environ.get("GAME_DB_POOL_MAX", "10")),
     dsn=DATABASE_URL,
+    connect_timeout=10,
+    options="-c statement_timeout=15000",
 )
 
 
