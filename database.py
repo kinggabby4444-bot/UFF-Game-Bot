@@ -63,6 +63,13 @@ class PooledConnection:
 
 def connect():
     raw = _pool.getconn()
+    try:
+        with raw.cursor() as cursor:
+            cursor.execute("SET statement_timeout = 15000")
+        raw.commit()
+    except Exception:
+        _pool.putconn(raw, close=True)
+        raise
     return PooledConnection(raw, _pool)
 
 
