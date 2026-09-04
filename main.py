@@ -1000,7 +1000,7 @@ async def scramblesetreward_command(update: Update, context: ContextTypes.DEFAUL
         await update.message.reply_text("❌ Amount must be positive.")
         return
 
-    db.set_config("reward_scramble_win", amount)
+    await asyncio.to_thread(db.set_config, "reward_scramble_win", amount)
     await update.message.reply_text(f"✅ Word Scramble win reward set to {DOLLAR}{amount}. Takes effect immediately.")
 
 
@@ -1050,7 +1050,7 @@ async def scrambleforceend_command(update: Update, context: ContextTypes.DEFAULT
 
 @owner_only
 async def scramblestopallgroups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    db.set_config("scramble_maintenance_mode", "1")
+    await asyncio.to_thread(db.set_config, "scramble_maintenance_mode", "1")
 
     chat_ids = await asyncio.to_thread(db.get_all_active_scramble_chats)
     stopped = 0
@@ -1080,14 +1080,14 @@ async def scramblestopallgroups_command(update: Update, context: ContextTypes.DE
 @owner_or_admin_only
 async def scramblemaintenance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args or context.args[0].lower() not in ("on", "off"):
-        current = db.get_config("scramble_maintenance_mode", "0")
+        current = await asyncio.to_thread(db.get_config, "scramble_maintenance_mode", "0")
         await update.message.reply_text(
             f"Usage: /scramblemaintenance on|off\nCurrently: {'on' if current == '1' else 'off'}"
         )
         return
 
     mode = context.args[0].lower()
-    db.set_config("scramble_maintenance_mode", "1" if mode == "on" else "0")
+    await asyncio.to_thread(db.set_config, "scramble_maintenance_mode", "1" if mode == "on" else "0")
     await update.message.reply_text(
         f"🛠️ Word Scramble maintenance mode {'enabled' if mode == 'on' else 'disabled'}. "
         f"(Word Game is unaffected.)"
@@ -1266,8 +1266,8 @@ async def scramblemode_command(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if not context.args:
-        enabled = db.get_config("scramble_mode_enabled", "0") == "1"
-        interval = db.get_config("scramble_mode_interval_seconds", "")
+        enabled = await asyncio.to_thread(db.get_config, "scramble_mode_enabled", "0") == "1"
+        interval = await asyncio.to_thread(db.get_config, "scramble_mode_interval_seconds", "")
         status = f"on, every {interval}s" if enabled else "off"
         await update.message.reply_text(
             "Usage: /scramblemode <time>  (e.g. /scramblemode 1h, 30m, 1d)\n"
@@ -1278,7 +1278,7 @@ async def scramblemode_command(update: Update, context: ContextTypes.DEFAULT_TYP
     arg = context.args[0].lower()
 
     if arg == "off":
-        db.set_config("scramble_mode_enabled", "0")
+        await asyncio.to_thread(db.set_config, "scramble_mode_enabled", "0")
         cancel_scramblemode_job(context.job_queue)
         await update.message.reply_text("🌐 Scramble Mode turned off.")
         return
@@ -1290,8 +1290,8 @@ async def scramblemode_command(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    db.set_config("scramble_mode_enabled", "1")
-    db.set_config("scramble_mode_interval_seconds", str(seconds))
+    await asyncio.to_thread(db.set_config, "scramble_mode_enabled", "1")
+    await asyncio.to_thread(db.set_config, "scramble_mode_interval_seconds", str(seconds))
     schedule_scramblemode_job(context.job_queue, seconds)
     await update.message.reply_text(
         f"🌐 Scramble Mode on - a new Word Scramble round auto-starts in every group every {arg}. "
@@ -1317,9 +1317,9 @@ async def scrambletopup_command(update: Update, context: ContextTypes.DEFAULT_TY
     amount = int(amount_arg)
 
     if target_arg.isdigit():
-        row = db.get_user_by_id(int(target_arg))
+        row = await asyncio.to_thread(db.get_user_by_id, int(target_arg))
     else:
-        row = db.get_user_by_username(target_arg)
+        row = await asyncio.to_thread(db.get_user_by_username, target_arg)
 
     if not row:
         await update.message.reply_text(f"❌ No player found matching {context.args[0]}.")
@@ -1327,7 +1327,7 @@ async def scrambletopup_command(update: Update, context: ContextTypes.DEFAULT_TY
 
     target_id, target_name, target_username, _ = row
 
-    new_balance = db.scramble_adjust_global_earned(target_id, target_name, amount)
+    new_balance = await asyncio.to_thread(db.scramble_adjust_global_earned, target_id, target_name, amount)
 
     action = "added" if amount >= 0 else "deducted"
     display = f"@{target_username}" if target_username else esc(target_name)
@@ -1680,7 +1680,7 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def claimdailyreward_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != ChatType.PRIVATE:
-        amount = db.get_config("reward_daily", db.DAILY_REWARD)
+        amount = await asyncio.to_thread(db.get_config, "reward_daily", db.DAILY_REWARD)
         await update.message.reply_text(
             f"To claim your daily reward ({amount}), please message me privately "
             f"and use the /claimdailyreward command."
@@ -1693,7 +1693,7 @@ async def claimdailyreward_command(update: Update, context: ContextTypes.DEFAULT
     result = await asyncio.to_thread(db.claim_daily_reward, user.id, user.first_name, user.username)
 
     if result[0]:
-        amount = int(db.get_config("reward_daily", db.DAILY_REWARD))
+        amount = int(await asyncio.to_thread(db.get_config, "reward_daily", db.DAILY_REWARD))
         apply_chat_credit_for_global_earning(user.id, user.first_name, amount)
 
     await update.message.reply_html(format_daily_reward_text(result))
@@ -1894,7 +1894,7 @@ Tap a button below to continue your adventure!
         result = await asyncio.to_thread(db.claim_daily_reward, user.id, user.first_name, user.username)
 
         if result[0]:
-            amount = int(db.get_config("reward_daily", db.DAILY_REWARD))
+            amount = int(await asyncio.to_thread(db.get_config, "reward_daily", db.DAILY_REWARD))
             apply_chat_credit_for_global_earning(user.id, user.first_name, amount, current_chat=chat)
 
         keyboard = InlineKeyboardMarkup([
@@ -2938,7 +2938,7 @@ async def topgroups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    rows = db.get_top_groups(10)
+    rows = await asyncio.to_thread(db.get_top_groups, 10)
 
     if not rows:
         await update.message.reply_text("No group activity recorded yet.")
@@ -3278,7 +3278,7 @@ async def addadmanager_command(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    db.set_config("ad_manager_username", username)
+    await asyncio.to_thread(db.set_config, "ad_manager_username", username)
     await update.message.reply_text(
         f"✅ @{username} is now the Advertisement Manager. "
         f"The advertisement link will open https://t.me/{username}."
@@ -3295,7 +3295,7 @@ async def changeadmanager_command(update: Update, context: ContextTypes.DEFAULT_
         )
         return
 
-    db.set_config("ad_manager_username", username)
+    await asyncio.to_thread(db.set_config, "ad_manager_username", username)
     await update.message.reply_text(
         f"✅ Advertisement Manager updated to @{username}. "
         f"The advertisement link now opens https://t.me/{username} everywhere in the bot."
@@ -3304,12 +3304,12 @@ async def changeadmanager_command(update: Update, context: ContextTypes.DEFAULT_
 
 @owner_or_admin_only
 async def removeadmanager_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    current = db.get_config("ad_manager_username", "")
+    current = await asyncio.to_thread(db.get_config, "ad_manager_username", "")
     if not current:
         await update.message.reply_text("⚠️ There's no Advertisement Manager currently assigned.")
         return
 
-    db.set_config("ad_manager_username", "")
+    await asyncio.to_thread(db.set_config, "ad_manager_username", "")
     await update.message.reply_text(
         "✅ Advertisement Manager removed. The advertisement section is now hidden "
         "from /leaderboard, /topplayers, and /topgroups until a new one is set."
@@ -3318,7 +3318,7 @@ async def removeadmanager_command(update: Update, context: ContextTypes.DEFAULT_
 
 @owner_or_admin_only
 async def admanager_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    current = db.get_config("ad_manager_username", "")
+    current = await asyncio.to_thread(db.get_config, "ad_manager_username", "")
     if not current:
         await update.message.reply_text("No Advertisement Manager is currently assigned.")
         return
@@ -3337,7 +3337,7 @@ async def ad_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     mode = context.args[0].lower()
-    db.set_config("ads_enabled", "1" if mode == "on" else "0")
+    await asyncio.to_thread(db.set_config, "ads_enabled", "1" if mode == "on" else "0")
 
     if mode == "on":
         await update.message.reply_text("✅ Advertisements have been enabled successfully.")
@@ -3348,7 +3348,7 @@ async def ad_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @owner_only
 async def sponsoredad_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args or context.args[0].lower() not in ("on", "off"):
-        current = db.get_config("sponsored_ad_enabled", "1")
+        current = await asyncio.to_thread(db.get_config, "sponsored_ad_enabled", "1")
         await update.message.reply_text(
             "Usage: /sponsoredad on|off\n"
             f"Currently: {'on' if current == '1' else 'off'}"
@@ -3356,14 +3356,14 @@ async def sponsoredad_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     mode = context.args[0].lower()
-    db.set_config("sponsored_ad_enabled", "1" if mode == "on" else "0")
+    await asyncio.to_thread(db.set_config, "sponsored_ad_enabled", "1" if mode == "on" else "0")
     await update.message.reply_text(f"✅ Sponsored Ad slot turned {mode}.")
 
 
 @owner_only
 async def changesponsoredad_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        current = db.get_config("sponsored_ad_override", "")
+        current = await asyncio.to_thread(db.get_config, "sponsored_ad_override", "")
         await update.message.reply_text(
             "Usage: /changesponsoredad <value>\n\n"
             "Formats accepted:\n"
@@ -3379,22 +3379,22 @@ async def changesponsoredad_command(update: Update, context: ContextTypes.DEFAUL
     value = " ".join(context.args).strip()
 
     if value.lower() in ("clear", "none", "reset"):
-        db.set_config("sponsored_ad_override", "")
+        await asyncio.to_thread(db.set_config, "sponsored_ad_override", "")
         await update.message.reply_text("✅ Sponsored Ad override cleared.")
         return
 
-    db.set_config("sponsored_ad_override", value)
+    await asyncio.to_thread(db.set_config, "sponsored_ad_override", value)
     await update.message.reply_text(f"✅ Sponsored Ad updated to: {value}")
 
 
 @owner_only
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    total_users = db.get_user_count()
-    total_groups = db.get_group_count()
-    games_played = db.get_stat("games_played")
-    words_solved = db.get_stat("words_solved")
-    total_rewards = db.get_stat("total_rewards_given")
-    active_games = db.get_active_games_count()
+    total_users = await asyncio.to_thread(db.get_user_count)
+    total_groups = await asyncio.to_thread(db.get_group_count)
+    games_played = await asyncio.to_thread(db.get_stat, "games_played")
+    words_solved = await asyncio.to_thread(db.get_stat, "words_solved")
+    total_rewards = await asyncio.to_thread(db.get_stat, "total_rewards_given")
+    active_games = await asyncio.to_thread(db.get_active_games_count)
     uptime = format_uptime(datetime.now() - START_TIME)
 
     text = f"""
@@ -3544,7 +3544,7 @@ async def botgroups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def groups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args:
         query = " ".join(context.args)
-        rows = db.search_groups(query)
+        rows = await asyncio.to_thread(db.search_groups, query)
 
         if not rows:
             await update.message.reply_text("No matching groups found.")
@@ -3576,7 +3576,7 @@ async def groups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args:
         query = " ".join(context.args)
-        rows = db.search_users(query)
+        rows = await asyncio.to_thread(db.search_users, query)
 
         if not rows:
             await update.message.reply_text("No matching users found.")
@@ -3618,7 +3618,7 @@ async def banuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ You can't ban yourself.")
         return
 
-    db.ban_user(target_id, update.effective_user.id)
+    await asyncio.to_thread(db.ban_user, target_id, update.effective_user.id)
     await update.message.reply_text(f"🚫 User <code>{target_id}</code> has been banned.", parse_mode="HTML")
 
 
@@ -3633,7 +3633,7 @@ async def unbanuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Please provide a valid numeric Telegram ID.")
         return
 
-    db.unban_user(target_id)
+    await asyncio.to_thread(db.unban_user, target_id)
     await update.message.reply_text(f"✅ User <code>{target_id}</code> has been unbanned.", parse_mode="HTML")
 
 
@@ -3648,7 +3648,7 @@ async def bangroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Please provide a valid numeric Group ID.")
         return
 
-    db.ban_group(target_id, update.effective_user.id)
+    await asyncio.to_thread(db.ban_group, target_id, update.effective_user.id)
     await update.message.reply_text(f"🚫 Group <code>{target_id}</code> has been banned.", parse_mode="HTML")
 
     try:
@@ -3668,7 +3668,7 @@ async def unbangroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("❌ Please provide a valid numeric Group ID.")
         return
 
-    db.unban_group(target_id)
+    await asyncio.to_thread(db.unban_group, target_id)
     await update.message.reply_text(f"✅ Group <code>{target_id}</code> has been unbanned.", parse_mode="HTML")
 
 
@@ -3698,9 +3698,9 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if target == "users":
-        recipients = [row[0] for row in db.get_all_users()]
+        recipients = [row[0] for row in await asyncio.to_thread(db.get_all_users)]
     else:
-        recipients = [row[0] for row in db.get_all_groups()]
+        recipients = [row[0] for row in await asyncio.to_thread(db.get_all_groups)]
 
     status = await update.message.reply_text(
         f"📣 Broadcasting to {len(recipients)} {target}..."
@@ -3731,7 +3731,7 @@ async def maintenance_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     mode = context.args[0].lower()
-    db.set_config("maintenance_mode", "1" if mode == "on" else "0")
+    await asyncio.to_thread(db.set_config, "maintenance_mode", "1" if mode == "on" else "0")
 
     await update.message.reply_text(
         f"🛠️ Maintenance mode {'enabled' if mode == 'on' else 'disabled'}."
@@ -3758,7 +3758,7 @@ async def setreward_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Amount must be a whole number (e.g. 10 or -1).")
         return
 
-    db.set_config(f"reward_{reward_type}", amount)
+    await asyncio.to_thread(db.set_config, f"reward_{reward_type}", amount)
 
     await update.message.reply_text(
         f"✅ {reward_type.capitalize()} reward set to {amount}. Takes effect immediately."
@@ -3794,9 +3794,9 @@ async def forceend_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    db.end_game(target_chat_id)
+    await asyncio.to_thread(db.end_game, target_chat_id)
     cancel_explain_timeout(context, target_chat_id)
-    db.clear_stop_votes(target_chat_id)
+    await asyncio.to_thread(db.clear_stop_votes, target_chat_id)
 
     await safe_send(
         context.bot,
@@ -3821,9 +3821,9 @@ async def forceleader_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     target_arg = context.args[0].lstrip("@")
 
     if target_arg.isdigit():
-        row = db.get_user_by_id(int(target_arg))
+        row = await asyncio.to_thread(db.get_user_by_id, int(target_arg))
     else:
-        row = db.get_user_by_username(target_arg)
+        row = await asyncio.to_thread(db.get_user_by_username, target_arg)
 
     if not row:
         await update.message.reply_text(
@@ -3836,9 +3836,9 @@ async def forceleader_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     cancel_explain_timeout(context, chat_id)
     word = random_word(chat_id)
-    db.set_leader(chat_id, target_id, target_name, word)
-    db.set_explaining_started(chat_id, False)
-    db.start_explain_log(chat_id, target_id)
+    await asyncio.to_thread(db.set_leader, chat_id, target_id, target_name, word)
+    await asyncio.to_thread(db.set_explaining_started, chat_id, False)
+    await asyncio.to_thread(db.start_explain_log, chat_id, target_id)
     schedule_explain_timeout(context, chat_id, target_id, target_name)
 
     await safe_send(
@@ -3871,9 +3871,9 @@ async def topup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     amount = int(amount_arg)
 
     if target_arg.isdigit():
-        row = db.get_user_by_id(int(target_arg))
+        row = await asyncio.to_thread(db.get_user_by_id, int(target_arg))
     else:
-        row = db.get_user_by_username(target_arg)
+        row = await asyncio.to_thread(db.get_user_by_username, target_arg)
 
     if not row:
         await update.message.reply_text(f"❌ No player found matching {context.args[0]}.")
@@ -3881,14 +3881,14 @@ async def topup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     target_id, target_name, target_username, _ = row
 
-    db.award_global_coins(target_id, target_name, amount)
+    await asyncio.to_thread(db.award_global_coins, target_id, target_name, amount)
 
     apply_chat_credit_for_global_earning(
         target_id, target_name, amount, current_chat=update.effective_chat
     )
 
-    new_balance = db.get_global_coins(target_id)
-    db.log_topup(target_id, target_name, amount, update.effective_user.id)
+    new_balance = await asyncio.to_thread(db.get_global_coins, target_id)
+    await asyncio.to_thread(db.log_topup, target_id, target_name, amount, update.effective_user.id)
 
     action = "added" if amount >= 0 else "deducted"
     display = f"@{target_username}" if target_username else esc(target_name)
@@ -3949,10 +3949,10 @@ async def share_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message_text = " ".join(context.args[2:]).strip()
 
     if top_n is None:
-        recipients = [(uid, name) for uid, name, username, coins in db.get_all_users()]
+        recipients = [(uid, name) for uid, name, username, coins in await asyncio.to_thread(db.get_all_users)]
         label = "all users"
     else:
-        recipients = [(uid, name) for uid, name, coins in db.get_global_leaderboard_with_ids(limit=top_n)]
+        recipients = [(uid, name) for uid, name, coins in await asyncio.to_thread(db.get_global_leaderboard_with_ids, limit=top_n)]
         label = f"top {top_n}"
 
     if not recipients:
@@ -3968,8 +3968,8 @@ async def share_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total_distributed = 0
 
     for uid, name in recipients:
-        db.award_global_coins(uid, name, amount)
-        new_balance = db.get_global_coins(uid)
+        await asyncio.to_thread(db.award_global_coins, uid, name, amount)
+        new_balance = await asyncio.to_thread(db.get_global_coins, uid)
         total_distributed += amount
 
         body = f"{DOLLAR}{amount} has been added to your account.\n\nYour new account balance is {DOLLAR}{new_balance}."
@@ -4001,9 +4001,9 @@ async def addadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_arg = context.args[0].lstrip("@")
 
     if target_arg.isdigit():
-        row = db.get_user_by_id(int(target_arg))
+        row = await asyncio.to_thread(db.get_user_by_id, int(target_arg))
     else:
-        row = db.get_user_by_username(target_arg)
+        row = await asyncio.to_thread(db.get_user_by_username, target_arg)
 
     if not row:
         await update.message.reply_text(
@@ -4017,11 +4017,11 @@ async def addadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ The bot owner can't be added as an admin.")
         return
 
-    if db.is_bot_admin(target_id):
+    if await asyncio.to_thread(db.is_bot_admin, target_id):
         await update.message.reply_text("⚠️ That user is already a bot admin.")
         return
 
-    db.add_bot_admin(target_id, target_name, target_username, update.effective_user.id)
+    await asyncio.to_thread(db.add_bot_admin, target_id, target_name, target_username, update.effective_user.id)
 
     display = f"@{target_username}" if target_username else target_name
     await update.message.reply_text(
@@ -4039,23 +4039,23 @@ async def removeadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if target_arg.isdigit():
         target_id = int(target_arg)
-        row = db.get_user_by_id(target_id)
+        row = await asyncio.to_thread(db.get_user_by_id, target_id)
     else:
-        row = db.get_user_by_username(target_arg)
+        row = await asyncio.to_thread(db.get_user_by_username, target_arg)
         target_id = row[0] if row else None
 
-    if target_id is None or not db.is_bot_admin(target_id):
+    if target_id is None or not await asyncio.to_thread(db.is_bot_admin, target_id):
         await update.message.reply_text("❌ That user is not currently a Bot Admin.")
         return
 
-    db.remove_bot_admin(target_id)
+    await asyncio.to_thread(db.remove_bot_admin, target_id)
     display = f"@{row[2]}" if row and row[2] else (row[1] if row else target_id)
     await update.message.reply_text(f"✅ Bot Admin privileges revoked for {display} (ID: {target_id}).")
 
 
 @owner_only
 async def admins_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rows = db.get_bot_admins()
+    rows = await asyncio.to_thread(db.get_bot_admins)
 
     if not rows:
         await update.message.reply_text("👮 There are currently no Bot Admins.")
@@ -4147,7 +4147,7 @@ async def claimeddailyreward_command(update: Update, context: ContextTypes.DEFAU
     else:
         date_str = datetime.now().strftime("%Y-%m-%d")
 
-    rows = db.get_daily_claims(date_str)
+    rows = await asyncio.to_thread(db.get_daily_claims, date_str)
 
     if not rows:
         await update.message.reply_text(f"📋 No daily reward claims recorded for {date_str}.")
@@ -4169,7 +4169,7 @@ async def claimeddailyreward_command(update: Update, context: ContextTypes.DEFAU
             f"Time: {time_display}\n"
         )
 
-    total_players, total_amount = db.get_daily_totals(date_str)
+    total_players, total_amount = await asyncio.to_thread(db.get_daily_totals, date_str)
     lines.append(f"👥 Total Players Who Claimed Today: <b>{total_players}</b>")
     lines.append(f"{DOLLAR} Total Distributed Today: <b>{total_amount}</b>")
 

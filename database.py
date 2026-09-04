@@ -27,6 +27,20 @@ _pool = psycopg2.pool.ThreadedConnectionPool(
     maxconn=int(os.environ.get("GAME_DB_POOL_MAX", "10")),
     dsn=DATABASE_URL,
     connect_timeout=10,
+    options="-c statement_timeout=15000",
+    # Without these, a connection that goes stale mid-idle (e.g. Neon
+    # free-tier auto-suspending the compute under it, or a network blip
+    # on Render) has NO client-side timeout at all - psycopg2 sits
+    # waiting on the dead socket until the OS's default TCP keepalive
+    # finally gives up, which on most Linux hosts is ~2 hours. That is
+    # the exact "freezes for hours then recovers on its own" symptom.
+    # These settings make the OS detect a dead peer and kill the socket
+    # within ~45 seconds instead, so a bad connection surfaces as a
+    # quick, catchable error instead of an open-ended hang.
+    keepalives=1,
+    keepalives_idle=15,
+    keepalives_interval=10,
+    keepalives_count=3,
 )
 
 
@@ -63,13 +77,6 @@ class PooledConnection:
 
 def connect():
     raw = _pool.getconn()
-    try:
-        with raw.cursor() as cursor:
-            cursor.execute("SET statement_timeout = 15000")
-        raw.commit()
-    except Exception:
-        _pool.putconn(raw, close=True)
-        raise
     return PooledConnection(raw, _pool)
 
 
@@ -330,6 +337,8 @@ def create_tables():
             enabled INTEGER DEFAULT 0
         )
         """)
+
+        cursor.execute("ALTER TABLE scramble_slowmode ADD COLUMN IF NOT EXISTS next_round_due_at TEXT")
 
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS scramble_auto_mode (
@@ -1931,6 +1940,104 @@ def get_all_active_slowmode_chats():
         return cursor.fetchall()
     finally:
         conn.close()
+
+
+def scramble_set_next_round_due(chat_id, due_iso):
+    """Record when the next slowmode round is due, so a restart during the
+    gap between rounds knows how much longer to wait (or that it's already
+    overdue) instead of leaving the chat waiting forever."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE scramble_slowmode SET next_round_due_at=%s WHERE chat_id=%s",
+            (due_iso, chat_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def scramble_clear_next_round_due(chat_id):
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE scramble_slowmode SET next_round_due_at=NULL WHERE chat_id=%s",
+            (chat_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_pending_slowmode_waits():
+    """Chats where slowmode is on and we're between rounds, waiting for the
+    next one to start - used to resume that wait after a restart."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT chat_id, interval_seconds, next_round_due_at
+            FROM scramble_slowmode
+            WHERE enabled=1 AND next_round_due_at IS NOT NULL
+        """)
+        return cursor.fetchall()
+    finally:
+        conn.close()
+
+
+def get_all_active_word_game_chats():
+    """Chats with a /wordgame round in progress (someone volunteered to
+    explain, whether or not they've started) - used to clean up and reopen
+    the floor for a new leader after a restart."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT chat_id FROM word_games WHERE leader_id IS NOT NULL")
+        return [r[0] for r in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+def get_combined_global_leaderboard(limit=10):
+    """Global leaderboard combining regular game coins (global_scores) with
+    Word Scramble earnings (scramble_global_stats) per player."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT COALESCE(g.name, s.name) AS name,
+                   COALESCE(g.coins, 0) + COALESCE(s.earned, 0) AS total
+            FROM global_scores g
+            FULL OUTER JOIN scramble_global_stats s ON g.user_id = s.user_id
+            ORDER BY total DESC
+            LIMIT %s
+        """, (limit,))
+        return cursor.fetchall()
+    finally:
+        conn.close()
+
+
+def get_combined_global_position(user_id):
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT COALESCE(g.user_id, s.user_id) AS user_id,
+                   COALESCE(g.name, s.name) AS name,
+                   COALESCE(g.coins, 0) + COALESCE(s.earned, 0) AS total
+            FROM global_scores g
+            FULL OUTER JOIN scramble_global_stats s ON g.user_id = s.user_id
+            ORDER BY total DESC, user_id ASC
+        """)
+        rows = cursor.fetchall()
+    finally:
+        conn.close()
+    for index, row in enumerate(rows, start=1):
+        if row[0] == user_id:
+            return index, row[1], row[2]
+    return None
 
 
 def get_current_groups():
