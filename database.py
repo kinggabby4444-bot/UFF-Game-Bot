@@ -27,7 +27,12 @@ _pool = psycopg2.pool.ThreadedConnectionPool(
     maxconn=int(os.environ.get("GAME_DB_POOL_MAX", "10")),
     dsn=DATABASE_URL,
     connect_timeout=10,
-    options="-c statement_timeout=15000",
+    # NOTE: statement_timeout is intentionally NOT set here via
+    # options="-c statement_timeout=...". Neon's pooled (pgbouncer)
+    # endpoint rejects arbitrary startup parameters like that with
+    # "unsupported startup parameter in options" and refuses the
+    # connection outright. It's set per-session instead, right after
+    # each connection is handed out - see connect() below.
     # Without these, a connection that goes stale mid-idle (e.g. Neon
     # free-tier auto-suspending the compute under it, or a network blip
     # on Render) has NO client-side timeout at all - psycopg2 sits
@@ -77,6 +82,18 @@ class PooledConnection:
 
 def connect():
     raw = _pool.getconn()
+    try:
+        # Set per-session instead of via options="-c statement_timeout=..."
+        # at connection time - Neon's pooled endpoint rejects that as an
+        # unsupported startup parameter. This SET is a cheap, harmless
+        # no-op round trip if it's ever redundant, and it's what actually
+        # caps a runaway query at 15s instead of letting it hang.
+        raw.cursor().execute("SET statement_timeout = 15000")
+    except Exception:
+        # If even this fails, don't block the caller on it - the
+        # keepalive settings on the pool still bound how long a truly
+        # dead connection can hang.
+        pass
     return PooledConnection(raw, _pool)
 
 

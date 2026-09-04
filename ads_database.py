@@ -20,6 +20,14 @@ _pool = psycopg2.pool.ThreadedConnectionPool(
     minconn=1,
     maxconn=int(os.environ.get("ADS_DB_POOL_MAX", "5")),
     dsn=DATABASE_URL,
+    connect_timeout=10,
+    # statement_timeout is set per-session in connect() below, not here -
+    # Neon's pooled endpoint rejects it as a startup parameter (see
+    # database.py for the full explanation).
+    keepalives=1,
+    keepalives_idle=15,
+    keepalives_interval=10,
+    keepalives_count=3,
 )
 
 
@@ -50,6 +58,10 @@ class PooledConnection:
 
 def connect():
     raw = _pool.getconn()
+    try:
+        raw.cursor().execute("SET statement_timeout = 15000")
+    except Exception:
+        pass
     return PooledConnection(raw, _pool)
 
 
