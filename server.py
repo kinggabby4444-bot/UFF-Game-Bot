@@ -2,7 +2,6 @@ import os
 import asyncio
 import logging
 import threading
-from concurrent.futures import ThreadPoolExecutor
 from aiohttp import web
 
 from telegram import Update
@@ -32,27 +31,24 @@ class BotRunner:
     only ever block THIS bot's thread - never the shared aiohttp server
     that answers Telegram's webhook requests and Render's health checks."""
 
-    def __init__(self, name, build_app_fn, webhook_path, max_db_workers=8):
+    def __init__(self, name, build_app_fn, webhook_path):
         self.name = name
         self.build_app_fn = build_app_fn
         self.webhook_path = webhook_path
-        self.max_db_workers = max_db_workers
         self.loop = None
         self.app = None
         self.ready = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True)
+        # Futures from run_coroutine_threadsafe() must be kept referenced
+        # until they finish - otherwise they can be garbage-collected while
+        # still pending (harmless "Task was destroyed but it is pending"
+        # warning) and any exception raised inside process_update() is
+        # silently lost instead of being logged.
+        self._pending_futures = set()
 
     def _run(self):
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
-        # Cap concurrent asyncio.to_thread() workers to the DB pool size,
-        # so under a burst of messages, extra DB calls queue and wait
-        # for a free connection instead of all firing at once and
-        # exhausting the pool (PoolError). Without this, to_thread's
-        # default executor allows far more concurrent threads than the
-        # pool has connections.
-        executor = ThreadPoolExecutor(max_workers=self.max_db_workers)
-        self.loop.set_default_executor(executor)
         try:
             self.app = self.build_app_fn()
             self.loop.run_until_complete(self._startup())
@@ -80,7 +76,16 @@ class BotRunner:
             logger.error(f"{self.name}: not ready, dropping update")
             return
         update = Update.de_json(data, self.app.bot)
-        asyncio.run_coroutine_threadsafe(self.app.process_update(update), self.loop)
+        future = asyncio.run_coroutine_threadsafe(self.app.process_update(update), self.loop)
+        self._pending_futures.add(future)
+        future.add_done_callback(self._on_update_done)
+
+    def _on_update_done(self, future):
+        self._pending_futures.discard(future)
+        try:
+            future.result()
+        except Exception:
+            logger.exception(f"{self.name}: unhandled error while processing an update")
 
     def stop(self):
         if self.app is None or self.loop is None:
@@ -96,11 +101,8 @@ class BotRunner:
         self.loop.call_soon_threadsafe(self.loop.stop)
 
 
-GAME_DB_WORKERS = int(os.environ.get("GAME_DB_POOL_MAX", "10"))
-ADS_DB_WORKERS = int(os.environ.get("ADS_DB_POOL_MAX", "5"))
-
-game_runner = BotRunner("GAME BOT", game_bot_module.main, GAME_WEBHOOK_PATH, max_db_workers=GAME_DB_WORKERS)
-ads_runner = BotRunner("ADS BOT", ads_bot_module.main, ADS_WEBHOOK_PATH, max_db_workers=ADS_DB_WORKERS)
+game_runner = BotRunner("GAME BOT", game_bot_module.main, GAME_WEBHOOK_PATH)
+ads_runner = BotRunner("ADS BOT", ads_bot_module.main, ADS_WEBHOOK_PATH)
 
 
 async def health(request):

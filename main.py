@@ -7,7 +7,7 @@ import logging
 import importlib
 import html as html_lib
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 try:
@@ -590,14 +590,105 @@ def restore_stale_scramble_rounds(job_queue):
             remaining = 0
 
         if remaining <= 0:
-            db.scramble_claim_round(chat_id)
-        else:
-            job_queue.run_once(
-                scramble_timeout_callback,
-                remaining,
-                chat_id=chat_id,
-                name=_scramble_timeout_job_name(chat_id),
-            )
+            # Already past its 2-minute window by the time we came back up.
+            # Fire the real timeout callback almost immediately instead of
+            # just deleting the round - that's what sends the "Time's up"
+            # message and (if slowmode/automatic mode is on) starts the
+            # next round, exactly as if it had timed out normally.
+            remaining = 1
+
+        job_queue.run_once(
+            scramble_timeout_callback,
+            remaining,
+            chat_id=chat_id,
+            name=_scramble_timeout_job_name(chat_id),
+        )
+
+
+def restore_stale_slowmode_waits(job_queue):
+    """Resume the wait for the next slowmode round across a restart, using
+    the persisted due time - so a chat that was 40 seconds from its next
+    round before the restart is still ~40 seconds away after it, instead
+    of the wait resetting to the full interval."""
+    if job_queue is None:
+        return
+
+    now = datetime.now()
+    handled = set()
+
+    for chat_id, interval_seconds, due_at in db.get_pending_slowmode_waits():
+        if db.scramble_get_round(chat_id):
+            # A round is already active for this chat - the scramble-round
+            # restore pass handles its own timeout; nothing to wait for.
+            db.scramble_clear_next_round_due(chat_id)
+            handled.add(chat_id)
+            continue
+
+        try:
+            due_dt = datetime.fromisoformat(due_at)
+            remaining = (due_dt - now).total_seconds()
+        except (TypeError, ValueError):
+            remaining = 0
+
+        if remaining <= 0:
+            remaining = 1
+
+        cancel_slowmode_next_job(job_queue, chat_id)
+        job_queue.run_once(
+            slowmode_next_round_callback,
+            remaining,
+            chat_id=chat_id,
+            name=_slowmode_next_job_name(chat_id),
+        )
+        handled.add(chat_id)
+
+    # Chats with slowmode enabled but no persisted due time yet (e.g. the
+    # gap started before this upgrade) - fall back to a fresh full
+    # interval so they don't end up waiting forever.
+    for chat_id, interval_seconds in db.get_all_active_slowmode_chats():
+        if chat_id in handled or db.scramble_get_round(chat_id):
+            continue
+        cancel_slowmode_next_job(job_queue, chat_id)
+        job_queue.run_once(
+            slowmode_next_round_callback,
+            interval_seconds,
+            chat_id=chat_id,
+            name=_slowmode_next_job_name(chat_id),
+        )
+        db.scramble_set_next_round_due(
+            chat_id, (now + timedelta(seconds=interval_seconds)).isoformat()
+        )
+
+
+def restore_stale_word_games(job_queue):
+    """End any /wordgame round left stuck mid-explain from before a
+    restart and reopen the floor for a new leader - the same as if
+    /wordgame had just been run fresh."""
+    if job_queue is None:
+        return
+
+    for chat_id in db.get_all_active_word_game_chats():
+        db.start_game(chat_id)
+        job_queue.run_once(
+            _resend_wordgame_prompt,
+            1,
+            chat_id=chat_id,
+            name=f"wordgame_restore_{chat_id}",
+        )
+
+
+async def _resend_wordgame_prompt(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.chat_id
+    await safe_send(
+        context.bot,
+        chat_id,
+        text=(
+            "🎮 <b>UFF Word Game</b>\n\n"
+            "Who wants to explain?"
+        ),
+        parse_mode="HTML",
+        reply_markup=volunteer_keyboard(),
+    )
 
 
 async def scramble_timeout_callback(context: ContextTypes.DEFAULT_TYPE):
@@ -620,7 +711,7 @@ async def scramble_timeout_callback(context: ContextTypes.DEFAULT_TYPE):
         interval_seconds = slow[0]
         text += f"\n\n🐢New word will be sent in {_format_duration_words(interval_seconds)}."
         await safe_send(context.bot, chat_id, text=text, parse_mode="HTML")
-        schedule_slowmode_next_round(context.job_queue, chat_id, interval_seconds)
+        await schedule_slowmode_next_round(context.job_queue, chat_id, interval_seconds)
         return
 
     _, auto_enabled, _ = await asyncio.to_thread(db.scramble_get_auto_mode, chat_id)
@@ -764,7 +855,7 @@ async def _scramble_handle_win(context: ContextTypes.DEFAULT_TYPE, chat, user, m
         interval_seconds = slow[0]
         lines.append(f"🐢New word will be sent in {_format_duration_words(interval_seconds)}.")
         await safe_send(context.bot, chat.id, text="\n".join(lines), parse_mode="HTML")
-        schedule_slowmode_next_round(context.job_queue, chat.id, interval_seconds)
+        await schedule_slowmode_next_round(context.job_queue, chat.id, interval_seconds)
         return
 
     _, auto_enabled, _ = await asyncio.to_thread(db.scramble_get_auto_mode, chat.id)
@@ -898,11 +989,13 @@ def scramble_topplayers_keyboard():
 
 def format_scramble_top_players(rows, title, position_info, requester_name, position_label) -> str:
     text = f"🔤 <b>{title}</b>\n\n"
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
 
     if not rows:
         text += "No scores yet.\n"
     else:
         for i, row in enumerate(rows, start=1):
+            prefix = medals.get(i, f"{i}.")
             if len(row) == 4:
                 name, wins, earned, streak = row
                 streak_display = f" 🔥{streak}" if streak and streak > 1 else ""
@@ -910,7 +1003,7 @@ def format_scramble_top_players(rows, title, position_info, requester_name, posi
                 name, wins, earned = row
                 streak_display = ""
             display_name = truncate_name(name)
-            text += f"{i}. {display_name}\t{DOLLAR}{earned}{streak_display}\n"
+            text += f"{prefix} {display_name}\t{DOLLAR}{earned}{streak_display}\n"
 
     if position_info:
         if len(position_info) == 5:
@@ -1139,7 +1232,7 @@ def cancel_slowmode_next_job(job_queue, chat_id):
         job.schedule_removal()
 
 
-def schedule_slowmode_next_round(job_queue, chat_id, interval_seconds):
+async def schedule_slowmode_next_round(job_queue, chat_id, interval_seconds):
     if job_queue is None:
         return
     cancel_slowmode_next_job(job_queue, chat_id)
@@ -1149,6 +1242,8 @@ def schedule_slowmode_next_round(job_queue, chat_id, interval_seconds):
         chat_id=chat_id,
         name=_slowmode_next_job_name(chat_id),
     )
+    due_at = (datetime.now() + timedelta(seconds=interval_seconds)).isoformat()
+    await asyncio.to_thread(db.scramble_set_next_round_due, chat_id, due_at)
 
 
 async def slowmode_next_round_callback(context: ContextTypes.DEFAULT_TYPE):
@@ -1162,18 +1257,20 @@ async def slowmode_next_round_callback(context: ContextTypes.DEFAULT_TYPE):
 
     maintenance = await asyncio.to_thread(db.get_config, "scramble_maintenance_mode", "0")
     if maintenance == "1":
-        schedule_slowmode_next_round(context.job_queue, chat_id, interval_seconds)
+        await schedule_slowmode_next_round(context.job_queue, chat_id, interval_seconds)
         return
 
     if await asyncio.to_thread(db.scramble_get_round, chat_id):
+        await asyncio.to_thread(db.scramble_clear_next_round_due, chat_id)
         return
 
     try:
         chat = await context.bot.get_chat(chat_id)
     except Exception:
-        schedule_slowmode_next_round(context.job_queue, chat_id, interval_seconds)
+        await schedule_slowmode_next_round(context.job_queue, chat_id, interval_seconds)
         return
 
+    await asyncio.to_thread(db.scramble_clear_next_round_due, chat_id)
     await start_scramble_round(context, chat)
 
 
@@ -1217,7 +1314,7 @@ async def slowmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await asyncio.to_thread(db.scramble_set_auto_enabled, chat_id, False)
 
     if not await asyncio.to_thread(db.scramble_get_round, chat_id):
-        schedule_slowmode_next_round(context.job_queue, chat_id, seconds)
+        await schedule_slowmode_next_round(context.job_queue, chat_id, seconds)
 
     await update.message.reply_text(
         f"🐢 Slowmode on - manual starts are paused; a new Word Scramble round starts here "
@@ -1940,8 +2037,8 @@ Tap a button below to continue your adventure!
 
     if query.data == "leaderboard":
         await query.answer()
-        rows = await asyncio.to_thread(db.get_global_leaderboard)
-        position_info = await asyncio.to_thread(db.get_global_position, user.id)
+        rows = await asyncio.to_thread(db.get_combined_global_leaderboard)
+        position_info = await asyncio.to_thread(db.get_combined_global_position, user.id)
 
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("⬅ Back", callback_data="home")]
@@ -4285,6 +4382,8 @@ def main():
 
     if app.job_queue is not None:
         restore_stale_scramble_rounds(app.job_queue)
+        restore_stale_slowmode_waits(app.job_queue)
+        restore_stale_word_games(app.job_queue)
 
         if db.get_config("scramble_mode_enabled", "0") == "1":
             try:
@@ -4292,10 +4391,6 @@ def main():
             except ValueError:
                 interval = 3600
             schedule_scramblemode_job(app.job_queue, interval)
-
-        for chat_id, interval_seconds in db.get_all_active_slowmode_chats():
-            if not db.scramble_get_round(chat_id):
-                schedule_slowmode_next_round(app.job_queue, chat_id, interval_seconds)
 
     return app
 

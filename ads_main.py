@@ -191,7 +191,7 @@ def main_menu_keyboard():
 @owner_only
 async def changecontactsupport_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        current = db.get_config("support_contact", OWNER_USERNAME) or "(not set)"
+        current = await asyncio.to_thread(db.get_config, "support_contact", OWNER_USERNAME) or "(not set)"
         await update.message.reply_text(
             "Usage: /changecontactsupport <@username or link>\n"
             f"Current: {current}"
@@ -199,8 +199,8 @@ async def changecontactsupport_command(update: Update, context: ContextTypes.DEF
         return
 
     value = " ".join(context.args).strip()
-    db.set_config("support_contact", value)
-    db.audit(update.effective_user.id, "change_contact_support", value)
+    await asyncio.to_thread(db.set_config, "support_contact", value)
+    await asyncio.to_thread(db.audit, update.effective_user.id, "change_contact_support", value)
     await update.message.reply_text(f"✅ Contact/support updated to: {value}")
 
 
@@ -293,7 +293,7 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @owner_only
 async def setrates_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        current = "\n".join(f"{d} Day{'s' if d != 1 else ''} = {p}" for d, p in db.get_rates())
+        current = "\n".join(f"{d} Day{'s' if d != 1 else ''} = {p}" for d, p in await asyncio.to_thread(db.get_rates))
         await update.message.reply_text(
             "Usage: /setrates <duration_days> <price>\n"
             "Example: /setrates 7 2500\n\n"
@@ -316,7 +316,7 @@ async def setrates_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Duration must be positive and price can't be negative.")
         return
 
-    db.set_rate(days, price)
+    await asyncio.to_thread(db.set_rate, days, price)
     await update.message.reply_text(f"✅ Rate updated: {days} Day{'s' if days != 1 else ''} = ₦{price}")
 
 
@@ -343,8 +343,8 @@ async def setrate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     currency = context.args[2].upper() if len(context.args) >= 3 else "NGN"
 
-    db.set_rate(days, price, currency)
-    db.audit(update.effective_user.id, "set_rate", f"{days}d = {price} {currency}")
+    await asyncio.to_thread(db.set_rate, days, price, currency)
+    await asyncio.to_thread(db.audit, update.effective_user.id, "set_rate", f"{days}d = {price} {currency}")
 
     await update.message.reply_text(
         f"✅ Rate saved: {days} Day{'s' if days != 1 else ''} = {format_price(price, currency)}\n"
@@ -359,8 +359,8 @@ async def deleterate_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     days = int(context.args[0])
-    removed = db.delete_rate(days)
-    db.audit(update.effective_user.id, "delete_rate", str(days))
+    removed = await asyncio.to_thread(db.delete_rate, days)
+    await asyncio.to_thread(db.audit, update.effective_user.id, "delete_rate", str(days))
 
     if removed:
         await update.message.reply_text(f"✅ Rate for {days} Day{'s' if days != 1 else ''} deleted.")
@@ -370,7 +370,7 @@ async def deleterate_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 @owner_only
 async def rates_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rows = db.get_rates_with_currency()
+    rows = await asyncio.to_thread(db.get_rates_with_currency)
     if not rows:
         await update.message.reply_text("No advertisement rates configured yet. Use /setrate to add one.")
         return
@@ -389,7 +389,7 @@ async def submit_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query:
         await query.answer()
 
-    if db.has_pending_application(user.id):
+    if await asyncio.to_thread(db.has_pending_application, user.id):
         text = (
             "⚠️ You already have an advertisement application awaiting a decision. "
             "Please wait for that one to be reviewed before submitting another."
@@ -519,7 +519,7 @@ async def preview_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ASK_BUSINESS
 
     data = context.user_data["ad_draft"]
-    application_id = db.create_application(
+    application_id = await asyncio.to_thread(db.create_application, 
         applicant_id=user.id,
         applicant_name=user.first_name,
         applicant_username=user.username,
@@ -637,7 +637,7 @@ def decision_keyboard(application_id):
 
 
 async def notify_owner_new_application(context: ContextTypes.DEFAULT_TYPE, application_id):
-    app_row = db.get_application(application_id)
+    app_row = await asyncio.to_thread(db.get_application, application_id)
     if not app_row:
         return
     try:
@@ -674,8 +674,8 @@ def payment_method_choice_keyboard(application_id, methods):
 
 
 async def send_payment_instructions(context, application_id, applicant_id, price, currency="NGN"):
-    methods = db.get_enabled_payment_methods()
-    mode = db.get_config("payment_mode", "multiple")
+    methods = await asyncio.to_thread(db.get_enabled_payment_methods)
+    mode = await asyncio.to_thread(db.get_config, "payment_mode", "multiple")
 
     if not methods:
         await context.bot.send_message(
@@ -708,7 +708,7 @@ async def payment_method_choice_callback(update: Update, context: ContextTypes.D
     await query.answer()
 
     _, aid_str, idx_str = query.data.split(":")
-    methods = db.get_enabled_payment_methods()
+    methods = await asyncio.to_thread(db.get_enabled_payment_methods)
     idx = int(idx_str)
 
     if idx >= len(methods):
@@ -716,9 +716,9 @@ async def payment_method_choice_callback(update: Update, context: ContextTypes.D
         return
 
     application_id = int(aid_str)
-    app_row = db.get_application(application_id)
+    app_row = await asyncio.to_thread(db.get_application, application_id)
 
-    rate_row = db.get_rate_with_currency(app_row[7]) if app_row else None
+    rate_row = await asyncio.to_thread(db.get_rate_with_currency, app_row[7]) if app_row else None
     currency = rate_row[1] if rate_row else "NGN"
     price = (app_row[16] if app_row and app_row[16] is not None
              else (rate_row[0] if rate_row else 0))
@@ -728,7 +728,7 @@ async def payment_method_choice_callback(update: Update, context: ContextTypes.D
     if method_name == "Telegram Stars":
         await query.edit_message_text(
             "⭐ Telegram Stars\n\n"
-            f"Please send the payment to @{db.get_config('stars_recipient', '')}.\n\n"
+            f"Please send the payment to @{await asyncio.to_thread(db.get_config, 'stars_recipient', '')}.\n\n"
             "After payment, send your payment proof here.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton(
@@ -740,7 +740,7 @@ async def payment_method_choice_callback(update: Update, context: ContextTypes.D
         return
 
     if str(method_name).strip().lower() == "telegram gifts":
-        recipient = db.get_config("gifts_recipient", "")
+        recipient = await asyncio.to_thread(db.get_config, "gifts_recipient", "")
         await query.edit_message_text(
             "🎁 Telegram Gifts\n\n"
             f"Please send the gift to @{recipient}.\n\n"
@@ -774,7 +774,7 @@ async def change_payment_method_callback(update: Update, context: ContextTypes.D
     await query.answer()
 
     application_id = int(query.data.split(":", 1)[1])
-    methods = db.get_enabled_payment_methods()
+    methods = await asyncio.to_thread(db.get_enabled_payment_methods)
 
     if not methods:
         await query.edit_message_text(
@@ -789,16 +789,16 @@ async def change_payment_method_callback(update: Update, context: ContextTypes.D
 
 
 async def approve_application(context, application_id, actor_id):
-    db.set_application_status(application_id, "approved", decided_by=actor_id)
-    db.audit(actor_id, "approve_application", f"Application #{application_id}")
+    await asyncio.to_thread(db.set_application_status, application_id, "approved", decided_by=actor_id)
+    await asyncio.to_thread(db.audit, actor_id, "approve_application", f"Application #{application_id}")
 
-    app_row = db.get_application(application_id)
+    app_row = await asyncio.to_thread(db.get_application, application_id)
     if not app_row:
         return False
 
     applicant_id = app_row[1]
     duration_days = app_row[7]
-    rate_row = db.get_rate_with_currency(duration_days)
+    rate_row = await asyncio.to_thread(db.get_rate_with_currency, duration_days)
     price, currency = rate_row if rate_row else (0, "NGN")
 
     try:
@@ -820,10 +820,10 @@ async def approve_application(context, application_id, actor_id):
 
 
 async def reject_application(context, application_id, actor_id, reason="Application rejected."):
-    db.set_application_status(application_id, "rejected", decided_by=actor_id, reject_reason=reason)
-    db.audit(actor_id, "reject_application", f"Application #{application_id}: {reason}")
+    await asyncio.to_thread(db.set_application_status, application_id, "rejected", decided_by=actor_id, reject_reason=reason)
+    await asyncio.to_thread(db.audit, actor_id, "reject_application", f"Application #{application_id}: {reason}")
 
-    app_row = db.get_application(application_id)
+    app_row = await asyncio.to_thread(db.get_application, application_id)
     if not app_row:
         return False
 
@@ -850,7 +850,7 @@ async def decision_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     _, action, aid_str = query.data.split(":")
     application_id = int(aid_str)
-    app_row = db.get_application(application_id)
+    app_row = await asyncio.to_thread(db.get_application, application_id)
 
     if not app_row:
         await query.answer("❌ Application not found.", show_alert=True)
@@ -862,7 +862,7 @@ async def decision_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await approve_application(context, application_id, user.id)
         await query.answer()
         await query.edit_message_text(
-            application_detail_text(db.get_application(application_id)) + "\n✅ <b>APPROVED</b>",
+            application_detail_text(await asyncio.to_thread(db.get_application, application_id)) + "\n✅ <b>APPROVED</b>",
             parse_mode="HTML",
         )
         return
@@ -878,7 +878,7 @@ async def decision_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @owner_only
 async def approveall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ids = db.get_pending_application_ids()
+    ids = await asyncio.to_thread(db.get_pending_application_ids)
     if not ids:
         await update.message.reply_text("No pending applications to approve.")
         return
@@ -893,7 +893,7 @@ async def approveall_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 @owner_only
 async def rejectall_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ids = db.get_pending_application_ids()
+    ids = await asyncio.to_thread(db.get_pending_application_ids)
     if not ids:
         await update.message.reply_text("No pending applications to reject.")
         return
@@ -924,27 +924,27 @@ async def coupon_code_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     user = update.effective_user
     text = update.message.text.strip()
 
-    app_row = db.get_latest_approved_application(user.id)
+    app_row = await asyncio.to_thread(db.get_latest_approved_application, user.id)
     if not app_row:
         return False
 
     code = text.upper()
-    coupon_row = db.get_coupon(code)
+    coupon_row = await asyncio.to_thread(db.get_coupon, code)
     if not coupon_row:
         return False
 
-    valid, reason = db.is_coupon_valid(code)
+    valid, reason = await asyncio.to_thread(db.is_coupon_valid, code)
     if not valid:
         await update.message.reply_text(f"❌ {reason}")
         return True
 
     application_id = app_row[0]
     duration_days = app_row[7]
-    rate_row = db.get_rate_with_currency(duration_days)
+    rate_row = await asyncio.to_thread(db.get_rate_with_currency, duration_days)
     base_price, currency = rate_row if rate_row else (0, "NGN")
-    discounted_price = db.apply_coupon_to_price(code, base_price)
+    discounted_price = await asyncio.to_thread(db.apply_coupon_to_price, code, base_price)
 
-    db.set_application_coupon(application_id, code, discounted_price)
+    await asyncio.to_thread(db.set_application_coupon, application_id, code, discounted_price)
 
     await update.message.reply_text(
         f"✅ Coupon {esc(code)} applied! New price: {format_price(discounted_price, currency)} "
@@ -975,7 +975,7 @@ async def contact_advertiser_callback(update: Update, context: ContextTypes.DEFA
         return
 
     application_id = int(query.data.split(":", 1)[1])
-    app_row = db.get_application(application_id)
+    app_row = await asyncio.to_thread(db.get_application, application_id)
 
     if not app_row:
         await query.answer("❌ Application not found.", show_alert=True)
@@ -1008,7 +1008,7 @@ async def payment_proof_upload(update: Update, context: ContextTypes.DEFAULT_TYP
     user = update.effective_user
     message = update.message
 
-    app_row = db.get_latest_approved_application(user.id)
+    app_row = await asyncio.to_thread(db.get_latest_approved_application, user.id)
 
     if not app_row:
         return
@@ -1026,8 +1026,8 @@ async def payment_proof_upload(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await safe_call(message.reply_text, "⏳ Please wait...")
 
-    payment_id = db.create_payment(application_id, file_id, file_kind)
-    db.set_application_status(application_id, "awaiting_payment")
+    payment_id = await asyncio.to_thread(db.create_payment, application_id, file_id, file_kind)
+    await asyncio.to_thread(db.set_application_status, application_id, "awaiting_payment")
 
     try:
         caption = f"💳 Payment proof for Application #{application_id} (Payment #{payment_id})"
@@ -1055,14 +1055,14 @@ async def payment_review_callback(update: Update, context: ContextTypes.DEFAULT_
 
     _, action, pid_str = query.data.split(":")
     payment_id = int(pid_str)
-    payment_row = db.get_payment(payment_id)
+    payment_row = await asyncio.to_thread(db.get_payment, payment_id)
 
     if not payment_row:
         await query.answer("❌ Payment record not found.", show_alert=True)
         return
 
     application_id = payment_row[1]
-    app_row = db.get_application(application_id)
+    app_row = await asyncio.to_thread(db.get_application, application_id)
     applicant_id = app_row[1] if app_row else None
 
     await query.answer()
@@ -1083,10 +1083,10 @@ async def payment_review_callback(update: Update, context: ContextTypes.DEFAULT_
             logger.error(f"Failed to reveal decision keyboard for payment {payment_id}: {e}")
         return
 
-    db.set_payment_status(payment_id, "rejected", confirmed_by=user.id)
-    db.audit(user.id, "decline_payment_proof", f"Payment #{payment_id}, Application #{application_id}")
+    await asyncio.to_thread(db.set_payment_status, payment_id, "rejected", confirmed_by=user.id)
+    await asyncio.to_thread(db.audit, user.id, "decline_payment_proof", f"Payment #{payment_id}, Application #{application_id}")
     if application_id:
-        db.set_application_status(application_id, "approved", decided_by=user.id)
+        await asyncio.to_thread(db.set_application_status, application_id, "approved", decided_by=user.id)
 
     if applicant_id:
         try:
@@ -1113,21 +1113,21 @@ async def payment_decision_callback(update: Update, context: ContextTypes.DEFAUL
 
     _, action, pid_str = query.data.split(":")
     payment_id = int(pid_str)
-    payment_row = db.get_payment(payment_id)
+    payment_row = await asyncio.to_thread(db.get_payment, payment_id)
 
     if not payment_row:
         await query.answer("❌ Payment record not found.", show_alert=True)
         return
 
     application_id = payment_row[1]
-    app_row = db.get_application(application_id)
+    app_row = await asyncio.to_thread(db.get_application, application_id)
     applicant_id = app_row[1] if app_row else None
 
     await query.answer()
 
     if action == "confirm":
-        db.set_payment_status(payment_id, "confirmed", confirmed_by=user.id)
-        db.audit(user.id, "confirm_payment", f"Payment #{payment_id}, Application #{application_id}")
+        await asyncio.to_thread(db.set_payment_status, payment_id, "confirmed", confirmed_by=user.id)
+        await asyncio.to_thread(db.audit, user.id, "confirm_payment", f"Payment #{payment_id}, Application #{application_id}")
         try:
             await query.edit_message_caption(
                 caption=(query.message.caption or "") + "\n\n✅ CONFIRMED - choose a start time below"
@@ -1145,9 +1145,9 @@ async def payment_decision_callback(update: Update, context: ContextTypes.DEFAUL
             reply_markup=keyboard,
         )
     else:
-        db.set_payment_status(payment_id, "rejected", confirmed_by=user.id)
-        db.set_application_status(application_id, "payment_rejected", decided_by=user.id)
-        db.audit(user.id, "reject_payment", f"Payment #{payment_id}, Application #{application_id}")
+        await asyncio.to_thread(db.set_payment_status, payment_id, "rejected", confirmed_by=user.id)
+        await asyncio.to_thread(db.set_application_status, application_id, "payment_rejected", decided_by=user.id)
+        await asyncio.to_thread(db.audit, user.id, "reject_payment", f"Payment #{payment_id}, Application #{application_id}")
         try:
             await query.edit_message_caption(
                 caption=(query.message.caption or "") + "\n\n❌ REJECTED"
@@ -1226,16 +1226,16 @@ def _publish_to_sponsored_slot(ad_text, ad_link):
 
 
 async def finalize_subscription(context, payment_id, start_at, actor_id):
-    payment_row = db.get_payment(payment_id)
+    payment_row = await asyncio.to_thread(db.get_payment, payment_id)
     application_id = payment_row[1]
-    app_row = db.get_application(application_id)
+    app_row = await asyncio.to_thread(db.get_application, application_id)
 
     (aid, applicant_id, applicant_name, applicant_username, business_name,
      ad_link, ad_type, duration_days, ad_text, notes, status,
      reject_reason, submitted_at, decided_at, decided_by,
      coupon_code, final_price) = app_row
 
-    rate_row = db.get_rate_with_currency(duration_days)
+    rate_row = await asyncio.to_thread(db.get_rate_with_currency, duration_days)
     base_price, currency = rate_row if rate_row else (0, "NGN")
     amount_paid = final_price if final_price is not None else base_price
 
@@ -1243,7 +1243,7 @@ async def finalize_subscription(context, payment_id, start_at, actor_id):
     end_at = start_at + timedelta(days=duration_days)
     status_value = "active" if start_at <= now else "scheduled"
 
-    subscription_id = db.create_subscription(
+    subscription_id = await asyncio.to_thread(db.create_subscription, 
         application_id=application_id, applicant_id=applicant_id, business_name=business_name,
         ad_link=ad_link, ad_text=ad_text, ad_type=ad_type, duration_days=duration_days,
         start_at=start_at.isoformat(), end_at=end_at.isoformat(), status=status_value,
@@ -1252,12 +1252,12 @@ async def finalize_subscription(context, payment_id, start_at, actor_id):
     if status_value == "active":
         _publish_to_sponsored_slot(ad_text, ad_link)
 
-    db.set_application_status(application_id, "payment_confirmed", decided_by=actor_id)
+    await asyncio.to_thread(db.set_application_status, application_id, "payment_confirmed", decided_by=actor_id)
 
-    methods = db.get_enabled_payment_methods()
+    methods = await asyncio.to_thread(db.get_enabled_payment_methods)
     method_name = methods[0][0] if len(methods) == 1 else "Unspecified"
 
-    invoice_id = db.create_invoice(
+    invoice_id = await asyncio.to_thread(db.create_invoice, 
         application_id=application_id, subscription_id=subscription_id,
         business_name=business_name, advertiser_name=applicant_name,
         advertiser_username=applicant_username, advertiser_id=applicant_id,
@@ -1266,9 +1266,9 @@ async def finalize_subscription(context, payment_id, start_at, actor_id):
     )
 
     if coupon_code:
-        db.redeem_coupon(coupon_code)
+        await asyncio.to_thread(db.redeem_coupon, coupon_code)
 
-    db.audit(actor_id, "activate_subscription",
+    await asyncio.to_thread(db.audit, actor_id, "activate_subscription",
              f"Application #{application_id}, Subscription #{subscription_id}, Invoice #{invoice_id}")
 
     when_text = "immediately" if status_value == "active" else f"on {start_at.strftime('%Y-%m-%d %H:%M')}"
@@ -1317,9 +1317,9 @@ def applications_list_keyboard(status, page):
 
 
 async def send_applications_page(update_or_query, status, page, edit=False):
-    total = db.count_applications_by_status(status)
+    total = await asyncio.to_thread(db.count_applications_by_status, status)
     offset = page * APPLICATIONS_PAGE_SIZE
-    rows = db.get_applications_by_status(status, offset, APPLICATIONS_PAGE_SIZE)
+    rows = await asyncio.to_thread(db.get_applications_by_status, status, offset, APPLICATIONS_PAGE_SIZE)
 
     if not rows:
         text = f"No {status} applications." if page == 0 else "No more applications."
@@ -1369,7 +1369,7 @@ async def open_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /open <Application ID>")
         return
 
-    app_row = db.get_application(int(context.args[0]))
+    app_row = await asyncio.to_thread(db.get_application, int(context.args[0]))
     if not app_row:
         await update.message.reply_text("❌ No application with that ID.")
         return
@@ -1382,12 +1382,12 @@ async def open_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @owner_or_admin_only
 async def payments_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rows = db.get_pending_payments()
+    rows = await asyncio.to_thread(db.get_pending_payments)
     if not rows:
         await update.message.reply_text("No payments waiting for verification.")
         return
 
-    lines = [f"💳 <b>Payments Awaiting Verification</b> ({db.count_pending_payments()} total)\n"]
+    lines = [f"💳 <b>Payments Awaiting Verification</b> ({await asyncio.to_thread(db.count_pending_payments)} total)\n"]
     for pid, application_id, submitted_at, business_name, applicant_name in rows:
         lines.append(f"Payment #{pid} - Application #{application_id} - {esc(business_name)} ({esc(applicant_name)})")
 
@@ -1396,7 +1396,7 @@ async def payments_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @owner_only
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    s = db.get_stats()
+    s = await asyncio.to_thread(db.get_stats)
     text = f"""
 📊 <b>Advertisement Stats</b>
 
@@ -1420,7 +1420,7 @@ async def searchads_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     query = " ".join(context.args)
-    rows = db.search_applications(query)
+    rows = await asyncio.to_thread(db.search_applications, query)
 
     if not rows:
         await update.message.reply_text("No matching applications found.")
@@ -1445,12 +1445,12 @@ PAYMENT_METHOD_FIELDS = {
 
 @owner_only
 async def paymentmethods_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    methods = db.get_payment_methods()
+    methods = await asyncio.to_thread(db.get_payment_methods)
     if not methods:
         await update.message.reply_text("💳 No payment methods have been added yet. Use /addpayment <name>.")
         return
 
-    mode = db.get_config("payment_mode", "multiple")
+    mode = await asyncio.to_thread(db.get_config, "payment_mode", "multiple")
     lines = [f"💳 <b>Payment Methods</b> (mode: {mode})\n"]
     for name, enabled, config in methods:
         lines.append(f"{'🟢' if enabled else '🔴'} {esc(name)}")
@@ -1465,8 +1465,8 @@ async def addpayment_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     name = " ".join(context.args)
-    added = db.add_payment_method(name)
-    db.audit(update.effective_user.id, "add_payment_method", name)
+    added = await asyncio.to_thread(db.add_payment_method, name)
+    await asyncio.to_thread(db.audit, update.effective_user.id, "add_payment_method", name)
 
     if added:
         await update.message.reply_text(f"✅ Payment method added: {name}")
@@ -1481,8 +1481,8 @@ async def removepayment_command(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     name = " ".join(context.args)
-    removed = db.remove_payment_method(name)
-    db.audit(update.effective_user.id, "remove_payment_method", name)
+    removed = await asyncio.to_thread(db.remove_payment_method, name)
+    await asyncio.to_thread(db.audit, update.effective_user.id, "remove_payment_method", name)
 
     if removed:
         await update.message.reply_text(f"✅ Payment method removed: {name}")
@@ -1497,8 +1497,8 @@ async def enablepayment_command(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     name = " ".join(context.args)
-    updated = db.set_payment_method_enabled(name, True)
-    db.audit(update.effective_user.id, "enable_payment_method", name)
+    updated = await asyncio.to_thread(db.set_payment_method_enabled, name, True)
+    await asyncio.to_thread(db.audit, update.effective_user.id, "enable_payment_method", name)
 
     if updated:
         await update.message.reply_text(f"✅ {name} is now enabled.")
@@ -1513,8 +1513,8 @@ async def disablepayment_command(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     name = " ".join(context.args)
-    updated = db.set_payment_method_enabled(name, False)
-    db.audit(update.effective_user.id, "disable_payment_method", name)
+    updated = await asyncio.to_thread(db.set_payment_method_enabled, name, False)
+    await asyncio.to_thread(db.audit, update.effective_user.id, "disable_payment_method", name)
 
     if updated:
         await update.message.reply_text(f"✅ {name} is now disabled.")
@@ -1525,13 +1525,13 @@ async def disablepayment_command(update: Update, context: ContextTypes.DEFAULT_T
 @owner_only
 async def paymentmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args or context.args[0].lower() not in ("single", "multiple"):
-        current = db.get_config("payment_mode", "multiple")
+        current = await asyncio.to_thread(db.get_config, "payment_mode", "multiple")
         await update.message.reply_text(f"Usage: /paymentmode single|multiple\nCurrent mode: {current}")
         return
 
     mode = context.args[0].lower()
-    db.set_config("payment_mode", mode)
-    db.audit(update.effective_user.id, "set_payment_mode", mode)
+    await asyncio.to_thread(db.set_config, "payment_mode", mode)
+    await asyncio.to_thread(db.audit, update.effective_user.id, "set_payment_mode", mode)
     await update.message.reply_text(f"✅ Payment mode set to: {mode}")
 
 
@@ -1542,8 +1542,8 @@ async def setstarsrecipient_command(update: Update, context: ContextTypes.DEFAUL
         return
 
     username = context.args[0].lstrip("@")
-    db.set_config("stars_recipient", username)
-    db.audit(update.effective_user.id, "set_stars_recipient", username)
+    await asyncio.to_thread(db.set_config, "stars_recipient", username)
+    await asyncio.to_thread(db.audit, update.effective_user.id, "set_stars_recipient", username)
 
     await update.message.reply_text(
         f"✅ Telegram Stars recipient set to @{username}"
@@ -1557,8 +1557,8 @@ async def setgiftsrecipient_command(update: Update, context: ContextTypes.DEFAUL
         return
 
     username = context.args[0].lstrip("@")
-    db.set_config("gifts_recipient", username)
-    db.audit(update.effective_user.id, "set_gifts_recipient", username)
+    await asyncio.to_thread(db.set_config, "gifts_recipient", username)
+    await asyncio.to_thread(db.audit, update.effective_user.id, "set_gifts_recipient", username)
 
     await update.message.reply_text(
         f"✅ Telegram Gifts recipient set to @{username}"
@@ -1594,14 +1594,14 @@ async def setbank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     bank_name, account_name, account_number = parts
 
-    db.add_payment_method("Bank Transfer")
-    db.set_payment_method_config("Bank Transfer", json.dumps({
+    await asyncio.to_thread(db.add_payment_method, "Bank Transfer")
+    await asyncio.to_thread(db.set_payment_method_config, "Bank Transfer", json.dumps({
         "Bank Name": bank_name,
         "Account Name": account_name,
         "Account Number": account_number,
     }))
-    db.set_payment_method_enabled("Bank Transfer", True)
-    db.audit(update.effective_user.id, "configure_payment_method", "Bank Transfer")
+    await asyncio.to_thread(db.set_payment_method_enabled, "Bank Transfer", True)
+    await asyncio.to_thread(db.audit, update.effective_user.id, "configure_payment_method", "Bank Transfer")
 
     await update.message.reply_text(
         "✅ Bank Transfer details saved and enabled.\n\n"
@@ -1651,10 +1651,10 @@ async def setpayment_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             return
         config[key] = value
 
-    db.add_payment_method(method_name)
-    db.set_payment_method_config(method_name, json.dumps(config))
-    db.set_payment_method_enabled(method_name, True)
-    db.audit(update.effective_user.id, "configure_payment_method", method_name)
+    await asyncio.to_thread(db.add_payment_method, method_name)
+    await asyncio.to_thread(db.set_payment_method_config, method_name, json.dumps(config))
+    await asyncio.to_thread(db.set_payment_method_enabled, method_name, True)
+    await asyncio.to_thread(db.audit, update.effective_user.id, "configure_payment_method", method_name)
 
     details = "\n".join(f"{k}: {v}" for k, v in config.items())
     await update.message.reply_text(f"✅ {method_name} saved and enabled.\n\n{details}")
@@ -1687,7 +1687,7 @@ async def setcrypto_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @owner_only
 async def fixcrypto_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    updated = db.rename_payment_method(
+    updated = await asyncio.to_thread(db.rename_payment_method, 
         "crypto_ton",
         "Crypto [TON Coin Only]"
     )
@@ -1704,14 +1704,15 @@ async def fixcrypto_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @owner_only
 async def addstars_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    added = db.add_payment_method("Telegram Stars")
-    db.set_payment_method_config(
+    added = await asyncio.to_thread(db.add_payment_method, "Telegram Stars")
+    stars_recipient = await asyncio.to_thread(db.get_config, "stars_recipient", "")
+    await asyncio.to_thread(db.set_payment_method_config,
         "Telegram Stars",
         json.dumps({
-            "recipient": db.get_config("stars_recipient", "")
+            "recipient": stars_recipient
         })
     )
-    db.audit(update.effective_user.id, "add_payment_method", "Telegram Stars")
+    await asyncio.to_thread(db.audit, update.effective_user.id, "add_payment_method", "Telegram Stars")
 
     if added:
         await update.message.reply_text("✅ Telegram Stars added as a payment method.")
@@ -1721,14 +1722,15 @@ async def addstars_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @owner_only
 async def addgifts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    added = db.add_payment_method("Telegram Gifts")
-    db.set_payment_method_config(
+    added = await asyncio.to_thread(db.add_payment_method, "Telegram Gifts")
+    gifts_recipient = await asyncio.to_thread(db.get_config, "gifts_recipient", "")
+    await asyncio.to_thread(db.set_payment_method_config,
         "Telegram Gifts",
         json.dumps({
-            "recipient": db.get_config("gifts_recipient", "")
+            "recipient": gifts_recipient
         })
     )
-    db.audit(update.effective_user.id, "add_payment_method", "Telegram Gifts")
+    await asyncio.to_thread(db.audit, update.effective_user.id, "add_payment_method", "Telegram Gifts")
 
     if added:
         await update.message.reply_text("✅ Telegram Gifts added as a payment method.")
@@ -1751,9 +1753,9 @@ async def payment_config_message(update: Update, context: ContextTypes.DEFAULT_T
         return True
 
     method_key = state["method"]
-    db.add_payment_method(method_key)
-    db.set_payment_method_config(method_key, json.dumps(state["answers"]))
-    db.audit(update.effective_user.id, "configure_payment_method", method_key)
+    await asyncio.to_thread(db.add_payment_method, method_key)
+    await asyncio.to_thread(db.set_payment_method_config, method_key, json.dumps(state["answers"]))
+    await asyncio.to_thread(db.audit, update.effective_user.id, "configure_payment_method", method_key)
     context.user_data.pop("payment_config", None)
 
     await update.message.reply_text(f"✅ {method_key.capitalize()} configured and enabled.")
@@ -1783,7 +1785,7 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     message_text = " ".join(context.args[1:])
     status_filter = BROADCAST_AUDIENCES[audience]
-    recipient_ids = db.get_all_advertiser_ids(status_filter)
+    recipient_ids = await asyncio.to_thread(db.get_all_advertiser_ids, status_filter)
 
     sent = 0
     failed = 0
@@ -1847,15 +1849,15 @@ async def createcoupon_command(update: Update, context: ContextTypes.DEFAULT_TYP
             except ValueError:
                 pass
 
-    db.create_coupon(code, discount_type, discount_value, expires_at, max_uses, update.effective_user.id)
-    db.audit(update.effective_user.id, "create_coupon", code)
+    await asyncio.to_thread(db.create_coupon, code, discount_type, discount_value, expires_at, max_uses, update.effective_user.id)
+    await asyncio.to_thread(db.audit, update.effective_user.id, "create_coupon", code)
 
     await update.message.reply_text(f"✅ Coupon {code} created.")
 
 
 @owner_only
 async def coupons_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    coupons = db.get_all_coupons()
+    coupons = await asyncio.to_thread(db.get_all_coupons)
     if not coupons:
         await update.message.reply_text("No coupons have been created yet.")
         return
@@ -1876,8 +1878,8 @@ async def deletecoupon_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("Usage: /deletecoupon <CODE>")
         return
     code = context.args[0].upper()
-    removed = db.delete_coupon(code)
-    db.audit(update.effective_user.id, "delete_coupon", code)
+    removed = await asyncio.to_thread(db.delete_coupon, code)
+    await asyncio.to_thread(db.audit, update.effective_user.id, "delete_coupon", code)
     await update.message.reply_text(f"✅ Coupon {code} deleted." if removed else f"❌ No coupon named {code}.")
 
 
@@ -1898,21 +1900,21 @@ async def createoffer_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     description = " ".join(context.args[2:])
-    offer_id = db.create_offer(description, start_at, end_at, update.effective_user.id)
-    db.audit(update.effective_user.id, "create_offer", f"#{offer_id}: {description}")
+    offer_id = await asyncio.to_thread(db.create_offer, description, start_at, end_at, update.effective_user.id)
+    await asyncio.to_thread(db.audit, update.effective_user.id, "create_offer", f"#{offer_id}: {description}")
 
     await update.message.reply_text(f"✅ Offer #{offer_id} created: {description}")
 
 
 @owner_only
 async def offers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    offers = db.get_all_offers()
+    offers = await asyncio.to_thread(db.get_all_offers)
     if not offers:
         await update.message.reply_text("No promotional offers have been created yet.")
         return
 
     lines = ["🎁 <b>Promotional Offers</b>\n"]
-    active_ids = {o[0] for o in db.get_active_offers()}
+    active_ids = {o[0] for o in await asyncio.to_thread(db.get_active_offers)}
     for oid, description, start_at, end_at in offers:
         tag = "🟢 active" if oid in active_ids else "⚪ inactive"
         lines.append(f"#{oid} [{tag}] {esc(description)} ({start_at[:10]} to {end_at[:10]})")
@@ -1925,8 +1927,8 @@ async def deleteoffer_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not context.args or not context.args[0].isdigit():
         await update.message.reply_text("Usage: /deleteoffer <ID>")
         return
-    removed = db.delete_offer(int(context.args[0]))
-    db.audit(update.effective_user.id, "delete_offer", context.args[0])
+    removed = await asyncio.to_thread(db.delete_offer, int(context.args[0]))
+    await asyncio.to_thread(db.audit, update.effective_user.id, "delete_offer", context.args[0])
     await update.message.reply_text("✅ Offer deleted." if removed else "❌ No offer with that ID.")
 
 
@@ -1962,7 +1964,7 @@ async def invoice_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /invoice <Invoice ID>")
         return
 
-    row = db.get_invoice(int(context.args[0]))
+    row = await asyncio.to_thread(db.get_invoice, int(context.args[0]))
     if not row:
         await update.message.reply_text("❌ No invoice with that ID.")
         return
@@ -1971,7 +1973,7 @@ async def invoice_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def receipts_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rows = db.get_advertiser_invoices(update.effective_user.id)
+    rows = await asyncio.to_thread(db.get_advertiser_invoices, update.effective_user.id)
     if not rows:
         await update.message.reply_text("You don't have any receipts yet.")
         return
@@ -1992,7 +1994,7 @@ async def revenue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /revenue today|week|month|year")
         return
 
-    r = db.get_revenue_report(period)
+    r = await asyncio.to_thread(db.get_revenue_report, period)
     text = f"""
 📈 <b>Revenue Report ({period})</b>
 
@@ -2008,11 +2010,11 @@ New Advertisers: {r['new_advertisers']}
 
 async def myads_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    subs = db.get_advertiser_subscriptions(user.id)
-    history = db.get_advertiser_history(user.id)
-    invoices = db.get_advertiser_invoices(user.id)
+    subs = await asyncio.to_thread(db.get_advertiser_subscriptions, user.id)
+    history = await asyncio.to_thread(db.get_advertiser_history, user.id)
+    invoices = await asyncio.to_thread(db.get_advertiser_invoices, user.id)
     total_spent = sum(inv[3] for inv in invoices)
-    my_pending = sum(1 for r in db.search_applications(str(user.id)) if r[7] == "pending")
+    my_pending = sum(1 for r in await asyncio.to_thread(db.search_applications, str(user.id)) if r[7] == "pending")
 
     lines = ["📊 <b>My Advertisements</b>\n"]
 
@@ -2063,7 +2065,7 @@ async def renew_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     subscription_id = int(query.data.split(":", 1)[1])
-    sub_row = db.get_subscription(subscription_id)
+    sub_row = await asyncio.to_thread(db.get_subscription, subscription_id)
 
     if not sub_row:
         await query.edit_message_text("❌ That advertisement subscription no longer exists.")
@@ -2087,20 +2089,20 @@ async def renew_duration_callback(update: Update, context: ContextTypes.DEFAULT_
     days = int(query.data.split(":", 1)[1])
     context.user_data.pop("renew_subscription_id", None)
 
-    sub_row = db.get_subscription(subscription_id)
+    sub_row = await asyncio.to_thread(db.get_subscription, subscription_id)
     (sid, application_id, applicant_id, business_name, ad_link, ad_text, ad_type,
      old_duration, start_at, end_at, status, created_at, total_views, total_clicks,
      r7, r3, r24, rex, renewed_from) = sub_row
 
-    new_application_id = db.create_application(
+    new_application_id = await asyncio.to_thread(db.create_application, 
         applicant_id=applicant_id, applicant_name=update.effective_user.first_name,
         applicant_username=update.effective_user.username, business_name=business_name,
         ad_link=ad_link, ad_type=ad_type, duration_days=days, ad_text=ad_text, notes="Renewal",
     )
-    db.set_application_status(new_application_id, "approved", decided_by=None)
-    db.audit(applicant_id, "renew_subscription", f"Subscription #{subscription_id} -> Application #{new_application_id}")
+    await asyncio.to_thread(db.set_application_status, new_application_id, "approved", decided_by=None)
+    await asyncio.to_thread(db.audit, applicant_id, "renew_subscription", f"Subscription #{subscription_id} -> Application #{new_application_id}")
 
-    rate_row = db.get_rate_with_currency(days)
+    rate_row = await asyncio.to_thread(db.get_rate_with_currency, days)
     price, currency = rate_row if rate_row else (0, "NGN")
     await query.edit_message_text(f"✅ Renewal set up for {days} Days. Amount due: {format_price(price, currency)}")
     await send_payment_instructions(context, new_application_id, applicant_id, price, currency)
@@ -2108,12 +2110,12 @@ async def renew_duration_callback(update: Update, context: ContextTypes.DEFAULT_
 
 @owner_or_admin_only
 async def subscriptions_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rows = db.get_all_subscriptions()
+    rows = await asyncio.to_thread(db.get_all_subscriptions)
     if not rows:
         await update.message.reply_text("No advertisement subscriptions yet.")
         return
 
-    lines = [f"📋 <b>Subscriptions</b> ({db.count_subscriptions()} total)\n"]
+    lines = [f"📋 <b>Subscriptions</b> ({await asyncio.to_thread(db.count_subscriptions)} total)\n"]
     lines.extend(subscription_summary_line(r) for r in rows)
     await update.message.reply_html("\n".join(lines))
 
@@ -2124,7 +2126,7 @@ async def subscription_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("Usage: /subscription <ID>")
         return
 
-    row = db.get_subscription(int(context.args[0]))
+    row = await asyncio.to_thread(db.get_subscription, int(context.args[0]))
     if not row:
         await update.message.reply_text("❌ No subscription with that ID.")
         return
@@ -2159,8 +2161,8 @@ async def pausead_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /pausead <ID>")
         return
     subscription_id = int(context.args[0])
-    db.set_subscription_status(subscription_id, "paused")
-    db.audit(update.effective_user.id, "pause_ad", str(subscription_id))
+    await asyncio.to_thread(db.set_subscription_status, subscription_id, "paused")
+    await asyncio.to_thread(db.audit, update.effective_user.id, "pause_ad", str(subscription_id))
     await update.message.reply_text(f"⏸ Subscription #{subscription_id} paused.")
 
 
@@ -2170,8 +2172,8 @@ async def resumead_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /resumead <ID>")
         return
     subscription_id = int(context.args[0])
-    db.set_subscription_status(subscription_id, "active")
-    db.audit(update.effective_user.id, "resume_ad", str(subscription_id))
+    await asyncio.to_thread(db.set_subscription_status, subscription_id, "active")
+    await asyncio.to_thread(db.audit, update.effective_user.id, "resume_ad", str(subscription_id))
     await update.message.reply_text(f"▶ Subscription #{subscription_id} resumed.")
 
 
@@ -2182,11 +2184,11 @@ async def extendad_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     subscription_id = int(context.args[0])
     days = int(context.args[1])
-    new_end = db.extend_subscription(subscription_id, days)
+    new_end = await asyncio.to_thread(db.extend_subscription, subscription_id, days)
     if new_end is None:
         await update.message.reply_text("❌ No subscription with that ID.")
         return
-    db.audit(update.effective_user.id, "extend_ad", f"#{subscription_id} by {days} days")
+    await asyncio.to_thread(db.audit, update.effective_user.id, "extend_ad", f"#{subscription_id} by {days} days")
     await update.message.reply_text(f"✅ Subscription #{subscription_id} extended. New end date: {new_end[:16]}")
 
 
@@ -2196,8 +2198,8 @@ async def cancelad_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /cancelad <ID>")
         return
     subscription_id = int(context.args[0])
-    db.set_subscription_status(subscription_id, "cancelled")
-    db.audit(update.effective_user.id, "cancel_ad", str(subscription_id))
+    await asyncio.to_thread(db.set_subscription_status, subscription_id, "cancelled")
+    await asyncio.to_thread(db.audit, update.effective_user.id, "cancel_ad", str(subscription_id))
     await update.message.reply_text(f"❌ Subscription #{subscription_id} cancelled.")
 
 
@@ -2207,7 +2209,7 @@ async def adreport_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /adreport <Advertisement ID>")
         return
 
-    row = db.get_subscription(int(context.args[0]))
+    row = await asyncio.to_thread(db.get_subscription, int(context.args[0]))
     if not row:
         await update.message.reply_text("❌ No subscription with that ID.")
         return
@@ -2260,7 +2262,7 @@ async def _send_export(update, filename, header, rows):
 
 @owner_only
 async def exportads_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rows = db.get_all_applications()
+    rows = await asyncio.to_thread(db.get_all_applications)
     await _send_export(
         update, "advertisements.csv",
         ["ID", "Applicant ID", "Applicant Name", "Username", "Business", "Link", "Type", "Duration", "Status", "Submitted"],
@@ -2270,7 +2272,7 @@ async def exportads_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @owner_only
 async def exportrevenue_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rows = db.get_all_invoices()
+    rows = await asyncio.to_thread(db.get_all_invoices)
     await _send_export(
         update, "revenue.csv",
         ["Invoice ID", "Business", "Advertiser", "Duration", "Amount Paid", "Payment Method", "Payment Date", "Currency"],
@@ -2280,7 +2282,7 @@ async def exportrevenue_command(update: Update, context: ContextTypes.DEFAULT_TY
 
 @owner_only
 async def exportpayments_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rows = db.get_pending_payments()
+    rows = await asyncio.to_thread(db.get_pending_payments)
     await _send_export(
         update, "payments.csv",
         ["Payment ID", "Application ID", "Submitted", "Business", "Applicant"],
@@ -2355,32 +2357,32 @@ async def allcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def job_activate_scheduled_ads(context: ContextTypes.DEFAULT_TYPE):
-    for subscription_id in db.get_subscriptions_needing_activation():
-        db.set_subscription_status(subscription_id, "active")
+    for subscription_id in await asyncio.to_thread(db.get_subscriptions_needing_activation):
+        await asyncio.to_thread(db.set_subscription_status, subscription_id, "active")
         logger.info(f"Activated subscription #{subscription_id}")
 
-        sub_row = db.get_subscription(subscription_id)
+        sub_row = await asyncio.to_thread(db.get_subscription, subscription_id)
         if sub_row:
             ad_link, ad_text = sub_row[4], sub_row[5]
             _publish_to_sponsored_slot(ad_text, ad_link)
 
 
 async def job_expire_ads(context: ContextTypes.DEFAULT_TYPE):
-    for subscription_id in db.get_subscriptions_needing_expiry():
-        db.set_subscription_status(subscription_id, "expired")
+    for subscription_id in await asyncio.to_thread(db.get_subscriptions_needing_expiry):
+        await asyncio.to_thread(db.set_subscription_status, subscription_id, "expired")
         logger.info(f"Expired subscription #{subscription_id}")
 
 
 async def job_mark_expiring_soon(context: ContextTypes.DEFAULT_TYPE):
-    for row in db.get_subscriptions_expiring_within(24):
+    for row in await asyncio.to_thread(db.get_subscriptions_expiring_within, 24):
         subscription_id = row[0]
-        db.set_subscription_status(subscription_id, "expiring_soon")
+        await asyncio.to_thread(db.set_subscription_status, subscription_id, "expiring_soon")
 
 
 async def job_send_reminders(context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now()
 
-    for row in db.get_subscriptions_expiring_within(24 * 7 + 1):
+    for row in await asyncio.to_thread(db.get_subscriptions_expiring_within, 24 * 7 + 1):
         (subscription_id, applicant_id, business_name, end_at,
          r7, r3, r24, rex) = row
 
@@ -2423,7 +2425,7 @@ async def job_send_reminders(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Failed to send reminder for subscription #{subscription_id}: {e}")
 
-        db.mark_reminder_sent(subscription_id, which)
+        await asyncio.to_thread(db.mark_reminder_sent, subscription_id, which)
 
 
 async def renew_dismiss_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
