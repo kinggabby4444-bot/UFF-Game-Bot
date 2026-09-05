@@ -94,7 +94,7 @@ def owner_only(func):
 def owner_or_admin_only(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
-        if not user or not is_owner_or_admin(user.id):
+        if not user or not await asyncio.to_thread(is_owner_or_admin, user.id):
             if update.message:
                 await update.message.reply_text("🚫 This command is restricted to the bot owner or bot admins.")
             return
@@ -262,7 +262,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args and context.args[0] == "submitad":
         return await submit_entry(update, context)
 
-    await update.message.reply_html(WELCOME_TEXT, reply_markup=main_menu_keyboard())
+    await update.message.reply_html(WELCOME_TEXT, reply_markup=await asyncio.to_thread(main_menu_keyboard))
     return ConversationHandler.END
 
 
@@ -277,7 +277,7 @@ def rates_text() -> str:
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_html(HELP_TEXT, reply_markup=main_menu_keyboard())
+    await update.message.reply_html(HELP_TEXT, reply_markup=await asyncio.to_thread(main_menu_keyboard))
 
 
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -285,9 +285,11 @@ async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
 
     if query.data == "menu:rates":
-        await query.edit_message_text(rates_text(), parse_mode="HTML", reply_markup=main_menu_keyboard())
+        rates = await asyncio.to_thread(rates_text)
+        keyboard = await asyncio.to_thread(main_menu_keyboard)
+        await query.edit_message_text(rates, parse_mode="HTML", reply_markup=keyboard)
     elif query.data == "menu:help":
-        await query.edit_message_text(HELP_TEXT, parse_mode="HTML", reply_markup=main_menu_keyboard())
+        await query.edit_message_text(HELP_TEXT, parse_mode="HTML", reply_markup=await asyncio.to_thread(main_menu_keyboard))
 
 
 @owner_only
@@ -448,7 +450,7 @@ async def ask_type_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         query.edit_message_text,
         f"Type: {esc(ad_type)}\n\nHow long would you like to advertise for?\n\nChoose from any of the buttons below 👇",
         parse_mode="HTML",
-        reply_markup=duration_keyboard(),
+        reply_markup=await asyncio.to_thread(duration_keyboard),
     )
     return ASK_DURATION
 
@@ -844,7 +846,7 @@ async def decision_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user = update.effective_user
 
-    if not is_owner_or_admin(user.id):
+    if not await asyncio.to_thread(is_owner_or_admin, user.id):
         await query.answer("🚫 Owner/admin only.", show_alert=True)
         return
 
@@ -970,7 +972,7 @@ async def contact_advertiser_callback(update: Update, context: ContextTypes.DEFA
     query = update.callback_query
     user = update.effective_user
 
-    if not is_owner_or_admin(user.id):
+    if not await asyncio.to_thread(is_owner_or_admin, user.id):
         await query.answer("🚫 Owner/admin only.", show_alert=True)
         return
 
@@ -1049,7 +1051,7 @@ async def payment_review_callback(update: Update, context: ContextTypes.DEFAULT_
     query = update.callback_query
     user = update.effective_user
 
-    if not is_owner_or_admin(user.id):
+    if not await asyncio.to_thread(is_owner_or_admin, user.id):
         await query.answer("🚫 Owner/admin only.", show_alert=True)
         return
 
@@ -1107,7 +1109,7 @@ async def payment_decision_callback(update: Update, context: ContextTypes.DEFAUL
     query = update.callback_query
     user = update.effective_user
 
-    if not is_owner_or_admin(user.id):
+    if not await asyncio.to_thread(is_owner_or_admin, user.id):
         await query.answer("🚫 Owner/admin only.", show_alert=True)
         return
 
@@ -1168,7 +1170,7 @@ async def paystart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user = update.effective_user
 
-    if not is_owner_or_admin(user.id):
+    if not await asyncio.to_thread(is_owner_or_admin, user.id):
         await query.answer("🚫 Owner/admin only.", show_alert=True)
         return
 
@@ -1250,7 +1252,7 @@ async def finalize_subscription(context, payment_id, start_at, actor_id):
     )
 
     if status_value == "active":
-        _publish_to_sponsored_slot(ad_text, ad_link)
+        await asyncio.to_thread(_publish_to_sponsored_slot, ad_text, ad_link)
 
     await asyncio.to_thread(db.set_application_status, application_id, "payment_confirmed", decided_by=actor_id)
 
@@ -1329,7 +1331,7 @@ async def send_applications_page(update_or_query, status, page, edit=False):
         lines.extend(format_application_row(r) for r in rows)
         text = "\n".join(lines)
 
-    keyboard, _ = applications_list_keyboard(status, page)
+    keyboard, _ = await asyncio.to_thread(applications_list_keyboard, status, page)
 
     if edit:
         await update_or_query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
@@ -1355,7 +1357,7 @@ async def rejected_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def applications_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user = update.effective_user
-    if not is_owner_or_admin(user.id):
+    if not await asyncio.to_thread(is_owner_or_admin, user.id):
         await query.answer("🚫 Owner/admin only.", show_alert=True)
         return
     await query.answer()
@@ -2074,7 +2076,7 @@ async def renew_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["renew_subscription_id"] = subscription_id
     await query.edit_message_text(
         "How long would you like to renew for?",
-        reply_markup=duration_keyboard(),
+        reply_markup=await asyncio.to_thread(duration_keyboard),
     )
 
 
@@ -2364,7 +2366,7 @@ async def job_activate_scheduled_ads(context: ContextTypes.DEFAULT_TYPE):
         sub_row = await asyncio.to_thread(db.get_subscription, subscription_id)
         if sub_row:
             ad_link, ad_text = sub_row[4], sub_row[5]
-            _publish_to_sponsored_slot(ad_text, ad_link)
+            await asyncio.to_thread(_publish_to_sponsored_slot, ad_text, ad_link)
 
 
 async def job_expire_ads(context: ContextTypes.DEFAULT_TYPE):
