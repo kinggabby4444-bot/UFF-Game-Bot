@@ -2217,13 +2217,13 @@ Tap a button below to continue your adventure!
                 invite_link = fresh_link
 
         username_display = f"@{esc(group_username)}" if group_username else "No public username"
-        added_by_display = esc(added_by_name) if added_by_name else (f"ID: <code>{added_by_id}</code>" if added_by_id else "Unknown")
-        removed_by_display = esc(removed_by_name) if removed_by_name else (f"ID: <code>{removed_by_id}</code>" if removed_by_id else "Unknown")
+        added_by_display = linked_actor_from_stored(added_by_name, added_by_id)
+        removed_by_display = linked_actor_from_stored(removed_by_name, removed_by_id)
 
         text = f"""
 👨‍👩‍👧‍👦 <b>Group Details</b>
 
-📛 Name: {esc(title or 'Untitled Group')}
+📛 Name: {linked_group_name(title, invite_link)}
 🆔 Group ID: <code>{g_chat_id}</code>
 👤 Group username: {username_display}
 👥 Members: {members_display}
@@ -2996,12 +2996,50 @@ def format_actor_plain(user):
     return user.full_name or str(user.id)
 
 
+def linked_actor_from_stored(name, user_id):
+    """Rebuilds a clickable identity from what was saved to the DB (a plain
+    '@username' or display name, plus the numeric id). Mirrors
+    format_actor_html's link choice: @username -> DM link, otherwise a
+    tg://user text-mention using the stored id."""
+    if not user_id and not name:
+        return "Unknown"
+    display = esc(name) if name else str(user_id)
+    if name and name.startswith("@"):
+        href = f"https://t.me/{name[1:]}"
+    elif user_id:
+        href = f"tg://user?id={user_id}"
+    else:
+        return display
+    id_suffix = f" (ID: <code>{user_id}</code>)" if user_id else ""
+    return f'<a href="{href}">{display}</a>{id_suffix}'
+
+
 def format_actor_html(user):
-    """HTML-safe identity of whoever performed a membership change - for the owner notification."""
+    """Clickable identity of whoever performed a membership change - for the
+    owner notification. Uses a t.me/username DM link when the person has a
+    username; otherwise falls back to a tg://user text-mention, which
+    Telegram resolves to a working profile link for ANY user ID - no
+    username or prior bot interaction required, so this works even for
+    admins with private profiles."""
     if user is None:
         return "Unknown"
-    handle = f"@{esc(user.username)}" if user.username else esc(user.full_name or "Unknown")
-    return f"{handle} (ID: <code>{user.id}</code>)"
+    if user.username:
+        label = f"@{esc(user.username)}"
+        href = f"https://t.me/{user.username}"
+    else:
+        label = esc(user.full_name or "Unknown")
+        href = f"tg://user?id={user.id}"
+    return f'<a href="{href}">{label}</a> (ID: <code>{user.id}</code>)'
+
+
+def linked_group_name(title, link):
+    """Group name as clickable blue text pointing at the group, when we
+    have a link for it (public @username or a generated invite link).
+    Falls back to plain escaped text when no link is available."""
+    name = esc(title or "Untitled Group")
+    if link:
+        return f'<a href="{esc(link)}">{name}</a>'
+    return name
 
 
 async def get_group_invite_link(bot, chat_id, username=None):
@@ -3038,7 +3076,7 @@ async def notify_owner_group_event(bot, chat, actor, action, invite_link, group_
 
     text = (
         f"{emoji} <b>{title}</b>\n\n"
-        f"Group name : {esc(chat.title or str(chat.id))}\n"
+        f"Group name : {linked_group_name(chat.title or str(chat.id), invite_link)}\n"
         f"Group ID : <code>{chat.id}</code>\n"
         f"Time and date : {now_str}\n"
         f"Action : {action_line}\n"
