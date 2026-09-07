@@ -2202,26 +2202,40 @@ Tap a button below to continue your adventure!
             await query.answer("❌ Group data not found.", show_alert=True)
             return
 
-        g_chat_id, title, member_count, wg_played, first_seen, left_at, scr_played = details
-        members_display = member_count if member_count else "Unknown"
-        status_display = "🟢 Currently in group" if not left_at else f"🔴 Removed ({left_at[:16]})"
+        (g_chat_id, title, member_count, wg_played, first_seen, left_at, scr_played,
+         group_username, stored_invite_link, added_by_id, added_by_name,
+         removed_by_id, removed_by_name) = details
 
-        invite_link = None
-        if not left_at:
-            try:
-                link_obj = await context.bot.create_chat_invite_link(g_chat_id)
-                invite_link = link_obj.invite_link
-            except Exception:
-                invite_link = None
+        members_display = member_count if member_count else "Unknown"
+        is_current = not left_at
+        status_display = "🟢 Currently in group" if is_current else f"🔴 Removed ({left_at[:16]})"
+
+        invite_link = stored_invite_link
+        if is_current:
+            fresh_link = await get_group_invite_link(context.bot, g_chat_id, group_username)
+            if fresh_link:
+                invite_link = fresh_link
+
+        username_display = f"@{esc(group_username)}" if group_username else "No public username"
+        added_by_display = esc(added_by_name) if added_by_name else (f"ID: <code>{added_by_id}</code>" if added_by_id else "Unknown")
+        removed_by_display = esc(removed_by_name) if removed_by_name else (f"ID: <code>{removed_by_id}</code>" if removed_by_id else "Unknown")
 
         text = f"""
 👨‍👩‍👧‍👦 <b>Group Details</b>
 
 📛 Name: {esc(title or 'Untitled Group')}
 🆔 Group ID: <code>{g_chat_id}</code>
+👤 Group username: {username_display}
 👥 Members: {members_display}
-📅 Bot Joined: {first_seen or 'Unknown'}
+📅 Added on: {first_seen or 'Unknown'}
+👋 Added by: {added_by_display}
 {status_display}
+"""
+        if not is_current:
+            text += f"🚪 Removed by: {removed_by_display}\n"
+
+        text += f"""
+🔗 Group link: {esc(invite_link) if invite_link else 'Not available'}
 
 🎮 Word Game — Games Played: <b>{wg_played}</b>
 🔤 Word Scramble — Rounds Played: <b>{scr_played}</b>
@@ -2944,7 +2958,7 @@ async def pre_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
             raise ApplicationHandlerStop
 
-        await asyncio.to_thread(db.register_group, chat.id, chat.title or str(chat.id))
+        await asyncio.to_thread(db.register_group, chat.id, chat.title or str(chat.id), chat.username)
 
     maintenance_mode = await asyncio.to_thread(db.get_config, "maintenance_mode", "0")
     if not await asyncio.to_thread(is_bot_admin_or_owner, user.id) and maintenance_mode == "1":
@@ -2973,12 +2987,78 @@ async def pre_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await asyncio.to_thread(db.add_user, user.id, user.first_name, user.username)
 
 
+def format_actor_plain(user):
+    """Plain-text identity of whoever performed a membership change - for DB storage."""
+    if user is None:
+        return None
+    if user.username:
+        return f"@{user.username}"
+    return user.full_name or str(user.id)
+
+
+def format_actor_html(user):
+    """HTML-safe identity of whoever performed a membership change - for the owner notification."""
+    if user is None:
+        return "Unknown"
+    handle = f"@{esc(user.username)}" if user.username else esc(user.full_name or "Unknown")
+    return f"{handle} (ID: <code>{user.id}</code>)"
+
+
+async def get_group_invite_link(bot, chat_id, username=None):
+    """Best-effort group link. Public groups just use the @username link.
+    Private groups need the bot to have admin rights with invite
+    permission to generate one - if it doesn't (yet), this returns None
+    and the caller falls back to a friendly message instead of crashing."""
+    if username:
+        return f"https://t.me/{username}"
+    try:
+        link_obj = await bot.create_chat_invite_link(chat_id, creates_join_request=True)
+        return link_obj.invite_link
+    except Exception:
+        pass
+    try:
+        full_chat = await bot.get_chat(chat_id)
+        if getattr(full_chat, "invite_link", None):
+            return full_chat.invite_link
+    except Exception:
+        pass
+    return None
+
+
+async def notify_owner_group_event(bot, chat, actor, action, invite_link, group_username=None):
+    now_str = datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
+    username = group_username if group_username is not None else chat.username
+    username_display = f"@{esc(username)}" if username else "No public username"
+    link_display = esc(invite_link) if invite_link else "Not available (bot needs admin/invite rights in that group)"
+
+    if action == "added":
+        emoji, title, action_line, by_label = "🟢", "Added to a group", "It was added", "Added by"
+    else:
+        emoji, title, action_line, by_label = "🔴", "Removed from a group", "It was removed", "Removed by"
+
+    text = (
+        f"{emoji} <b>{title}</b>\n\n"
+        f"Group name : {esc(chat.title or str(chat.id))}\n"
+        f"Group ID : <code>{chat.id}</code>\n"
+        f"Time and date : {now_str}\n"
+        f"Action : {action_line}\n"
+        f"{by_label} : {format_actor_html(actor)}\n"
+        f"Group username : {username_display}\n"
+        f"Group link : {link_display}"
+    )
+    try:
+        await bot.send_message(chat_id=OWNER_ID, text=text, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Failed to notify owner of group {action} event: {e}")
+
+
 async def on_bot_membership_change(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = update.my_chat_member
     if result.new_chat_member.user.id != context.bot.id:
         return
 
     chat = update.effective_chat
+    actor = result.from_user
     old_status = result.old_chat_member.status
     new_status = result.new_chat_member.status
 
@@ -2989,25 +3069,35 @@ async def on_bot_membership_change(update: Update, context: ContextTypes.DEFAULT
             except (Forbidden, BadRequest):
                 pass
             return
-        await asyncio.to_thread(db.register_group, chat.id, chat.title or str(chat.id))
 
-        if old_status in ("left", "kicked"):
-            try:
-                await context.bot.send_message(
-                    chat_id=OWNER_ID,
-                    text=(
-                        f"➕ <b>Added to a new group!</b>\n\n"
-                        f"Title: {esc(chat.title or str(chat.id))}\n"
-                        f"ID: <code>{chat.id}</code>"
-                    ),
-                    parse_mode="HTML",
-                )
-            except Exception as e:
-                logger.error(f"Failed to notify owner of group add: {e}")
+        just_joined = old_status in ("left", "kicked")
+        invite_link = await get_group_invite_link(context.bot, chat.id, chat.username)
+
+        await asyncio.to_thread(
+            db.register_group, chat.id, chat.title or str(chat.id),
+            chat.username, invite_link,
+            actor.id if (just_joined and actor) else None,
+            format_actor_plain(actor) if just_joined else None,
+        )
+
+        if just_joined:
+            await notify_owner_group_event(context.bot, chat, actor, "added", invite_link)
         return
 
     if new_status in ("left", "kicked"):
-        await asyncio.to_thread(db.mark_group_left, chat.id)
+        stored = await asyncio.to_thread(db.get_group_full_details, chat.id)
+        stored_username = stored[7] if stored else None
+        stored_invite_link = stored[8] if stored else None
+
+        await asyncio.to_thread(
+            db.mark_group_left, chat.id,
+            actor.id if actor else None,
+            format_actor_plain(actor),
+        )
+        await notify_owner_group_event(
+            context.bot, chat, actor, "removed",
+            stored_invite_link, group_username=(stored_username or chat.username),
+        )
 
 
 def owner_top_groups_keyboard():

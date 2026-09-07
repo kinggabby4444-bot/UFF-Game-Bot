@@ -186,6 +186,12 @@ def create_tables():
         """)
 
         cursor.execute("ALTER TABLE groups ADD COLUMN IF NOT EXISTS left_at TEXT")
+        cursor.execute("ALTER TABLE groups ADD COLUMN IF NOT EXISTS username TEXT")
+        cursor.execute("ALTER TABLE groups ADD COLUMN IF NOT EXISTS invite_link TEXT")
+        cursor.execute("ALTER TABLE groups ADD COLUMN IF NOT EXISTS added_by_id BIGINT")
+        cursor.execute("ALTER TABLE groups ADD COLUMN IF NOT EXISTS added_by_name TEXT")
+        cursor.execute("ALTER TABLE groups ADD COLUMN IF NOT EXISTS removed_by_id BIGINT")
+        cursor.execute("ALTER TABLE groups ADD COLUMN IF NOT EXISTS removed_by_name TEXT")
 
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS banned_users (
@@ -1038,27 +1044,39 @@ def get_explain_log(chat_id, leader_id):
         conn.close()
 
 
-def register_group(chat_id, title):
+def register_group(chat_id, title, username=None, invite_link=None, added_by_id=None, added_by_name=None):
     conn = connect()
     try:
         cursor = conn.cursor()
         now = datetime.now().isoformat()
         cursor.execute("""
-            INSERT INTO groups (chat_id, title, first_seen, last_active)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO groups (chat_id, title, first_seen, last_active, username, invite_link, added_by_id, added_by_name)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (chat_id) DO UPDATE SET
-                title=EXCLUDED.title, last_active=EXCLUDED.last_active, left_at=NULL
-        """, (chat_id, title, now, now))
+                title=EXCLUDED.title,
+                last_active=EXCLUDED.last_active,
+                left_at=NULL,
+                username=COALESCE(EXCLUDED.username, groups.username),
+                invite_link=COALESCE(EXCLUDED.invite_link, groups.invite_link),
+                added_by_id=COALESCE(EXCLUDED.added_by_id, groups.added_by_id),
+                added_by_name=COALESCE(EXCLUDED.added_by_name, groups.added_by_name)
+        """, (chat_id, title, now, now, username, invite_link, added_by_id, added_by_name))
         conn.commit()
     finally:
         conn.close()
 
 
-def mark_group_left(chat_id):
+def mark_group_left(chat_id, removed_by_id=None, removed_by_name=None):
     conn = connect()
     try:
         cursor = conn.cursor()
-        cursor.execute("UPDATE groups SET left_at=%s WHERE chat_id=%s", (datetime.now().isoformat(), chat_id))
+        cursor.execute("""
+            UPDATE groups
+            SET left_at=%s,
+                removed_by_id=COALESCE(%s, removed_by_id),
+                removed_by_name=COALESCE(%s, removed_by_name)
+            WHERE chat_id=%s
+        """, (datetime.now().isoformat(), removed_by_id, removed_by_name, chat_id))
         conn.commit()
     finally:
         conn.close()
@@ -1111,7 +1129,8 @@ def get_group_full_details(chat_id):
         cursor = conn.cursor()
         cursor.execute("""
             SELECT g.chat_id, g.title, g.member_count, g.games_played, g.first_seen, g.left_at,
-                   COALESCE(s.rounds_played, 0)
+                   COALESCE(s.rounds_played, 0), g.username, g.invite_link,
+                   g.added_by_id, g.added_by_name, g.removed_by_id, g.removed_by_name
             FROM groups g
             LEFT JOIN scramble_group_stats s ON s.chat_id = g.chat_id
             WHERE g.chat_id=%s
