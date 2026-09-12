@@ -88,7 +88,7 @@ def is_bot_admin_or_owner(user_id) -> bool:
 def owner_or_admin_only(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
-        if not user or not await asyncio.to_thread(is_bot_admin_or_owner, user.id):
+        if not user or not is_bot_admin_or_owner(user.id):
             if update.message:
                 await update.message.reply_text(
                     "🚫 This command is restricted to the bot owner or bot admins."
@@ -770,7 +770,6 @@ async def start_scramble_round(context: ContextTypes.DEFAULT_TYPE, chat):
     if chat.type != ChatType.PRIVATE:
         await asyncio.to_thread(db.scramble_register_group, chat.id, chat.title or str(chat.id))
 
-    scramble_reward = await asyncio.to_thread(get_scramble_reward)
     await safe_send(
         context.bot,
         chat.id,
@@ -778,7 +777,7 @@ async def start_scramble_round(context: ContextTypes.DEFAULT_TYPE, chat):
             f"🎮 <b>WORD SCRAMBLE</b> 🎮\n\n"
             f"Unscramble this word:\n\n"
             f"<b>{esc(scrambled)}</b>\n\n"
-            f"First to type the correct word in the next 2 minutes wins {DOLLAR}{scramble_reward}"
+            f"First to type the correct word in the next 2 minutes wins {DOLLAR}{get_scramble_reward()}"
         ),
         parse_mode="HTML",
     )
@@ -796,7 +795,7 @@ async def wordscramble_command(update: Update, context: ContextTypes.DEFAULT_TYP
     user = update.effective_user
     await asyncio.to_thread(db.scramble_increment_played, user.id, chat.id, user.first_name)
 
-    if await asyncio.to_thread(_slowmode_enabled, chat.id) and not await asyncio.to_thread(db.scramble_get_round, chat.id):
+    if _slowmode_enabled(chat.id) and not await asyncio.to_thread(db.scramble_get_round, chat.id):
         interval = (await asyncio.to_thread(db.get_scramble_slowmode, chat.id))[0]
         await update.message.reply_text(
             f"🐢 Slow mode is on - a new round starts automatically every {_format_duration_words(interval)}. Please wait."
@@ -828,7 +827,7 @@ async def _scramble_handle_win(context: ContextTypes.DEFAULT_TYPE, chat, user, m
 
     await safe_react(context.bot, chat.id, message.message_id, "🎉")
 
-    reward = await asyncio.to_thread(get_scramble_reward)
+    reward = get_scramble_reward()
 
     await asyncio.to_thread(db.scramble_reset_all_streaks_in_chat, chat.id, user.id)
     new_streak = await asyncio.to_thread(db.scramble_record_win, user.id, chat.id, user.first_name, reward)
@@ -911,8 +910,8 @@ async def scramble_private_text(update: Update, context: ContextTypes.DEFAULT_TY
     await _scramble_process_guess(update, context, update.effective_chat, user, message)
 
 
-async def scramble_help_text() -> str:
-    reward = await asyncio.to_thread(get_scramble_reward)
+def scramble_help_text() -> str:
+    reward = get_scramble_reward()
     return f"""
 🔤 <b>Word Scramble - How to Play</b>
 
@@ -942,7 +941,7 @@ Your streak resets if someone else wins a round before you do.
 
 
 async def scramblehelp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_html(await scramble_help_text())
+    await update.message.reply_html(scramble_help_text())
 
 
 def format_scramble_board(rows, title, position_info=None, requester_name=None) -> str:
@@ -974,7 +973,7 @@ async def scrambleleaderboard_command(update: Update, context: ContextTypes.DEFA
     position_info = await asyncio.to_thread(db.scramble_get_chat_position, chat_id, user.id)
 
     await update.message.reply_html(
-        await asyncio.to_thread(format_scramble_board, rows, "Word Scramble - This Chat", position_info, user.first_name),
+        format_scramble_board(rows, "Word Scramble - This Chat", position_info, user.first_name),
         link_preview_options=LinkPreviewOptions(is_disabled=True),
     )
 
@@ -1035,9 +1034,8 @@ async def scrambletopgroups_command(update: Update, context: ContextTypes.DEFAUL
     for i, (title, rounds_played) in enumerate(rows, start=1):
         lines.append(f"{i}. {truncate_name(title or 'Untitled Group')} — {rounds_played:,} Rounds")
 
-    ad_footer = await asyncio.to_thread(ad_footer_html)
     await update.message.reply_html(
-        "\n".join(lines) + ad_footer,
+        "\n".join(lines) + ad_footer_html(),
         link_preview_options=LinkPreviewOptions(is_disabled=True),
     )
 
@@ -1082,9 +1080,8 @@ async def scramblestats_command(update: Update, context: ContextTypes.DEFAULT_TY
 @owner_only
 async def scramblesetreward_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        current_reward = await asyncio.to_thread(get_scramble_reward)
         await update.message.reply_text(
-            f"Usage: /scramblesetreward <amount>\nCurrent: {DOLLAR}{current_reward}"
+            f"Usage: /scramblesetreward <amount>\nCurrent: {DOLLAR}{get_scramble_reward()}"
         )
         return
     try:
@@ -1460,7 +1457,7 @@ async def scrambleautomaticmode_command(update: Update, context: ContextTypes.DE
 
     mode = context.args[0].lower()
 
-    if mode == "on" and await asyncio.to_thread(_slowmode_enabled, chat_id):
+    if mode == "on" and _slowmode_enabled(chat_id):
         await update.message.reply_text(
             "❌ Slow Mode is currently on in this chat - turn it off with /slowmode off "
             "before enabling Automatic Mode. The two must never run at the same time."
@@ -1512,13 +1509,14 @@ def build_scrambleusers_list_page(page: int):
 
 @owner_only
 async def scrambleusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    header, keyboard = await asyncio.to_thread(build_scrambleusers_list_page, 0)
+    header, keyboard = build_scrambleusers_list_page(0)
     if header is None:
         await update.message.reply_text("No Word Scramble activity recorded yet.")
         return
     await update.message.reply_html(header, reply_markup=keyboard)
 
 _SYSTEM_DICTIONARY_CACHE = None
+_SPELLCHECKER_CACHE = None
 
 
 def _load_system_dictionary():
@@ -1544,7 +1542,28 @@ def _load_system_dictionary():
     return words
 
 
+def _get_spellchecker():
+    """pyspellchecker ships its own word-frequency dictionary as data
+    bundled inside the pip package itself - unlike enchant (needs the
+    system libenchant library, not present on Render) or
+    /usr/share/dict/words (not present on Render's slim container
+    either), so this is the one dictionary check that's actually
+    guaranteed to work in production, not just on a local dev machine."""
+    global _SPELLCHECKER_CACHE
+    if _SPELLCHECKER_CACHE is None:
+        from spellchecker import SpellChecker
+        _SPELLCHECKER_CACHE = SpellChecker()
+    return _SPELLCHECKER_CACHE
+
+
 def _word_in_dictionary(word_lower: str) -> bool:
+    try:
+        spell = _get_spellchecker()
+        if spell.known([word_lower]) or spell.known([word_lower.capitalize()]):
+            return True
+    except Exception:
+        pass
+
     try:
         enchant = importlib.import_module("enchant")
         try:
@@ -1774,7 +1793,7 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(
         "⚙️ <b>Settings</b>\n\n"
         "When you win a round, should you automatically become the next leader?",
-        reply_markup=await asyncio.to_thread(settings_keyboard, user.id),
+        reply_markup=settings_keyboard(user.id),
     )
 
 
@@ -1794,9 +1813,9 @@ async def claimdailyreward_command(update: Update, context: ContextTypes.DEFAULT
 
     if result[0]:
         amount = int(await asyncio.to_thread(db.get_config, "reward_daily", db.DAILY_REWARD))
-        await asyncio.to_thread(apply_chat_credit_for_global_earning, user.id, user.first_name, amount)
+        apply_chat_credit_for_global_earning(user.id, user.first_name, amount)
 
-    await update.message.reply_html(await asyncio.to_thread(format_daily_reward_text, result))
+    await update.message.reply_html(format_daily_reward_text(result))
 
 
 async def is_chat_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -1887,7 +1906,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer()
             await query.edit_message_text(SCRAMBLE_GROUPS_ONLY_TEXT, parse_mode="HTML")
             return
-        if await asyncio.to_thread(_slowmode_enabled, chat.id) and not await asyncio.to_thread(db.scramble_get_round, chat.id):
+        if _slowmode_enabled(chat.id) and not await asyncio.to_thread(db.scramble_get_round, chat.id):
             interval = (await asyncio.to_thread(db.get_scramble_slowmode, chat.id))[0]
             await query.answer(
                 f"🐢 Slow mode is on - a new round starts automatically every {_format_duration_words(interval)}.",
@@ -1924,7 +1943,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rows = await asyncio.to_thread(db.scramble_get_chat_leaderboard, chat.id, 15)
         position_info = await asyncio.to_thread(db.scramble_get_chat_position, chat.id, user.id)
         await query.edit_message_text(
-            await asyncio.to_thread(format_scramble_top_players, rows, "Top 15 - This Chat", position_info, user.first_name, "Your Position"),
+            format_scramble_top_players(rows, "Top 15 - This Chat", position_info, user.first_name, "Your Position"),
             parse_mode="HTML",
             reply_markup=scramble_topplayers_keyboard(),
             link_preview_options=LinkPreviewOptions(is_disabled=True),
@@ -1936,7 +1955,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rows = await asyncio.to_thread(db.scramble_get_global_leaderboard, 15)
         position_info = await asyncio.to_thread(db.scramble_get_global_position, user.id)
         await query.edit_message_text(
-            await asyncio.to_thread(format_scramble_top_players, rows, "Top 15 - Global", position_info, user.first_name, "Your Global Position"),
+            format_scramble_top_players(rows, "Top 15 - Global", position_info, user.first_name, "Your Global Position"),
             parse_mode="HTML",
             reply_markup=scramble_topplayers_keyboard(),
             link_preview_options=LinkPreviewOptions(is_disabled=True),
@@ -1995,14 +2014,14 @@ Tap a button below to continue your adventure!
 
         if result[0]:
             amount = int(await asyncio.to_thread(db.get_config, "reward_daily", db.DAILY_REWARD))
-            await asyncio.to_thread(apply_chat_credit_for_global_earning, user.id, user.first_name, amount, current_chat=chat)
+            apply_chat_credit_for_global_earning(user.id, user.first_name, amount, current_chat=chat)
 
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("⬅ Back", callback_data="home")]
         ])
 
         await query.edit_message_text(
-            await asyncio.to_thread(format_daily_reward_text, result),
+            format_daily_reward_text(result),
             parse_mode="HTML",
             reply_markup=keyboard,
         )
@@ -2013,7 +2032,7 @@ Tap a button below to continue your adventure!
             await query.answer()
             await query.edit_message_text(SCRAMBLE_GROUPS_ONLY_TEXT, parse_mode="HTML")
             return
-        if await asyncio.to_thread(_slowmode_enabled, chat.id) and not await asyncio.to_thread(db.scramble_get_round, chat.id):
+        if _slowmode_enabled(chat.id) and not await asyncio.to_thread(db.scramble_get_round, chat.id):
             interval = (await asyncio.to_thread(db.get_scramble_slowmode, chat.id))[0]
             await query.answer(
                 f"🐢 Slow mode is on - a new round starts automatically every {_format_duration_words(interval)}.",
@@ -2048,7 +2067,7 @@ Tap a button below to continue your adventure!
         ])
 
         await query.edit_message_text(
-            await asyncio.to_thread(format_board, rows, "UFF Leaderboard", position_info, user.first_name),
+            format_board(rows, "UFF Leaderboard", position_info, user.first_name),
             parse_mode="HTML",
             reply_markup=keyboard,
             link_preview_options=LinkPreviewOptions(is_disabled=True),
@@ -2059,7 +2078,7 @@ Tap a button below to continue your adventure!
         await query.answer()
         await asyncio.to_thread(db.toggle_auto_lead, user.id)
         await query.edit_message_reply_markup(
-            reply_markup=await asyncio.to_thread(settings_keyboard, user.id)
+            reply_markup=settings_keyboard(user.id)
         )
         return
 
@@ -2068,7 +2087,7 @@ Tap a button below to continue your adventure!
         rows = await asyncio.to_thread(db.get_chat_leaderboard, chat.id)
         position_info = await asyncio.to_thread(db.get_chat_position, chat.id, user.id)
         await query.edit_message_text(
-            await asyncio.to_thread(format_board, rows, "Leaderboard - This Chat", position_info, user.first_name),
+            format_board(rows, "Leaderboard - This Chat", position_info, user.first_name),
             parse_mode="HTML",
             reply_markup=leaderboard_keyboard(),
             link_preview_options=LinkPreviewOptions(is_disabled=True),
@@ -2080,7 +2099,7 @@ Tap a button below to continue your adventure!
         rows = await asyncio.to_thread(db.get_global_leaderboard)
         position_info = await asyncio.to_thread(db.get_global_position, user.id)
         await query.edit_message_text(
-            await asyncio.to_thread(format_board, rows, "Leaderboard - Global", position_info, user.first_name),
+            format_board(rows, "Leaderboard - Global", position_info, user.first_name),
             parse_mode="HTML",
             reply_markup=leaderboard_keyboard(),
             link_preview_options=LinkPreviewOptions(is_disabled=True),
@@ -2098,7 +2117,7 @@ Tap a button below to continue your adventure!
             return
 
         if is_owner(user.id):
-            keyboard = await asyncio.to_thread(owner_top_players_keyboard, "chat", chat.id)
+            keyboard = owner_top_players_keyboard("chat", chat.id)
             if keyboard is None:
                 await query.edit_message_text(
                     "No scores yet in this chat.",
@@ -2115,7 +2134,7 @@ Tap a button below to continue your adventure!
         rows = await asyncio.to_thread(db.get_chat_leaderboard, chat.id, 15)
         position_info = await asyncio.to_thread(db.get_chat_position, chat.id, user.id)
         await query.edit_message_text(
-            await asyncio.to_thread(format_top_players, rows, "Top 15 - This Chat", position_info, user.first_name, "Your Position"),
+            format_top_players(rows, "Top 15 - This Chat", position_info, user.first_name, "Your Position"),
             parse_mode="HTML",
             reply_markup=topplayers_keyboard(),
             link_preview_options=LinkPreviewOptions(is_disabled=True),
@@ -2126,7 +2145,7 @@ Tap a button below to continue your adventure!
         await query.answer()
 
         if is_owner(user.id):
-            keyboard = await asyncio.to_thread(owner_top_players_keyboard, "global", 0)
+            keyboard = owner_top_players_keyboard("global", 0)
             if keyboard is None:
                 await query.edit_message_text(
                     "No scores yet.",
@@ -2143,7 +2162,7 @@ Tap a button below to continue your adventure!
         rows = await asyncio.to_thread(db.get_global_leaderboard, 15)
         position_info = await asyncio.to_thread(db.get_global_position, user.id)
         await query.edit_message_text(
-            await asyncio.to_thread(format_top_players, rows, "Top 15 - Global", position_info, user.first_name, "Your Global Position"),
+            format_top_players(rows, "Top 15 - Global", position_info, user.first_name, "Your Global Position"),
             parse_mode="HTML",
             reply_markup=topplayers_keyboard(),
             link_preview_options=LinkPreviewOptions(is_disabled=True),
@@ -2155,7 +2174,7 @@ Tap a button below to continue your adventure!
             await query.answer("🚫 Owner only.", show_alert=True)
             return
         page = int(query.data.split(":", 1)[1])
-        header, keyboard = await asyncio.to_thread(build_users_list_page, page)
+        header, keyboard = build_users_list_page(page)
         await query.answer()
         if header is None:
             await query.edit_message_text("No users registered yet.")
@@ -2168,7 +2187,7 @@ Tap a button below to continue your adventure!
             await query.answer("🚫 Owner only.", show_alert=True)
             return
         page = int(query.data.split(":", 1)[1])
-        header, keyboard = await asyncio.to_thread(build_groups_list_page, page)
+        header, keyboard = build_groups_list_page(page)
         await query.answer()
         if header is None:
             await query.edit_message_text("No groups registered yet.")
@@ -2181,7 +2200,7 @@ Tap a button below to continue your adventure!
             await query.answer("🚫 Owner only.", show_alert=True)
             return
         page = int(query.data.split(":", 1)[1])
-        header, keyboard = await asyncio.to_thread(build_botgroups_list_page, page)
+        header, keyboard = build_botgroups_list_page(page)
         await query.answer()
         if header is None:
             await query.edit_message_text("No groups registered yet.")
@@ -2202,40 +2221,26 @@ Tap a button below to continue your adventure!
             await query.answer("❌ Group data not found.", show_alert=True)
             return
 
-        (g_chat_id, title, member_count, wg_played, first_seen, left_at, scr_played,
-         group_username, stored_invite_link, added_by_id, added_by_name,
-         removed_by_id, removed_by_name) = details
-
+        g_chat_id, title, member_count, wg_played, first_seen, left_at, scr_played = details
         members_display = member_count if member_count else "Unknown"
-        is_current = not left_at
-        status_display = "🟢 Currently in group" if is_current else f"🔴 Removed ({left_at[:16]})"
+        status_display = "🟢 Currently in group" if not left_at else f"🔴 Removed ({left_at[:16]})"
 
-        invite_link = stored_invite_link
-        if is_current:
-            fresh_link = await get_group_invite_link(context.bot, g_chat_id, group_username)
-            if fresh_link:
-                invite_link = fresh_link
-
-        username_display = f"@{esc(group_username)}" if group_username else "No public username"
-        added_by_display = linked_actor_from_stored(added_by_name, added_by_id)
-        removed_by_display = linked_actor_from_stored(removed_by_name, removed_by_id)
+        invite_link = None
+        if not left_at:
+            try:
+                link_obj = await context.bot.create_chat_invite_link(g_chat_id)
+                invite_link = link_obj.invite_link
+            except Exception:
+                invite_link = None
 
         text = f"""
 👨‍👩‍👧‍👦 <b>Group Details</b>
 
-📛 Name: {linked_group_name(title, invite_link)}
+📛 Name: {esc(title or 'Untitled Group')}
 🆔 Group ID: <code>{g_chat_id}</code>
-👤 Group username: {username_display}
 👥 Members: {members_display}
-📅 Added on: {first_seen or 'Unknown'}
-👋 Added by: {added_by_display}
+📅 Bot Joined: {first_seen or 'Unknown'}
 {status_display}
-"""
-        if not is_current:
-            text += f"🚪 Removed by: {removed_by_display}\n"
-
-        text += f"""
-🔗 Group link: {esc(invite_link) if invite_link else 'Not available'}
 
 🎮 Word Game — Games Played: <b>{wg_played}</b>
 🔤 Word Scramble — Rounds Played: <b>{scr_played}</b>
@@ -2271,14 +2276,14 @@ Tap a button below to continue your adventure!
         await query.answer()
 
         if scope == "userslist":
-            header, keyboard = await asyncio.to_thread(build_users_list_page, int(ctx_str))
+            header, keyboard = build_users_list_page(int(ctx_str))
             if header is None:
                 await query.edit_message_text("No users registered yet.")
                 return
             await query.edit_message_text(header, parse_mode="HTML", reply_markup=keyboard)
             return
 
-        keyboard = await asyncio.to_thread(owner_top_players_keyboard, scope, int(ctx_str))
+        keyboard = owner_top_players_keyboard(scope, int(ctx_str))
         title = "Top 15 - This Chat" if scope == "chat" else "Top 15 - Global"
         await query.edit_message_text(
             f"🏆 <b>{title}</b>\n<i>Tap a player to view their profile.</i>",
@@ -2330,14 +2335,14 @@ Tap a button below to continue your adventure!
         await query.answer()
 
         if backscope == "gl":
-            header, keyboard = await asyncio.to_thread(build_groups_list_page, backpage)
+            header, keyboard = build_groups_list_page(backpage)
             if header is None:
                 await query.edit_message_text("No groups registered yet.")
                 return
             await query.edit_message_text(header, parse_mode="HTML", reply_markup=keyboard)
             return
 
-        rows, keyboard = await asyncio.to_thread(owner_top_groups_keyboard)
+        rows, keyboard = owner_top_groups_keyboard()
         if not rows:
             await query.edit_message_text("No group activity recorded yet.")
             return
@@ -2402,7 +2407,7 @@ Tap a button below to continue your adventure!
             await query.answer("🚫 Owner only.", show_alert=True)
             return
         page = int(query.data.split(":", 1)[1])
-        header, keyboard = await asyncio.to_thread(build_scrambleusers_list_page, page)
+        header, keyboard = build_scrambleusers_list_page(page)
         await query.answer()
         if header is None:
             await query.edit_message_text("No Word Scramble activity recorded yet.")
@@ -2665,7 +2670,7 @@ async def group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         winner = user
 
         if not await asyncio.to_thread(db.is_explaining_started, chat.id):
-            cheat_penalty = await asyncio.to_thread(get_reward, "cheat")
+            cheat_penalty = get_reward("cheat")
 
             try:
                 await message.delete()
@@ -2691,7 +2696,7 @@ async def group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await safe_react(context.bot, chat.id, message.message_id, "🎉")
 
-        win_reward = await asyncio.to_thread(get_reward, "win")
+        win_reward = get_reward("win")
         await asyncio.to_thread(db.award_coins, winner.id, chat.id, winner.first_name, win_reward)
         await asyncio.to_thread(db.award_coins, leader_id, chat.id, leader_name, win_reward)
 
@@ -2802,7 +2807,7 @@ async def autolead_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(
         "⚙️ <b>Auto-Lead</b>\n\n"
         "When you win a round, should you automatically become the next leader?",
-        reply_markup=await asyncio.to_thread(settings_keyboard, user.id),
+        reply_markup=settings_keyboard(user.id),
     )
 
 
@@ -2877,7 +2882,7 @@ async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     position_info = await asyncio.to_thread(db.get_chat_position, chat_id, user.id)
 
     await update.message.reply_html(
-        await asyncio.to_thread(format_board, rows, "Leaderboard - This Chat", position_info, user.first_name),
+        format_board(rows, "Leaderboard - This Chat", position_info, user.first_name),
         reply_markup=leaderboard_keyboard(),
         link_preview_options=LinkPreviewOptions(is_disabled=True),
     )
@@ -2894,7 +2899,7 @@ async def chat_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = await asyncio.to_thread(db.get_chat_leaderboard, update.effective_chat.id)
     position_info = await asyncio.to_thread(db.get_chat_position, update.effective_chat.id, user.id)
     await update.message.reply_html(
-        await asyncio.to_thread(format_board, rows, "Group Leaderboard", position_info, user.first_name),
+        format_board(rows, "Group Leaderboard", position_info, user.first_name),
         link_preview_options=LinkPreviewOptions(is_disabled=True),
     )
 
@@ -2904,7 +2909,7 @@ async def global_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = await asyncio.to_thread(db.get_global_leaderboard)
     position_info = await asyncio.to_thread(db.get_global_position, user.id)
     await update.message.reply_html(
-        await asyncio.to_thread(format_board, rows, "Global Leaderboard", position_info, user.first_name),
+        format_board(rows, "Global Leaderboard", position_info, user.first_name),
         link_preview_options=LinkPreviewOptions(is_disabled=True),
     )
 
@@ -2958,10 +2963,10 @@ async def pre_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
             raise ApplicationHandlerStop
 
-        await asyncio.to_thread(db.register_group, chat.id, chat.title or str(chat.id), chat.username)
+        await asyncio.to_thread(db.register_group, chat.id, chat.title or str(chat.id))
 
     maintenance_mode = await asyncio.to_thread(db.get_config, "maintenance_mode", "0")
-    if not await asyncio.to_thread(is_bot_admin_or_owner, user.id) and maintenance_mode == "1":
+    if not is_bot_admin_or_owner(user.id) and maintenance_mode == "1":
         is_command = bool(
             update.effective_message
             and update.effective_message.text
@@ -2987,116 +2992,12 @@ async def pre_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await asyncio.to_thread(db.add_user, user.id, user.first_name, user.username)
 
 
-def format_actor_plain(user):
-    """Plain-text identity of whoever performed a membership change - for DB storage."""
-    if user is None:
-        return None
-    if user.username:
-        return f"@{user.username}"
-    return user.full_name or str(user.id)
-
-
-def linked_actor_from_stored(name, user_id):
-    """Rebuilds a clickable identity from what was saved to the DB (a plain
-    '@username' or display name, plus the numeric id). Mirrors
-    format_actor_html's link choice: @username -> DM link, otherwise a
-    tg://user text-mention using the stored id."""
-    if not user_id and not name:
-        return "Unknown"
-    display = esc(name) if name else str(user_id)
-    if name and name.startswith("@"):
-        href = f"https://t.me/{name[1:]}"
-    elif user_id:
-        href = f"tg://user?id={user_id}"
-    else:
-        return display
-    id_suffix = f" (ID: <code>{user_id}</code>)" if user_id else ""
-    return f'<a href="{href}">{display}</a>{id_suffix}'
-
-
-def format_actor_html(user):
-    """Clickable identity of whoever performed a membership change - for the
-    owner notification. Uses a t.me/username DM link when the person has a
-    username; otherwise falls back to a tg://user text-mention, which
-    Telegram resolves to a working profile link for ANY user ID - no
-    username or prior bot interaction required, so this works even for
-    admins with private profiles."""
-    if user is None:
-        return "Unknown"
-    if user.username:
-        label = f"@{esc(user.username)}"
-        href = f"https://t.me/{user.username}"
-    else:
-        label = esc(user.full_name or "Unknown")
-        href = f"tg://user?id={user.id}"
-    return f'<a href="{href}">{label}</a> (ID: <code>{user.id}</code>)'
-
-
-def linked_group_name(title, link):
-    """Group name as clickable blue text pointing at the group, when we
-    have a link for it (public @username or a generated invite link).
-    Falls back to plain escaped text when no link is available."""
-    name = esc(title or "Untitled Group")
-    if link:
-        return f'<a href="{esc(link)}">{name}</a>'
-    return name
-
-
-async def get_group_invite_link(bot, chat_id, username=None):
-    """Best-effort group link. Public groups just use the @username link.
-    Private groups need the bot to have admin rights with invite
-    permission to generate one - if it doesn't (yet), this returns None
-    and the caller falls back to a friendly message instead of crashing."""
-    if username:
-        return f"https://t.me/{username}"
-    try:
-        link_obj = await bot.create_chat_invite_link(chat_id, creates_join_request=True)
-        return link_obj.invite_link
-    except Exception:
-        pass
-    try:
-        full_chat = await bot.get_chat(chat_id)
-        if getattr(full_chat, "invite_link", None):
-            return full_chat.invite_link
-    except Exception:
-        pass
-    return None
-
-
-async def notify_owner_group_event(bot, chat, actor, action, invite_link, group_username=None):
-    now_str = datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
-    username = group_username if group_username is not None else chat.username
-    username_display = f"@{esc(username)}" if username else "No public username"
-    link_display = esc(invite_link) if invite_link else "Not available (bot needs admin/invite rights in that group)"
-
-    if action == "added":
-        emoji, title, action_line, by_label = "🟢", "Added to a group", "It was added", "Added by"
-    else:
-        emoji, title, action_line, by_label = "🔴", "Removed from a group", "It was removed", "Removed by"
-
-    text = (
-        f"{emoji} <b>{title}</b>\n\n"
-        f"Group name : {linked_group_name(chat.title or str(chat.id), invite_link)}\n"
-        f"Group ID : <code>{chat.id}</code>\n"
-        f"Time and date : {now_str}\n"
-        f"Action : {action_line}\n"
-        f"{by_label} : {format_actor_html(actor)}\n"
-        f"Group username : {username_display}\n"
-        f"Group link : {link_display}"
-    )
-    try:
-        await bot.send_message(chat_id=OWNER_ID, text=text, parse_mode="HTML")
-    except Exception as e:
-        logger.error(f"Failed to notify owner of group {action} event: {e}")
-
-
 async def on_bot_membership_change(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = update.my_chat_member
     if result.new_chat_member.user.id != context.bot.id:
         return
 
     chat = update.effective_chat
-    actor = result.from_user
     old_status = result.old_chat_member.status
     new_status = result.new_chat_member.status
 
@@ -3107,35 +3008,25 @@ async def on_bot_membership_change(update: Update, context: ContextTypes.DEFAULT
             except (Forbidden, BadRequest):
                 pass
             return
+        await asyncio.to_thread(db.register_group, chat.id, chat.title or str(chat.id))
 
-        just_joined = old_status in ("left", "kicked")
-        invite_link = await get_group_invite_link(context.bot, chat.id, chat.username)
-
-        await asyncio.to_thread(
-            db.register_group, chat.id, chat.title or str(chat.id),
-            chat.username, invite_link,
-            actor.id if (just_joined and actor) else None,
-            format_actor_plain(actor) if just_joined else None,
-        )
-
-        if just_joined:
-            await notify_owner_group_event(context.bot, chat, actor, "added", invite_link)
+        if old_status in ("left", "kicked"):
+            try:
+                await context.bot.send_message(
+                    chat_id=OWNER_ID,
+                    text=(
+                        f"➕ <b>Added to a new group!</b>\n\n"
+                        f"Title: {esc(chat.title or str(chat.id))}\n"
+                        f"ID: <code>{chat.id}</code>"
+                    ),
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                logger.error(f"Failed to notify owner of group add: {e}")
         return
 
     if new_status in ("left", "kicked"):
-        stored = await asyncio.to_thread(db.get_group_full_details, chat.id)
-        stored_username = stored[7] if stored else None
-        stored_invite_link = stored[8] if stored else None
-
-        await asyncio.to_thread(
-            db.mark_group_left, chat.id,
-            actor.id if actor else None,
-            format_actor_plain(actor),
-        )
-        await notify_owner_group_event(
-            context.bot, chat, actor, "removed",
-            stored_invite_link, group_username=(stored_username or chat.username),
-        )
+        await asyncio.to_thread(db.mark_group_left, chat.id)
 
 
 def owner_top_groups_keyboard():
@@ -3156,7 +3047,7 @@ async def topgroups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
 
     if is_owner(user.id):
-        rows, keyboard = await asyncio.to_thread(owner_top_groups_keyboard)
+        rows, keyboard = owner_top_groups_keyboard()
         if not rows:
             await update.message.reply_text("No group activity recorded yet.")
             return
@@ -3176,9 +3067,8 @@ async def topgroups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for i, (title, games) in enumerate(rows, start=1):
         lines.append(f"{i}. {truncate_name(title or 'Untitled Group')} — {games:,} Games")
 
-    ad_footer = await asyncio.to_thread(ad_footer_html)
     await update.message.reply_html(
-        "\n".join(lines) + ad_footer,
+        "\n".join(lines) + ad_footer_html(),
         link_preview_options=LinkPreviewOptions(is_disabled=True),
     )
 
@@ -3762,7 +3652,7 @@ def build_botgroups_list_page(page: int):
 
 @owner_only
 async def botgroups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    header, keyboard = await asyncio.to_thread(build_botgroups_list_page, 0)
+    header, keyboard = build_botgroups_list_page(0)
     if header is None:
         await update.message.reply_text("No groups registered yet.")
         return
@@ -3793,7 +3683,7 @@ async def groups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_html("\n".join(lines))
         return
 
-    header, keyboard = await asyncio.to_thread(build_groups_list_page, 0)
+    header, keyboard = build_groups_list_page(0)
     if header is None:
         await update.message.reply_text("No groups registered yet.")
         return
@@ -3825,7 +3715,7 @@ async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_html("\n".join(lines))
         return
 
-    header, keyboard = await asyncio.to_thread(build_users_list_page, 0)
+    header, keyboard = build_users_list_page(0)
     if header is None:
         await update.message.reply_text("No users registered yet.")
         return
@@ -4064,7 +3954,7 @@ async def forceleader_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat_id = update.effective_chat.id
 
     cancel_explain_timeout(context, chat_id)
-    word = await asyncio.to_thread(random_word, chat_id)
+    word = random_word(chat_id)
     await asyncio.to_thread(db.set_leader, chat_id, target_id, target_name, word)
     await asyncio.to_thread(db.set_explaining_started, chat_id, False)
     await asyncio.to_thread(db.start_explain_log, chat_id, target_id)
@@ -4112,8 +4002,7 @@ async def topup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await asyncio.to_thread(db.award_global_coins, target_id, target_name, amount)
 
-    await asyncio.to_thread(
-        apply_chat_credit_for_global_earning,
+    apply_chat_credit_for_global_earning(
         target_id, target_name, amount, current_chat=update.effective_chat
     )
 
