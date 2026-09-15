@@ -1940,6 +1940,58 @@ def scramble_adjust_global_earned(user_id, name, amount):
         conn.close()
 
 
+def get_group_by_username(username):
+    """Resolve a stored group by its @username. Returns (chat_id, title) or None."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT chat_id, title FROM groups WHERE LOWER(username) = LOWER(%s)",
+            (str(username).lstrip("@"),),
+        )
+        return cursor.fetchone()
+    finally:
+        conn.close()
+
+
+def scramble_adjust_chat_earned(user_id, chat_id, name, amount):
+    """Adjust a player's Word Scramble balance inside ONE specific group
+    (scramble_chat_stats) AND their global balance (scramble_global_stats) -
+    exactly as if they had earned/lost that amount playing in that group.
+
+    Returns (new_chat_balance, new_global_balance).
+    Balances are floored at 0, same as scramble_adjust_global_earned()."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            INSERT INTO scramble_chat_stats
+                (user_id, chat_id, name, wins, earned, current_streak, best_streak)
+            VALUES (%s, %s, %s, 0, GREATEST(0, %s), 0, 0)
+            ON CONFLICT (user_id, chat_id) DO UPDATE SET
+                earned = GREATEST(0, scramble_chat_stats.earned + %s),
+                name = EXCLUDED.name
+            RETURNING earned
+        """, (user_id, chat_id, name, amount, amount))
+        new_chat_balance = cursor.fetchone()[0]
+
+        cursor.execute("""
+            INSERT INTO scramble_global_stats (user_id, name, wins, earned)
+            VALUES (%s, %s, 0, GREATEST(0, %s))
+            ON CONFLICT (user_id) DO UPDATE SET
+                earned = GREATEST(0, scramble_global_stats.earned + %s),
+                name = EXCLUDED.name
+            RETURNING earned
+        """, (user_id, name, amount, amount))
+        new_global_balance = cursor.fetchone()[0]
+
+        conn.commit()
+        return new_chat_balance, new_global_balance
+    finally:
+        conn.close()
+
+
 def set_scramble_slowmode(chat_id, interval_seconds, enabled: bool):
     conn = connect()
     try:

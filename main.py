@@ -789,7 +789,10 @@ async def wordscramble_command(update: Update, context: ContextTypes.DEFAULT_TYP
     chat = update.effective_chat
 
     if chat.type == ChatType.PRIVATE:
-        await update.message.reply_html(SCRAMBLE_GROUPS_ONLY_TEXT)
+        await update.message.reply_html(
+            SCRAMBLE_GROUPS_ONLY_TEXT,
+            reply_markup=add_to_group_keyboard(context),
+        )
         return
 
     user = update.effective_user
@@ -1435,6 +1438,78 @@ async def scrambletopup_command(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 
+@owner_only
+async def scrambletopupspecific_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 3:
+        await update.message.reply_html(
+            "Usage:\n"
+            "<code>/scrambletopupspecific &lt;@username or ID&gt; &lt;+amount|-amount&gt; "
+            "&lt;group ID or @groupusername&gt;</code>\n\n"
+            "e.g.\n"
+            "<code>/scrambletopupspecific @kinggabby7 +500 -1001234567890</code>\n"
+            "<code>/scrambletopupspecific 123456789 -50 @myuffgroup</code>\n\n"
+            "The amount is credited as if the player earned it in that group, so it shows up "
+            "under <b>In this chat</b> there — and in <b>Global</b> too."
+        )
+        return
+
+    target_arg = context.args[0].lstrip("@")
+    amount_arg = context.args[1]
+    group_arg = context.args[2]
+
+    if not re.fullmatch(r"[+-]?\d+", amount_arg):
+        await update.message.reply_text("❌ Amount must look like +500 or -500.")
+        return
+
+    amount = int(amount_arg)
+
+    if target_arg.isdigit():
+        row = await asyncio.to_thread(db.get_user_by_id, int(target_arg))
+    else:
+        row = await asyncio.to_thread(db.get_user_by_username, target_arg)
+
+    if not row:
+        await update.message.reply_text(f"❌ No player found matching {context.args[0]}.")
+        return
+
+    target_id, target_name, target_username, _ = row
+
+    group_chat_id = None
+    group_title = None
+
+    if re.fullmatch(r"-?\d+", group_arg):
+        g = await asyncio.to_thread(db.get_group_details, int(group_arg))
+        if g:
+            group_chat_id, group_title = g[0], g[1]
+    else:
+        g = await asyncio.to_thread(db.get_group_by_username, group_arg)
+        if g:
+            group_chat_id, group_title = g[0], g[1]
+
+    if group_chat_id is None:
+        await update.message.reply_html(
+            f"❌ No group found matching <code>{esc(group_arg)}</code>.\n\n"
+            "Use the numeric group ID (tap a group in /botgroups to see it) "
+            "or the group's @username."
+        )
+        return
+
+    new_chat_balance, new_global_balance = await asyncio.to_thread(
+        db.scramble_adjust_chat_earned, target_id, group_chat_id, target_name, amount
+    )
+
+    action = "Added" if amount >= 0 else "Deducted"
+    display = f"@{target_username}" if target_username else esc(target_name)
+
+    await update.message.reply_html(
+        f"✅ {action} {abs(amount)} to {display}'s Word Scramble balance "
+        f"in <b>{esc(group_title or 'Untitled Group')}</b>.\n\n"
+        f"🆔 Group ID: <code>{group_chat_id}</code>\n"
+        f"📍 In-that-chat balance: {DOLLAR}{new_chat_balance}\n"
+        f"🌍 Global balance: {DOLLAR}{new_global_balance}"
+    )
+
+
 async def scrambleautomaticmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == ChatType.PRIVATE:
         await update.message.reply_text("🤖 Run /scrambleautomaticmode inside the group you want to control.")
@@ -1686,6 +1761,130 @@ async def explain_timeout_callback(context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# --- Feature 1: "Add to a Group" button -------------------------------------
+
+def _bot_username(context) -> str:
+    """Live bot username from Telegram, falling back to the BOT_USERNAME env var."""
+    try:
+        uname = context.bot.username
+    except Exception:
+        uname = None
+    return uname or BOT_USERNAME
+
+
+def add_to_group_keyboard(context):
+    """Inline keyboard with a single [Add to a Group] button. Tapping it opens
+    Telegram's group picker. Returns None if the bot username is unknown, in
+    which case the message simply sends without a button (never crashes)."""
+    uname = _bot_username(context)
+    if not uname:
+        return None
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "➕ Add to a Group",
+            url=f"https://t.me/{uname}?startgroup=true",
+        )
+    ]])
+
+
+# --- Feature 3: group-join prompt message -----------------------------------
+
+DEFAULT_GROUP_JOIN_PROMPT = (
+    "Play word game 🎮, Word scramble 🔤, Earn rewards 💵, "
+    "Claim daily rewards 🎁 — all in one bot 🤖\n\n"
+    "Add me as an admin to enjoy all features."
+)
+
+
+def get_group_join_prompt() -> str:
+    text = db.get_config("group_join_prompt_text", None)
+    return text if text else DEFAULT_GROUP_JOIN_PROMPT
+
+
+def group_join_prompt_enabled() -> bool:
+    return db.get_config("group_join_prompt_enabled", "1") == "1"
+
+
+# --- Feature 2: group add/remove owner alerts -------------------------------
+
+def _format_event_time(dt=None) -> str:
+    return (dt or datetime.now()).strftime("%d %b %Y, %I:%M %p")
+
+
+def _format_stored_time(value) -> str:
+    if not value:
+        return "Unknown"
+    return str(value)[:19].replace("T", " ")
+
+
+def _format_actor(actor) -> str:
+    """'@username (12345)' / 'Name (12345)' / 'Unknown' for a Telegram User."""
+    if not actor:
+        return "Unknown"
+    label = f"@{actor.username}" if actor.username else esc(actor.first_name or "Unknown")
+    return f"{label} (<code>{actor.id}</code>)"
+
+
+def _format_stored_actor(uid, name) -> str:
+    """Same, but from the values stored in the groups table."""
+    if not uid and not name:
+        return "Unknown"
+    label = esc(name) if name else "Unknown"
+    return f"{label} (<code>{uid}</code>)" if uid else label
+
+
+async def _resolve_group_link(context, chat):
+    """Best-effort public/invite link for a group. Never raises."""
+    if getattr(chat, "username", None):
+        return f"https://t.me/{chat.username}"
+    try:
+        link_obj = await context.bot.create_chat_invite_link(chat.id)
+        return link_obj.invite_link
+    except Exception:
+        pass
+    try:
+        full = await context.bot.get_chat(chat.id)
+        return getattr(full, "invite_link", None)
+    except Exception:
+        return None
+
+
+async def _notify_owner_group_event(context, kind, chat, actor, group_link):
+    """kind is 'added' or 'removed'. Never raises - failures are logged only."""
+    if kind == "added":
+        header = "🟢 <b>Added to a group</b>"
+        actor_label = "Added by"
+    else:
+        header = "🔴 <b>Removed from a group</b>"
+        actor_label = "Removed by"
+
+    chat_username = getattr(chat, "username", None)
+    username_display = f"@{chat_username}" if chat_username else "None (private group)"
+    link_display = (
+        f'<a href="{group_link}">{esc(group_link)}</a>' if group_link else "Not available"
+    )
+
+    text = (
+        f"{header}\n\n"
+        f"Group name: {esc(chat.title or 'Untitled Group')}\n\n"
+        f"Group ID: <code>{chat.id}</code>\n\n"
+        f"Time and date: {_format_event_time()}\n\n"
+        f"{actor_label}: {_format_actor(actor)}\n\n"
+        f"Group username: {username_display}\n\n"
+        f"Group link: {link_display}"
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=OWNER_ID,
+            text=text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.error(f"Failed to notify owner of group {kind}: {e}")
+
+
 def main_menu():
     return InlineKeyboardMarkup([
         [
@@ -1831,7 +2030,8 @@ async def is_chat_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> b
 async def word_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == ChatType.PRIVATE:
         await update.message.reply_text(
-            "🎮 Add me to a group and run /wordgame there!"
+            "🎮 Add me to a group and run /wordgame there!",
+            reply_markup=add_to_group_keyboard(context),
         )
         return
 
@@ -2221,12 +2421,14 @@ Tap a button below to continue your adventure!
             await query.answer("❌ Group data not found.", show_alert=True)
             return
 
-        g_chat_id, title, member_count, wg_played, first_seen, left_at, scr_played = details
+        (g_chat_id, title, member_count, wg_played, first_seen, left_at, scr_played,
+         g_username, g_stored_link, added_by_id, added_by_name,
+         removed_by_id, removed_by_name) = details
         members_display = member_count if member_count else "Unknown"
         status_display = "🟢 Currently in group" if not left_at else f"🔴 Removed ({left_at[:16]})"
 
-        invite_link = None
-        if not left_at:
+        invite_link = f"https://t.me/{g_username}" if g_username else g_stored_link
+        if not invite_link and not left_at:
             try:
                 link_obj = await context.bot.create_chat_invite_link(g_chat_id)
                 invite_link = link_obj.invite_link
@@ -2245,6 +2447,16 @@ Tap a button below to continue your adventure!
 🎮 Word Game — Games Played: <b>{wg_played}</b>
 🔤 Word Scramble — Rounds Played: <b>{scr_played}</b>
 """
+        text += "\n━━━━━━━━━━━━━━━\n"
+        text += f"📛 Group name: {esc(title or 'Untitled Group')}\n"
+        text += f"🆔 Group ID: <code>{g_chat_id}</code>\n"
+        text += f"🕒 Time and date: {_format_stored_time(first_seen)}\n"
+        text += f"➕ Added by: {_format_stored_actor(added_by_id, added_by_name)}\n"
+        if left_at:
+            text += f"➖ Removed by: {_format_stored_actor(removed_by_id, removed_by_name)}\n"
+        text += f"🔗 Group username: {'@' + g_username if g_username else 'None (private group)'}\n"
+        text += f"🌐 Group link: {esc(invite_link) if invite_link else 'Not available'}\n"
+
         if not invite_link:
             text += "\n<i>No invite link available - tap the Group ID above to copy it.</i>\n"
 
@@ -2362,22 +2574,25 @@ Tap a button below to continue your adventure!
         backscope = parts[2] if len(parts) > 2 else "top"
         backpage = int(parts[3]) if len(parts) > 3 else 0
 
-        details = await asyncio.to_thread(db.get_group_details, target_chat_id)
+        details = await asyncio.to_thread(db.get_group_full_details, target_chat_id)
 
         if not details:
             await query.answer("❌ Group data not found.", show_alert=True)
             return
 
-        g_chat_id, title, member_count, games_played, first_seen = details
+        (g_chat_id, title, member_count, games_played, first_seen, left_at, _scr_played,
+         g_username, g_stored_link, added_by_id, added_by_name,
+         removed_by_id, removed_by_name) = details
         members_display = member_count if member_count else "Unknown"
         joined_display = first_seen or "Unknown"
 
-        invite_link = None
-        try:
-            link_obj = await context.bot.create_chat_invite_link(g_chat_id)
-            invite_link = link_obj.invite_link
-        except Exception:
-            invite_link = None
+        invite_link = f"https://t.me/{g_username}" if g_username else g_stored_link
+        if not invite_link and not left_at:
+            try:
+                link_obj = await context.bot.create_chat_invite_link(g_chat_id)
+                invite_link = link_obj.invite_link
+            except Exception:
+                invite_link = None
 
         text = f"""
 👨‍👩‍👧‍👦 <b>Group Details</b>
@@ -2388,6 +2603,16 @@ Tap a button below to continue your adventure!
 🎮 Total Games Played: {games_played}
 📅 Bot Joined: {joined_display}
 """
+        text += "\n━━━━━━━━━━━━━━━\n"
+        text += f"📛 Group name: {esc(title or 'Untitled Group')}\n"
+        text += f"🆔 Group ID: <code>{g_chat_id}</code>\n"
+        text += f"🕒 Time and date: {_format_stored_time(first_seen)}\n"
+        text += f"➕ Added by: {_format_stored_actor(added_by_id, added_by_name)}\n"
+        if left_at:
+            text += f"➖ Removed by: {_format_stored_actor(removed_by_id, removed_by_name)}\n"
+        text += f"🔗 Group username: {'@' + g_username if g_username else 'None (private group)'}\n"
+        text += f"🌐 Group link: {esc(invite_link) if invite_link else 'Not available'}\n"
+
         if not invite_link:
             text += "\n<i>No invite link available - tap the Group ID above to copy it.</i>\n"
 
@@ -2963,7 +3188,12 @@ async def pre_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
             raise ApplicationHandlerStop
 
-        await asyncio.to_thread(db.register_group, chat.id, chat.title or str(chat.id))
+        await asyncio.to_thread(
+            db.register_group,
+            chat.id,
+            chat.title or str(chat.id),
+            getattr(chat, "username", None),
+        )
 
     maintenance_mode = await asyncio.to_thread(db.get_config, "maintenance_mode", "0")
     if not is_bot_admin_or_owner(user.id) and maintenance_mode == "1":
@@ -3000,6 +3230,7 @@ async def on_bot_membership_change(update: Update, context: ContextTypes.DEFAULT
     chat = update.effective_chat
     old_status = result.old_chat_member.status
     new_status = result.new_chat_member.status
+    actor = result.from_user
 
     if new_status in ("member", "administrator"):
         if await asyncio.to_thread(db.is_group_banned, chat.id):
@@ -3008,25 +3239,60 @@ async def on_bot_membership_change(update: Update, context: ContextTypes.DEFAULT
             except (Forbidden, BadRequest):
                 pass
             return
-        await asyncio.to_thread(db.register_group, chat.id, chat.title or str(chat.id))
 
-        if old_status in ("left", "kicked"):
-            try:
-                await context.bot.send_message(
-                    chat_id=OWNER_ID,
-                    text=(
-                        f"➕ <b>Added to a new group!</b>\n\n"
-                        f"Title: {esc(chat.title or str(chat.id))}\n"
-                        f"ID: <code>{chat.id}</code>"
-                    ),
-                    parse_mode="HTML",
-                )
-            except Exception as e:
-                logger.error(f"Failed to notify owner of group add: {e}")
+        is_fresh_add = old_status in ("left", "kicked")
+
+        group_link = await _resolve_group_link(context, chat)
+
+        await asyncio.to_thread(
+            db.register_group,
+            chat.id,
+            chat.title or str(chat.id),
+            getattr(chat, "username", None),
+            group_link,
+            actor.id if actor else None,
+            (actor.first_name if actor else None),
+        )
+
+        if is_fresh_add:
+            # Feature 3: the configurable welcome/prompt message
+            if group_join_prompt_enabled():
+                try:
+                    await context.bot.send_message(
+                        chat_id=chat.id,
+                        text=get_group_join_prompt(),
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to send group join prompt: {e}")
+
+            await _notify_owner_group_event(context, "added", chat, actor, group_link)
         return
 
     if new_status in ("left", "kicked"):
-        await asyncio.to_thread(db.mark_group_left, chat.id)
+        was_in_group = old_status in ("member", "administrator", "restricted")
+
+        # Read the stored link BEFORE marking left - we can't create an invite
+        # link for a group we're no longer in.
+        stored_link = None
+        try:
+            details = await asyncio.to_thread(db.get_group_full_details, chat.id)
+            if details:
+                stored_link = details[8]
+        except Exception:
+            stored_link = None
+
+        if not stored_link and getattr(chat, "username", None):
+            stored_link = f"https://t.me/{chat.username}"
+
+        await asyncio.to_thread(
+            db.mark_group_left,
+            chat.id,
+            actor.id if actor else None,
+            (actor.first_name if actor else None),
+        )
+
+        if was_in_group:
+            await _notify_owner_group_event(context, "removed", chat, actor, stored_link)
 
 
 def owner_top_groups_keyboard():
@@ -3504,6 +3770,65 @@ async def changesponsoredad_command(update: Update, context: ContextTypes.DEFAUL
 
     await asyncio.to_thread(db.set_config, "sponsored_ad_override", value)
     await update.message.reply_text(f"✅ Sponsored Ad updated to: {value}")
+
+
+@owner_only
+async def prompt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    current = get_group_join_prompt()
+
+    if not context.args:
+        state = "🟢 ON" if group_join_prompt_enabled() else "🔴 OFF"
+        await update.message.reply_html(
+            f"⚙️ <b>Group Join Prompt</b>\n\n"
+            f"Status: <b>{state}</b>\n\n"
+            f"Current message:\n<i>{esc(current)}</i>\n\n"
+            f"Usage:\n"
+            f"<code>/prompt on</code> — send it whenever the bot is added to a group\n"
+            f"<code>/prompt off</code> — stop sending it\n"
+            f"<code>/editprompt (new prompt)</code> — change the message"
+        )
+        return
+
+    arg = context.args[0].lower()
+
+    if arg == "on":
+        await asyncio.to_thread(db.set_config, "group_join_prompt_enabled", "1")
+        await update.message.reply_html(
+            f"🟢 Group join prompt is now <b>ON</b>.\n\n"
+            f"It will be sent every time the bot is added to a group:\n\n<i>{esc(current)}</i>"
+        )
+    elif arg == "off":
+        await asyncio.to_thread(db.set_config, "group_join_prompt_enabled", "0")
+        await update.message.reply_html(
+            "🔴 Group join prompt is now <b>OFF</b>.\n\n"
+            "The bot will stay silent when it's added to a group."
+        )
+    else:
+        await update.message.reply_text("Usage: /prompt on  |  /prompt off")
+
+
+@owner_only
+async def editprompt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text or ""
+    parts = raw.split(None, 1)
+
+    if len(parts) < 2 or not parts[1].strip():
+        await update.message.reply_html(
+            "Usage: <code>/editprompt (new prompt message)</code>\n\n"
+            f"Current message:\n<i>{esc(get_group_join_prompt())}</i>"
+        )
+        return
+
+    new_text = parts[1].strip()
+    await asyncio.to_thread(db.set_config, "group_join_prompt_text", new_text)
+
+    state_note = (
+        "" if group_join_prompt_enabled()
+        else "\n\n⚠️ Note: the prompt is currently <b>OFF</b> — run <code>/prompt on</code> to start sending it."
+    )
+    await update.message.reply_html(
+        f"✅ Group join prompt updated.\n\nNew message:\n<i>{esc(new_text)}</i>{state_note}"
+    )
 
 
 @owner_only
@@ -4340,6 +4665,7 @@ def main():
     app.add_handler(CommandHandler("slowmode", slowmode_command))
     app.add_handler(CommandHandler("scramblemode", scramblemode_command))
     app.add_handler(CommandHandler("scrambletopup", scrambletopup_command))
+    app.add_handler(CommandHandler("scrambletopupspecific", scrambletopupspecific_command))
     app.add_handler(CommandHandler("scrambleautomaticmode", scrambleautomaticmode_command))
     app.add_handler(CommandHandler("scrambleusers", scrambleusers_command))
     app.add_handler(CommandHandler("hint", hint_command))
@@ -4354,7 +4680,10 @@ def main():
     # --- Owner admin panel -------------------------------------------
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("botgroups", botgroups_command))
+    app.add_handler(CommandHandler("botsgroups", botgroups_command))
     app.add_handler(CommandHandler("groups", groups_command))
+    app.add_handler(CommandHandler("prompt", prompt_command))
+    app.add_handler(CommandHandler("editprompt", editprompt_command))
     app.add_handler(CommandHandler("users", users_command))
     app.add_handler(CommandHandler("banuser", banuser_command))
     app.add_handler(CommandHandler("unbanuser", unbanuser_command))
