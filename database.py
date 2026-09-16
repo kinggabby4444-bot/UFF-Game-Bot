@@ -192,6 +192,7 @@ def create_tables():
         cursor.execute("ALTER TABLE groups ADD COLUMN IF NOT EXISTS added_by_name TEXT")
         cursor.execute("ALTER TABLE groups ADD COLUMN IF NOT EXISTS removed_by_id BIGINT")
         cursor.execute("ALTER TABLE groups ADD COLUMN IF NOT EXISTS removed_by_name TEXT")
+        cursor.execute("ALTER TABLE groups ADD COLUMN IF NOT EXISTS admin_mode_override TEXT")
 
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS banned_users (
@@ -2126,6 +2127,47 @@ def get_combined_global_position(user_id):
         if row[0] == user_id:
             return index, row[1], row[2]
     return None
+
+
+def get_group_admin_mode_override(chat_id):
+    """Returns 'on', 'off', or None (meaning: follow the global default)."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT admin_mode_override FROM groups WHERE chat_id=%s", (chat_id,))
+        row = cursor.fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def set_group_admin_mode_override(chat_id, value):
+    """value must be 'on' or 'off'."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE groups SET admin_mode_override=%s WHERE chat_id=%s", (value, chat_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_effective_admin_mode(chat_id) -> bool:
+    """True if the bot should require admin rights to start a game in this
+    chat - the group's own override if it has one, else the global default."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT admin_mode_override FROM groups WHERE chat_id=%s", (chat_id,))
+        row = cursor.fetchone()
+        override = row[0] if row else None
+        if override in ("on", "off"):
+            return override == "on"
+        cursor.execute("SELECT value FROM bot_config WHERE key=%s", ("require_bot_admin_global",))
+        cfg_row = cursor.fetchone()
+        return bool(cfg_row) and cfg_row[0] == "1"
+    finally:
+        conn.close()
 
 
 def get_current_groups():

@@ -795,6 +795,15 @@ async def wordscramble_command(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
+    if await asyncio.to_thread(db.get_effective_admin_mode, chat.id):
+        if not await _bot_is_admin_in_chat(context, chat.id):
+            await update.message.reply_text(
+                "🙏 To start a round here, I'll need to be a group admin - that way I "
+                "can manage rounds and announce winners properly. Please make me an admin, "
+                "then just run this command again!"
+            )
+            return
+
     user = update.effective_user
     await asyncio.to_thread(db.scramble_increment_played, user.id, chat.id, user.first_name)
 
@@ -2017,6 +2026,80 @@ async def claimdailyreward_command(update: Update, context: ContextTypes.DEFAULT
     await update.message.reply_html(format_daily_reward_text(result))
 
 
+# --- Feature: bot-admin requirement toggle -----------------------------------
+
+DEFAULT_ADMIN_MODE_PROMPT_TEXT = (
+    "🎮 NEW UPDATE! 🚀\n\n"
+    "We've added a new feature to make gameplay ⚡ faster and smoother, record scores "
+    "🏆 instantly, and automatically delete ONLY the bot's messages 🧹 to keep "
+    "the group neat and organized.\n\n"
+    "👨‍💼 Make the bot an admin to unlock and enjoy all game features! 🔤🎮"
+)
+
+
+def get_admin_mode_default_text() -> str:
+    text = db.get_config("adminmode_default_text", None)
+    return text if text else DEFAULT_ADMIN_MODE_PROMPT_TEXT
+
+
+async def _bot_is_admin_in_chat(context, chat_id) -> bool:
+    try:
+        member = await context.bot.get_chat_member(chat_id, context.bot.id)
+        return member.status in ("administrator", "creator")
+    except Exception:
+        return False
+
+
+def admin_prompt_keyboard(context):
+    uname = _bot_username(context)
+    if not uname:
+        return None
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("👨‍💼 Add as an Admin", url=f"https://t.me/{uname}")
+    ]])
+
+
+async def _broadcast_admin_prompt(context, chat_ids, text) -> int:
+    kb = admin_prompt_keyboard(context)
+    sent = 0
+    for cid in chat_ids:
+        try:
+            await context.bot.send_message(chat_id=cid, text=text, reply_markup=kb)
+            sent += 1
+        except Exception as e:
+            logger.error(f"Failed to send admin-mode prompt to {cid}: {e}")
+        await asyncio.sleep(0.05)
+    return sent
+
+
+def admin_mode_confirm_keyboard(scope, value, target=""):
+    suffix = f":{target}" if target else ""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Send without added text", callback_data=f"amc:{scope}:{value}:none{suffix}")],
+        [InlineKeyboardButton("Add a text to show", callback_data=f"amc:{scope}:{value}:addtext{suffix}")],
+        [InlineKeyboardButton("Send default text", callback_data=f"amc:{scope}:{value}:default{suffix}")],
+        [InlineKeyboardButton("Change default text", callback_data=f"amc:{scope}:{value}:changedefault{suffix}")],
+    ])
+
+
+async def resolve_group_arg(arg: str):
+    """Resolve a group the bot is CURRENTLY in, by numeric chat ID or @username.
+    Returns (chat_id, title) or None."""
+    arg = (arg or "").strip()
+    if not arg:
+        return None
+    if re.fullmatch(r"-?\d+", arg):
+        details = await asyncio.to_thread(db.get_group_full_details, int(arg))
+    else:
+        g = await asyncio.to_thread(db.get_group_by_username, arg.lstrip("@"))
+        if not g:
+            return None
+        details = await asyncio.to_thread(db.get_group_full_details, g[0])
+    if not details or details[5] is not None:  # details[5] is left_at
+        return None
+    return details[0], details[1]
+
+
 async def is_chat_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     chat = update.effective_chat
     user = update.effective_user
@@ -2036,6 +2119,15 @@ async def word_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = update.effective_chat.id
+
+    if await asyncio.to_thread(db.get_effective_admin_mode, chat_id):
+        if not await _bot_is_admin_in_chat(context, chat_id):
+            await update.message.reply_text(
+                "🙏 To start a game here, I'll need to be a group admin - that way I "
+                "can manage rounds and announce winners properly. Please make me an admin, "
+                "then just run this command again!"
+            )
+            return
 
     existing = await asyncio.to_thread(db.get_game, chat_id)
     if existing and existing[1] is not None:
@@ -2098,6 +2190,88 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = query.message.chat
 
     if query.data == "noop":
+        await query.answer()
+        return
+
+    if query.data.startswith("amc:"):
+        if not is_bot_admin_or_owner(user.id):
+            await query.answer("🚫 Owner or bot admins only.", show_alert=True)
+            return
+
+        parts = query.data.split(":")
+        scope = parts[1]
+        value = parts[2]
+        action = parts[3]
+        target = parts[4] if len(parts) > 4 else None
+
+        if action == "none":
+            await query.answer()
+            if scope == "adminmode":
+                await asyncio.to_thread(db.set_config, "require_bot_admin_global", "1")
+                await query.edit_message_text(
+                    "🟢 Global Admin Mode is now ON. No message was sent to groups."
+                )
+            else:
+                await asyncio.to_thread(db.set_group_admin_mode_override, int(target), "on")
+                await query.edit_message_text(
+                    "🟢 Admin Mode override is now ON for that group. No message was sent."
+                )
+            return
+
+        if action == "default":
+            await query.answer()
+            text = get_admin_mode_default_text()
+            if scope == "adminmode":
+                await asyncio.to_thread(db.set_config, "require_bot_admin_global", "1")
+                groups = await asyncio.to_thread(db.get_current_groups)
+                sent = await _broadcast_admin_prompt(context, [g[0] for g in groups], text)
+                await query.edit_message_text(
+                    f"🟢 Global Admin Mode is now ON. Default message sent to {sent} group(s)."
+                )
+            else:
+                await asyncio.to_thread(db.set_group_admin_mode_override, int(target), "on")
+                await _broadcast_admin_prompt(context, [int(target)], text)
+                await query.edit_message_text(
+                    "🟢 Admin Mode override is now ON for that group. Default message sent."
+                )
+            return
+
+        if action == "addtext":
+            pending_action = f"amode_text:{scope}:{value}" + (f":{target}" if target else "")
+            await asyncio.to_thread(db.set_pending_input, user.id, 0, pending_action)
+            prompt = (
+                "✍️ Send me the message you'd like shown "
+                "(I'll automatically add an 'Add as an Admin' button below it)."
+            )
+            try:
+                await context.bot.send_message(chat_id=user.id, text=prompt)
+                if chat.type == ChatType.PRIVATE:
+                    await query.answer()
+                    await query.edit_message_text(prompt)
+                else:
+                    await query.answer("📩 Check your DM with me.", show_alert=True)
+            except Forbidden:
+                await query.answer(
+                    "⚠️ Please start a DM with me first, then try again.", show_alert=True
+                )
+            return
+
+        if action == "changedefault":
+            await asyncio.to_thread(db.set_pending_input, user.id, 0, "amode_default")
+            prompt = "✍️ Send me the new default message."
+            try:
+                await context.bot.send_message(chat_id=user.id, text=prompt)
+                if chat.type == ChatType.PRIVATE:
+                    await query.answer()
+                    await query.edit_message_text(prompt)
+                else:
+                    await query.answer("📩 Check your DM with me.", show_alert=True)
+            except Forbidden:
+                await query.answer(
+                    "⚠️ Please start a DM with me first, then try again.", show_alert=True
+                )
+            return
+
         await query.answer()
         return
 
@@ -2818,6 +2992,40 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except (Forbidden, BadRequest):
             pass
+        return
+
+    if action.startswith("amode_text:"):
+        parts = action.split(":")
+        scope = parts[1]
+        target = parts[3] if len(parts) > 3 else None
+        custom_text = update.message.text.strip()
+        await asyncio.to_thread(db.clear_pending_input, user.id)
+
+        if scope == "adminmode":
+            await asyncio.to_thread(db.set_config, "require_bot_admin_global", "1")
+            groups = await asyncio.to_thread(db.get_current_groups)
+            sent = await _broadcast_admin_prompt(context, [g[0] for g in groups], custom_text)
+            await update.message.reply_text(
+                f"🟢 Global Admin Mode is now ON. Message sent to {sent} group(s)."
+            )
+        else:
+            target_id = int(target)
+            await asyncio.to_thread(db.set_group_admin_mode_override, target_id, "on")
+            await _broadcast_admin_prompt(context, [target_id], custom_text)
+            await update.message.reply_text(
+                "🟢 Admin Mode override is now ON for that group. Message sent."
+            )
+        return
+
+    if action == "amode_default":
+        new_default = update.message.text.strip()
+        await asyncio.to_thread(db.set_config, "adminmode_default_text", new_default)
+        await asyncio.to_thread(db.clear_pending_input, user.id)
+        await update.message.reply_html(
+            "✅ Default message updated.\n\nRun <code>/adminmode on</code> or "
+            "<code>/groupadminmode on &lt;group&gt;</code> again to apply it."
+        )
+        return
 
 
 async def group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4169,6 +4377,73 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @owner_or_admin_only
+async def adminmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or context.args[0].lower() not in ("on", "off"):
+        current = await asyncio.to_thread(db.get_config, "require_bot_admin_global", "0")
+        state = "🟢 ON" if current == "1" else "🔴 OFF"
+        await update.message.reply_html(
+            f"⚙️ <b>Global Admin Mode</b>\n\n"
+            f"Status: <b>{state}</b>\n\n"
+            f"When ON, the bot requires admin rights before a game can start in any group "
+            f"that doesn't have its own override set via /groupadminmode.\n\n"
+            f"Usage:\n<code>/adminmode on</code>\n<code>/adminmode off</code>"
+        )
+        return
+
+    value = context.args[0].lower()
+
+    if value == "off":
+        await asyncio.to_thread(db.set_config, "require_bot_admin_global", "0")
+        await update.message.reply_text("🔴 Global Admin Mode is now OFF.")
+        return
+
+    await update.message.reply_html(
+        "⚙️ Before turning <b>Admin Mode ON</b> globally, how should I notify groups "
+        "that don't already have their own admin-mode override?",
+        reply_markup=admin_mode_confirm_keyboard("adminmode", "on"),
+    )
+
+
+@owner_or_admin_only
+async def groupadminmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2 or context.args[0].lower() not in ("on", "off"):
+        await update.message.reply_html(
+            "Usage:\n"
+            "<code>/groupadminmode on &lt;group ID or @username&gt;</code>\n"
+            "<code>/groupadminmode off &lt;group ID or @username&gt;</code>\n\n"
+            "Only works for groups I'm currently in. If a group has no override set, it "
+            "follows the global /adminmode setting."
+        )
+        return
+
+    value = context.args[0].lower()
+    group_arg = context.args[1]
+
+    resolved = await resolve_group_arg(group_arg)
+    if not resolved:
+        await update.message.reply_html(
+            f"❌ No group found matching <code>{esc(group_arg)}</code> that I'm currently in."
+        )
+        return
+
+    target_chat_id, target_title = resolved
+
+    if value == "off":
+        await asyncio.to_thread(db.set_group_admin_mode_override, target_chat_id, "off")
+        await update.message.reply_html(
+            f"🔴 Admin Mode override for <b>{esc(target_title)}</b> is now OFF "
+            f"(it no longer requires me to be admin there)."
+        )
+        return
+
+    await update.message.reply_html(
+        f"⚙️ Before turning <b>Admin Mode ON</b> for <b>{esc(target_title)}</b>, "
+        f"how should I notify that group?",
+        reply_markup=admin_mode_confirm_keyboard("groupadminmode", "on", str(target_chat_id)),
+    )
+
+
+@owner_or_admin_only
 async def maintenance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args or context.args[0].lower() not in ("on", "off"):
         await update.message.reply_text("Usage: /maintenance on|off")
@@ -4691,6 +4966,8 @@ def main():
     app.add_handler(CommandHandler("unbangroup", unbangroup_command))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(CommandHandler("maintenance", maintenance_command))
+    app.add_handler(CommandHandler("adminmode", adminmode_command))
+    app.add_handler(CommandHandler("groupadminmode", groupadminmode_command))
     app.add_handler(CommandHandler("setreward", setreward_command))
     app.add_handler(CommandHandler("reloadwords", reloadwords_command))
     app.add_handler(CommandHandler("addwords", addwords_command))
