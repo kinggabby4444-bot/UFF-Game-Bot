@@ -777,6 +777,30 @@ def clear_leader(chat_id):
         conn.close()
 
 
+def claim_word_game_round(chat_id, leader_id, secret_word):
+    """Atomically claims a Word Game round's win. Only clears the round (and
+    returns True) if it still has exactly this leader_id/secret_word - i.e.
+    nobody else has already claimed it. If two players guess the correct
+    word at nearly the same instant, only the first UPDATE to actually reach
+    Postgres matches this WHERE clause; by the time the second one runs,
+    leader_id is already NULL so it matches zero rows and returns False.
+    Callers should back off silently on False - someone else already won."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE word_games
+            SET leader_id=NULL, leader_name=NULL, secret_word=NULL, explaining_started=0, leader_message_id=NULL
+            WHERE chat_id=%s AND leader_id=%s AND secret_word=%s
+            RETURNING chat_id
+        """, (chat_id, leader_id, secret_word))
+        row = cursor.fetchone()
+        conn.commit()
+        return row is not None
+    finally:
+        conn.close()
+
+
 def end_game(chat_id):
     conn = connect()
     try:

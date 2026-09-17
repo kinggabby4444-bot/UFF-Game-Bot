@@ -952,15 +952,11 @@ async def _scramble_handle_win(context: ContextTypes.DEFAULT_TYPE, chat, user, m
     badge = await level_badge_html(user.id)
     name_html = f'<b><a href="tg://user?id={user.id}">{esc_name(user.first_name)}</a></b>'
 
-    if badge:
-        lines = [
-            f"🎉 Winner! {medal}{name_html}{badge}",
-            f"Got it, <b>{esc(word)}</b>! +{DOLLAR}{reward}",
-        ]
-    else:
-        lines = [
-            f"🎉 Winner! {medal}{name_html} got it, <b>{esc(word)}</b>! +{DOLLAR}{reward}",
-        ]
+    lines = [
+        "🎉 Winner!",
+        f"{medal}{name_html}{badge}",
+        f"Got it, <b>{esc(word)}</b>! +{DOLLAR}{reward}",
+    ]
     if bonus:
         lines.append(f"🔥 {new_streak}-win streak! Bonus: +{DOLLAR}{bonus}")
         lines.append(f"Total: {DOLLAR}{total}")
@@ -3439,6 +3435,15 @@ async def group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     guess_clean = re.sub(r"[^\w\s]", "", text_lower).strip()
     if guess_clean == word_lower:
         winner = user
+
+        # Atomically claim the win: only the FIRST concurrent correct guess
+        # (even by milliseconds) actually clears the round here. Any other
+        # guess that matched at nearly the same instant gets claimed=False
+        # and quietly backs off - this closes the race where two players
+        # guessing at once could both be declared the winner.
+        claimed = await asyncio.to_thread(db.claim_word_game_round, chat.id, leader_id, secret_word)
+        if not claimed:
+            return
 
         if not await asyncio.to_thread(db.is_explaining_started, chat.id):
             cheat_penalty = get_reward("cheat")
