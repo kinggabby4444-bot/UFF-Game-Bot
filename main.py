@@ -130,12 +130,97 @@ def esc(text) -> str:
     return html_lib.escape(str(text), quote=False)
 
 
+# Matches emoji / pictograph characters (plus variation selectors and the
+# zero-width joiner used to glue multi-codepoint emoji together) so they can
+# be stripped from a player's live Telegram display name before it's shown
+# anywhere - players can rename themselves with emoji at any time.
+_EMOJI_PATTERN = re.compile(
+    "["
+    "\U0001F1E6-\U0001F1FF"  # regional indicator symbols (flag emoji)
+    "\U0001F300-\U0001F5FF"  # symbols & pictographs
+    "\U0001F600-\U0001F64F"  # emoticons
+    "\U0001F680-\U0001F6FF"  # transport & map symbols
+    "\U0001F700-\U0001F77F"  # alchemical symbols
+    "\U0001F780-\U0001F7FF"  # geometric shapes extended
+    "\U0001F800-\U0001F8FF"  # supplemental arrows-C
+    "\U0001F900-\U0001F9FF"  # supplemental symbols & pictographs
+    "\U0001FA00-\U0001FA6F"  # chess symbols, symbols & pictographs extended-A (1)
+    "\U0001FA70-\U0001FAFF"  # symbols & pictographs extended-A (2)
+    "\U00002600-\U000026FF"  # misc symbols
+    "\U00002700-\U000027BF"  # dingbats
+    "\U00002B00-\U00002BFF"  # misc symbols and arrows (includes ⭐ ⚡ etc.)
+    "\U0000FE00-\U0000FE0F"  # variation selectors
+    "\U0000200D"             # zero-width joiner
+    "]+",
+    flags=re.UNICODE,
+)
+
+
+def sanitize_display_name(name):
+    """Strip emoji from a player's current Telegram display name before it's
+    printed anywhere (leaderboards, /start, /profile, win/explain
+    announcements, etc). Shared by every name-display call site so the
+    stripping logic only lives in one place."""
+    if not name:
+        return name
+    cleaned = _EMOJI_PATTERN.sub("", str(name))
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    return cleaned if cleaned else str(name)
+
+
+def esc_name(name) -> str:
+    """HTML-escaped, emoji-stripped display name - use this instead of esc()
+    for any player name shown in an HTML-parse_mode message."""
+    return esc(sanitize_display_name(name))
+
+
 def truncate_name(name: str) -> str:
     if name is None:
         return ""
+    name = sanitize_display_name(name)
     if len(name) > MAX_LEADERBOARD_NAME_LEN:
         name = name[:MAX_LEADERBOARD_NAME_LEN] + "..."
     return esc(name)
+
+
+# --- Shared medal (top-3 combined-balance) + level/rank badge helpers ------
+# Both reuse db.get_combined_global_position()/db.compute_level_rank(), which
+# are themselves built on db.get_combined_balance() - the SAME Word Game +
+# Word Scramble combined balance /start already uses. This guarantees there
+# is only ever one global #1/#2/#3, shared identically between Word Scramble
+# and Word Game.
+
+MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
+
+
+async def get_global_medal(user_id) -> str:
+    """Returns 🥇/🥈/🥉 if this user is currently top-3 globally by combined
+    balance, else ''. Does not check any /showmedal-style toggle itself."""
+    pos = await asyncio.to_thread(db.get_combined_global_position, user_id)
+    if not pos:
+        return ""
+    return MEDALS.get(pos[0], "")
+
+
+async def medal_prefix_if_enabled(user_id, config_key) -> str:
+    """Medal prefix for user_id, gated behind the given global on/off
+    bot_config toggle (defaults to on)."""
+    enabled = await asyncio.to_thread(db.get_config, config_key, "1")
+    if enabled != "1":
+        return ""
+    return await get_global_medal(user_id)
+
+
+async def level_badge_html(user_id) -> str:
+    """' · <b>💎 Lvl 4</b>' when /showlevel is on, else '' (gated behind the
+    show_level bot_config toggle, defaults to on)."""
+    enabled = await asyncio.to_thread(db.get_config, "show_level", "1")
+    if enabled != "1":
+        return ""
+    balance = await asyncio.to_thread(db.get_combined_balance, user_id)
+    level, rank_name = db.compute_level_rank(balance)
+    emoji = rank_name.split(" ", 1)[0] if rank_name else ""
+    return f" · <b>{emoji} Lvl {level}</b>"
 
 
 async def safe_send(bot, chat_id, retries=2, delay=2, **kwargs):
@@ -863,12 +948,19 @@ async def _scramble_handle_win(context: ContextTypes.DEFAULT_TYPE, chat, user, m
         await asyncio.to_thread(db.scramble_add_bonus, user.id, chat.id, user.first_name, bonus)
         total += bonus
 
-    mention = f'<a href="tg://user?id={user.id}">{esc(user.first_name)}</a>'
+    medal = await medal_prefix_if_enabled(user.id, "show_scramble_medal")
+    badge = await level_badge_html(user.id)
+    name_html = f'<b><a href="tg://user?id={user.id}">{esc_name(user.first_name)}</a></b>'
 
-    lines = [
-        "🎉 <b>Winner!</b>",
-        f"{mention} got it, <b>{esc(word)}</b>! +{DOLLAR}{reward}",
-    ]
+    if badge:
+        lines = [
+            f"🎉 Winner! {medal}{name_html}{badge}",
+            f"Got it, <b>{esc(word)}</b>! +{DOLLAR}{reward}",
+        ]
+    else:
+        lines = [
+            f"🎉 Winner! {medal}{name_html} got it, <b>{esc(word)}</b>! +{DOLLAR}{reward}",
+        ]
     if bonus:
         lines.append(f"🔥 {new_streak}-win streak! Bonus: +{DOLLAR}{bonus}")
         lines.append(f"Total: {DOLLAR}{total}")
@@ -1295,6 +1387,8 @@ async def scrambleallcommands_command(update: Update, context: ContextTypes.DEFA
 /scrambletopup &lt;@user or ID&gt; &lt;+/-amount&gt; - adjust a player's Word Scramble balance only
 /scrambletopupspecific &lt;@user or ID&gt; &lt;+/-amount&gt; &lt;group ID or @username&gt; - adjust a player's balance as if earned in that specific group (reflects in that group's "in this chat" total and Global)
 /scrambleusers - every player who's used the command or guessed a word, tappable for details
+/showlevel on|off - bot owner or Bot Admins: toggle the Level/Rank badge on Word Scramble winner messages (global, no args shows current status)
+/showmedal on|off - bot owner or Bot Admins: toggle the 🥇🥈🥉 medal prefix on Word Scramble messages (global, no args shows current status)
 /scrambleallcommands - this list
 
 <i>Note: Word Scramble intentionally has no /scramblebanuser, /scramblebroadcast, /scrambleshare, or /scrambleadmins - banning, broadcasting, and bot-admin management are bot-wide systems shared with the Word Game, so /banuser, /broadcast, /share, and /addadmin already cover Word Scramble too. There's also no daily-reward feature specific to Word Scramble - the 🎁 Daily Reward always credits the Word Game balance, and every player's displayed Balance/Level/Rank on /start combines both games automatically. This list and /allcommands are visible to the bot owner, Bot Admins, and each group's own Telegram creator.</i>
@@ -1960,7 +2054,7 @@ async def explain_timeout_callback(context: ContextTypes.DEFAULT_TYPE):
         context.bot,
         chat_id,
         text=(
-            f"⏰ <b>{esc(leader_name)}</b>\n\n"
+            f"⏰ <b>{esc_name(leader_name)}</b>\n\n"
             f"Ran out of time to explain.\n\n"
             f"Who wants to explain?"
         ),
@@ -2175,7 +2269,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text = f"""
 🎮 <b>Welcome Back, Warrior!</b>
 
-Hello, {esc(user.first_name)}! 👋
+Hello, {esc_name(user.first_name)}! 👋
 
 💵 Balance: <b>{player[2]}</b>
 ⭐ Level: <b>{player[3]}</b>
@@ -2566,7 +2660,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 🆔 User ID: <code>{player[0]}</code>
 
-👤 Name: {esc(player[1])}
+👤 Name: {esc_name(player[1])}
 
 💵 Balance: {player[2]}
 ⭐ Level: {player[3]}
@@ -2585,7 +2679,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"""
 🎮 <b>Welcome Back, Warrior!</b>
 
-Hello, {esc(user.first_name)}! 👋
+Hello, {esc_name(user.first_name)}! 👋
 
 💵 Balance: <b>{player[2]}</b>
 ⭐ Level: <b>{player[3]}</b>
@@ -3108,7 +3202,7 @@ Tap a button below to continue your adventure!
         await query.answer()
         await query.edit_message_text(
             f"""
-<b>{esc(user.first_name)} is explaining the word!</b>
+<b>{esc_name(user.first_name)} is explaining the word!</b>
 
 <i>ᵀᵒ ᵈⁱˢᵃᵇˡᵉ ᵃᵘᵗᵒ⁻ˡᵉᵃᵈ, ᵒᵖᵉⁿ ˢᵉᵗᵗⁱⁿᵍˢ ⁱⁿ ᵐʸ ᴾᴹ</i>
 """,
@@ -3173,7 +3267,7 @@ Tap a button below to continue your adventure!
             await safe_send(
                 context.bot,
                 chat.id,
-                text=f"🔄 {user.first_name} changed the word.",
+                text=f"🔄 {sanitize_display_name(user.first_name)} changed the word.",
             )
             return
 
@@ -3186,7 +3280,7 @@ Tap a button below to continue your adventure!
             await query.answer()
             await query.edit_message_text(
                 f"""
-❌ <b>{esc(leader_name)} dropped the lead.</b>
+❌ <b>{esc_name(leader_name)} dropped the lead.</b>
 
 Who wants to explain?
 """,
@@ -3232,7 +3326,7 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"🔄 {user.first_name} changed the word.",
+                text=f"🔄 {sanitize_display_name(user.first_name)} changed the word.",
             )
         except (Forbidden, BadRequest):
             pass
@@ -3301,7 +3395,7 @@ async def group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_send(
                 context.bot,
                 chat.id,
-                text=f"💡 <b>Hints from {esc(leader_name)}:</b>\n\n{hints_text}",
+                text=f"💡 <b>Hints from {esc_name(leader_name)}:</b>\n\n{hints_text}",
                 parse_mode="HTML",
                 link_preview_options=LinkPreviewOptions(is_disabled=True),
             )
@@ -3309,7 +3403,7 @@ async def group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_send(
                 context.bot,
                 chat.id,
-                text=f"💡 {leader_name} hasn't given any hints yet.",
+                text=f"💡 {sanitize_display_name(leader_name)} hasn't given any hints yet.",
             )
         return
 
@@ -3330,7 +3424,7 @@ async def group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat.id,
                 text=(
                     f"-1 💵\n\n"
-                    f"{leader_name} revealed the word.\n\n"
+                    f"{sanitize_display_name(leader_name)} revealed the word.\n\n"
                     f"Who wants to explain?"
                 ),
                 reply_markup=volunteer_keyboard(),
@@ -3364,7 +3458,7 @@ async def group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.bot,
                 chat.id,
                 text=(
-                    f"🚨 {winner.first_name} cheated. {cheat_penalty}\n\n"
+                    f"🚨 {sanitize_display_name(winner.first_name)} cheated. {cheat_penalty}\n\n"
                     f"Who wants to explain?"
                 ),
                 reply_markup=volunteer_keyboard(),
@@ -3387,11 +3481,16 @@ async def group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         auto_lead = await asyncio.to_thread(db.get_auto_lead, winner.id)
 
+        winner_medal = await medal_prefix_if_enabled(winner.id, "show_game_medal")
+        leader_medal = await medal_prefix_if_enabled(leader_id, "show_game_medal")
+        winner_display = sanitize_display_name(winner.first_name)
+        leader_display = sanitize_display_name(leader_name)
+
         result_text = (
-            f"🎉 {winner.first_name} found the word!\n\n"
+            f"🎉 {winner_medal}{winner_display} found the word!\n\n"
             f"📝 Word: {secret_word}\n\n"
-            f"{DOLLAR} {winner.first_name} +{win_reward}\n"
-            f"🎤 {leader_name} +{win_reward}\n"
+            f"{DOLLAR} {winner_medal}{winner_display} +{win_reward}\n"
+            f"🎤 {leader_medal}{leader_display} +{win_reward}\n"
         )
 
         if auto_lead:
@@ -3410,7 +3509,7 @@ async def group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.bot,
                 chat.id,
                 text=(
-                    f"{esc(winner.first_name)} is explaining the next word!\n\n"
+                    f"{winner_medal}{esc_name(winner.first_name)} is explaining the next word!\n\n"
                     f"<i>ᵀᵒ ᵈⁱˢᵃᵇˡᵉ ᵃᵘᵗᵒ⁻ˡᵉᵃᵈ, ᵒᵖᵉⁿ ˢᵉᵗᵗⁱⁿᵍˢ ⁱⁿ ᵐʸ ᴾᴹ</i>"
                 ),
                 parse_mode="HTML",
@@ -3470,12 +3569,12 @@ async def hint_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         leader_message_id = await asyncio.to_thread(db.get_leader_message_id, chat.id)
         hints_text = format_numbered_hints(log, chat, leader_message_id)
         await update.message.reply_html(
-            f"💡 <b>Hints from {esc(leader_name)}:</b>\n\n{hints_text}",
+            f"💡 <b>Hints from {esc_name(leader_name)}:</b>\n\n{hints_text}",
             link_preview_options=LinkPreviewOptions(is_disabled=True),
         )
     else:
         await update.message.reply_text(
-            f"💡 {leader_name} hasn't given any hints yet."
+            f"💡 {sanitize_display_name(leader_name)} hasn't given any hints yet."
         )
 
 
@@ -3901,7 +4000,7 @@ async def stopvote_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     count = await asyncio.to_thread(db.get_stop_vote_count, chat.id)
 
     if count >= 3:
-        names = await asyncio.to_thread(db.get_stop_vote_names, chat.id)
+        names = [sanitize_display_name(n) for n in await asyncio.to_thread(db.get_stop_vote_names, chat.id)]
 
         await asyncio.to_thread(db.clear_leader, chat.id)
         await asyncio.to_thread(db.set_explaining_started, chat.id, False)
@@ -3920,7 +4019,7 @@ async def stopvote_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         await update.message.reply_text(
-            f"🗳️ {user.first_name} voted to stop the game. ({count}/3)"
+            f"🗳️ {sanitize_display_name(user.first_name)} voted to stop the game. ({count}/3)"
         )
 
 
@@ -4204,6 +4303,51 @@ async def ad_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Advertisements have been enabled successfully.")
     else:
         await update.message.reply_text("✅ Advertisements have been disabled successfully.")
+
+
+@owner_or_admin_only
+async def showlevel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or context.args[0].lower() not in ("on", "off"):
+        current = await asyncio.to_thread(db.get_config, "show_level", "1")
+        await update.message.reply_text(
+            "Usage: /showlevel on|off\n"
+            f"Currently: {'on' if current == '1' else 'off'}"
+        )
+        return
+
+    mode = context.args[0].lower()
+    await asyncio.to_thread(db.set_config, "show_level", "1" if mode == "on" else "0")
+    await update.message.reply_text(f"✅ Level/Rank badge in Word Scramble winner messages turned {mode}.")
+
+
+@owner_or_admin_only
+async def showmedal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or context.args[0].lower() not in ("on", "off"):
+        current = await asyncio.to_thread(db.get_config, "show_scramble_medal", "1")
+        await update.message.reply_text(
+            "Usage: /showmedal on|off\n"
+            f"Currently: {'on' if current == '1' else 'off'}"
+        )
+        return
+
+    mode = context.args[0].lower()
+    await asyncio.to_thread(db.set_config, "show_scramble_medal", "1" if mode == "on" else "0")
+    await update.message.reply_text(f"✅ Medal prefix (🥇🥈🥉) in Word Scramble messages turned {mode}.")
+
+
+@owner_or_admin_only
+async def showgamemedal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or context.args[0].lower() not in ("on", "off"):
+        current = await asyncio.to_thread(db.get_config, "show_game_medal", "1")
+        await update.message.reply_text(
+            "Usage: /showgamemedal on|off\n"
+            f"Currently: {'on' if current == '1' else 'off'}"
+        )
+        return
+
+    mode = context.args[0].lower()
+    await asyncio.to_thread(db.set_config, "show_game_medal", "1" if mode == "on" else "0")
+    await update.message.reply_text(f"✅ Medal prefix (🥇🥈🥉) in Word Game messages turned {mode}.")
 
 
 @owner_only
@@ -5345,6 +5489,7 @@ async def allcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 /ad on|off - owner only: globally show/hide the advertisement section
 /sponsoredad on|off - owner only: show/hide just the Sponsored Ad line
 /changesponsoredad &lt;text, link, @username, or 'label | link'&gt; - owner only: replace the Sponsored Ad content (or 'clear' to reset)
+/showgamemedal on|off - owner/Bot Admins only: toggle the 🥇🥈🥉 medal prefix on Word Game names (global, no args shows current status)
 
 <i>Note: banuser/unbanuser/bangroup/unbangroup/broadcast/maintenance/addadmanager/changeadmanager/removeadmanager/admanager/adminmode/prompt/editprompt/groupadminmode can also be used by Bot Admins. /ad on|off, /botgroups, /addwords, /shufflewords, and /gamedifficulty are owner-only. /autodelete's bare on/off form works for group admins too; its explicit-group and allgroups forms are owner-only. This list and /scrambleallcommands are visible to the bot owner, Bot Admins, and each group's own Telegram creator. Word Scramble has its own command list - see /scrambleallcommands (includes /scramblestopallgroups). The 🎁 Daily Reward always credits the Word Game balance, and every player's Balance/Level/Rank on /start combines their Word Game + Word Scramble balances automatically.</i>
 """
@@ -5522,6 +5667,9 @@ def main():
     app.add_handler(CommandHandler("removeadmanager", removeadmanager_command))
     app.add_handler(CommandHandler("admanager", admanager_command))
     app.add_handler(CommandHandler("ad", ad_command))
+    app.add_handler(CommandHandler("showlevel", showlevel_command))
+    app.add_handler(CommandHandler("showmedal", showmedal_command))
+    app.add_handler(CommandHandler("showgamemedal", showgamemedal_command))
     app.add_handler(CommandHandler("sponsoredad", sponsoredad_command))
     app.add_handler(CommandHandler("changesponsoredad", changesponsoredad_command))
 
