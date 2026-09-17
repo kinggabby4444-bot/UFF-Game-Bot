@@ -193,6 +193,9 @@ def create_tables():
         cursor.execute("ALTER TABLE groups ADD COLUMN IF NOT EXISTS removed_by_id BIGINT")
         cursor.execute("ALTER TABLE groups ADD COLUMN IF NOT EXISTS removed_by_name TEXT")
         cursor.execute("ALTER TABLE groups ADD COLUMN IF NOT EXISTS admin_mode_override TEXT")
+        cursor.execute("ALTER TABLE groups ADD COLUMN IF NOT EXISTS autodelete_round_mode TEXT")
+        cursor.execute("ALTER TABLE groups ADD COLUMN IF NOT EXISTS autodelete_interval_seconds INTEGER DEFAULT 0")
+        cursor.execute("ALTER TABLE groups ADD COLUMN IF NOT EXISTS game_difficulty_override TEXT")
 
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS banned_users (
@@ -1108,15 +1111,22 @@ def get_botgroups_count():
         conn.close()
 
 
-def get_botgroups_page(offset, limit):
+def get_botgroups_page(offset, limit, sort="games"):
     conn = connect()
     try:
         cursor = conn.cursor()
-        cursor.execute("""
+        if sort == "time":
+            order_clause = "g.first_seen ASC"
+        else:
+            order_clause = (
+                "(g.left_at IS NULL) DESC, "
+                "(g.games_played + COALESCE(s.rounds_played, 0)) DESC, g.last_active DESC"
+            )
+        cursor.execute(f"""
             SELECT g.chat_id, g.title, g.games_played, g.left_at, COALESCE(s.rounds_played, 0)
             FROM groups g
             LEFT JOIN scramble_group_stats s ON s.chat_id = g.chat_id
-            ORDER BY (g.left_at IS NULL) DESC, g.games_played DESC, g.last_active DESC
+            ORDER BY {order_clause}
             LIMIT %s OFFSET %s
         """, (limit, offset))
         return cursor.fetchall()
@@ -1200,13 +1210,20 @@ def get_groups_count():
         conn.close()
 
 
-def get_groups_page(offset, limit):
+def get_groups_page(offset, limit, sort="games"):
     conn = connect()
     try:
         cursor = conn.cursor()
-        cursor.execute("""
-            SELECT chat_id, title, member_count, games_played, last_active
-            FROM groups ORDER BY games_played DESC, last_active DESC LIMIT %s OFFSET %s
+        if sort == "time":
+            order_clause = "g.first_seen ASC"
+        else:
+            order_clause = "(g.games_played + COALESCE(s.rounds_played, 0)) DESC, g.last_active DESC"
+        cursor.execute(f"""
+            SELECT g.chat_id, g.title, g.member_count, g.games_played, g.last_active
+            FROM groups g
+            LEFT JOIN scramble_group_stats s ON s.chat_id = g.chat_id
+            ORDER BY {order_clause}
+            LIMIT %s OFFSET %s
         """, (limit, offset))
         return cursor.fetchall()
     finally:
@@ -2166,6 +2183,130 @@ def get_effective_admin_mode(chat_id) -> bool:
         cursor.execute("SELECT value FROM bot_config WHERE key=%s", ("require_bot_admin_global",))
         cfg_row = cursor.fetchone()
         return bool(cfg_row) and cfg_row[0] == "1"
+    finally:
+        conn.close()
+
+
+def get_autodelete_settings(chat_id):
+    """Returns (round_mode_on: bool, interval_seconds: int)."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT autodelete_round_mode, autodelete_interval_seconds FROM groups WHERE chat_id=%s",
+            (chat_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return False, 0
+        return (row[0] == "on"), (row[1] or 0)
+    finally:
+        conn.close()
+
+
+def set_autodelete_round_mode(chat_id, value):
+    """value must be 'on' or 'off'."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE groups SET autodelete_round_mode=%s WHERE chat_id=%s", (value, chat_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def set_autodelete_interval(chat_id, seconds):
+    """seconds=0 disables interval cleanup for this group."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE groups SET autodelete_interval_seconds=%s WHERE chat_id=%s", (seconds, chat_id)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def is_autodelete_tracking_active(chat_id) -> bool:
+    """True if this group needs its bot messages tracked for deletion -
+    either round-based cleanup or interval cleanup is on."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT autodelete_round_mode, autodelete_interval_seconds FROM groups WHERE chat_id=%s",
+            (chat_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return False
+        return row[0] == "on" or (row[1] or 0) > 0
+    finally:
+        conn.close()
+
+
+def get_all_autodelete_interval_groups():
+    """Returns [(chat_id, interval_seconds), ...] for currently-active groups
+    with interval cleanup on. Used to restore JobQueue jobs on restart."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT chat_id, autodelete_interval_seconds FROM groups "
+            "WHERE autodelete_interval_seconds > 0 AND left_at IS NULL"
+        )
+        return cursor.fetchall()
+    finally:
+        conn.close()
+
+
+def get_group_game_difficulty_override(chat_id):
+    """Returns the override label ('easy'/'easy3'/.../'medium'/'hard'/'off') or None."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT game_difficulty_override FROM groups WHERE chat_id=%s", (chat_id,))
+        row = cursor.fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def set_group_game_difficulty_override(chat_id, value):
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE groups SET game_difficulty_override=%s WHERE chat_id=%s", (value, chat_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_effective_game_difficulty(chat_id) -> str:
+    """The group's own override if set, else the global default. 'off' if neither is set."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT game_difficulty_override FROM groups WHERE chat_id=%s", (chat_id,))
+        row = cursor.fetchone()
+        override = row[0] if row else None
+        if override:
+            return override
+        cursor.execute("SELECT value FROM bot_config WHERE key=%s", ("game_difficulty_global",))
+        cfg_row = cursor.fetchone()
+        return cfg_row[0] if cfg_row else "off"
+    finally:
+        conn.close()
+
+
+def get_all_used_words_global():
+    """Every word marked used in ANY chat (word-game used_words table), deduped."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT DISTINCT word FROM used_words")
+        return [row[0] for row in cursor.fetchall()]
     finally:
         conn.close()
 

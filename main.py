@@ -9,6 +9,7 @@ import html as html_lib
 import urllib.parse
 from datetime import datetime, timedelta
 from types import SimpleNamespace
+from collections import defaultdict
 
 try:
     from dotenv import load_dotenv
@@ -425,6 +426,7 @@ async def addwords_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     MEDIUM_WORDS = _build_medium_words()
     WORDS = _merge_all_words()
     SCRAMBLE_WORDS = _build_scramble_words()
+    _invalidate_difficulty_cache()
 
     msg = f"✅ Successful. Added: {', '.join(to_add)}"
     if already_existing:
@@ -487,12 +489,17 @@ def scramble_random_word(chat_id):
     if not SCRAMBLE_WORDS:
         return None
 
+    difficulty = db.get_effective_game_difficulty(chat_id)
+    pool = _get_difficulty_pool("scramble", SCRAMBLE_WORDS, difficulty)
+    if not pool:
+        return None
+
     used = db.scramble_get_used_words(chat_id)
-    choices = [w for w in SCRAMBLE_WORDS if w not in used]
+    choices = [w for w in pool if w not in used]
 
     if not choices:
         db.scramble_reset_used_words(chat_id)
-        choices = list(SCRAMBLE_WORDS)
+        choices = list(pool)
 
     word = random.choice(choices)
     db.scramble_mark_word_used(chat_id, word)
@@ -710,7 +717,10 @@ async def scramble_timeout_callback(context: ContextTypes.DEFAULT_TYPE):
     if slow_enabled:
         interval_seconds = slow[0]
         text += f"\n\n🐢New word will be sent in {_format_duration_words(interval_seconds)}."
-        await safe_send(context.bot, chat_id, text=text, parse_mode="HTML")
+        sent = await safe_send(context.bot, chat_id, text=text, parse_mode="HTML")
+        round_on, _ = await asyncio.to_thread(db.get_autodelete_settings, chat_id)
+        if round_on and sent:
+            await _flush_round_messages(context, chat_id, keep_message_id=sent.message_id)
         await schedule_slowmode_next_round(context.job_queue, chat_id, interval_seconds)
         return
 
@@ -718,7 +728,10 @@ async def scramble_timeout_callback(context: ContextTypes.DEFAULT_TYPE):
     if not auto_enabled:
         text += "\n\nPlay again with /wordscramble"
 
-    await safe_send(context.bot, chat_id, text=text, parse_mode="HTML")
+    sent = await safe_send(context.bot, chat_id, text=text, parse_mode="HTML")
+    round_on, _ = await asyncio.to_thread(db.get_autodelete_settings, chat_id)
+    if round_on and sent:
+        await _flush_round_messages(context, chat_id, keep_message_id=sent.message_id)
 
     await _scramble_auto_continue(context, chat_id, won=False)
 
@@ -866,20 +879,29 @@ async def _scramble_handle_win(context: ContextTypes.DEFAULT_TYPE, chat, user, m
     if slow_enabled:
         interval_seconds = slow[0]
         lines.append(f"🐢New word will be sent in {_format_duration_words(interval_seconds)}.")
-        await safe_send(context.bot, chat.id, text="\n".join(lines), parse_mode="HTML")
+        sent = await safe_send(context.bot, chat.id, text="\n".join(lines), parse_mode="HTML")
+        round_on, _ = await asyncio.to_thread(db.get_autodelete_settings, chat.id)
+        if round_on and sent:
+            await _flush_round_messages(context, chat.id, keep_message_id=sent.message_id)
         await schedule_slowmode_next_round(context.job_queue, chat.id, interval_seconds)
         return
 
     _, auto_enabled, _ = await asyncio.to_thread(db.scramble_get_auto_mode, chat.id)
 
     if auto_enabled:
-        await safe_send(context.bot, chat.id, text="\n".join(lines), parse_mode="HTML")
+        sent = await safe_send(context.bot, chat.id, text="\n".join(lines), parse_mode="HTML")
+        round_on, _ = await asyncio.to_thread(db.get_autodelete_settings, chat.id)
+        if round_on and sent:
+            await _flush_round_messages(context, chat.id, keep_message_id=sent.message_id)
         await _scramble_auto_continue(context, chat.id, won=True, chat_obj=chat)
         return
 
     lines.append("")
     lines.append("Play again with /wordscramble")
-    await safe_send(context.bot, chat.id, text="\n".join(lines), parse_mode="HTML")
+    sent = await safe_send(context.bot, chat.id, text="\n".join(lines), parse_mode="HTML")
+    round_on, _ = await asyncio.to_thread(db.get_autodelete_settings, chat.id)
+    if round_on and sent:
+        await _flush_round_messages(context, chat.id, keep_message_id=sent.message_id)
 
 
 async def _scramble_process_guess(update: Update, context: ContextTypes.DEFAULT_TYPE, chat, user, message):
@@ -1110,10 +1132,49 @@ async def scramblesetreward_command(update: Update, context: ContextTypes.DEFAUL
 
 
 @owner_only
+async def gamedifficulty_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    valid = ("easy", "easy3", "easy4", "easy5", "easy6", "medium", "hard", "off")
+
+    if not context.args or context.args[0].lower() not in valid:
+        current_global = await asyncio.to_thread(db.get_config, "game_difficulty_global", "off")
+        await update.message.reply_html(
+            "Usage:\n"
+            "<code>/gamedifficulty easy</code> — mix of 3/4/5/6-letter words\n"
+            "<code>/gamedifficulty easy3</code> (or easy4/easy5/easy6) — that exact length only\n"
+            "<code>/gamedifficulty medium</code> — words of 8+ letters, compounds excluded\n"
+            "<code>/gamedifficulty hard</code> — words of 11+ letters, compounds included\n"
+            "<code>/gamedifficulty off</code> — use the full word pool\n\n"
+            "Add a group ID or @username at the end to target just that group.\n\n"
+            f"Current global default: <b>{esc(current_global)}</b>"
+        )
+        return
+
+    label = context.args[0].lower()
+    group_arg = context.args[1] if len(context.args) > 1 else None
+
+    if group_arg:
+        resolved = await resolve_group_arg(group_arg)
+        if not resolved:
+            await update.message.reply_html(
+                f"❌ No group found matching <code>{esc(group_arg)}</code> that I'm currently in."
+            )
+            return
+        target_chat_id, target_title = resolved
+        await asyncio.to_thread(db.set_group_game_difficulty_override, target_chat_id, label)
+        await update.message.reply_html(
+            f"✅ Difficulty for <b>{esc(target_title)}</b> set to <b>{label}</b>."
+        )
+    else:
+        await asyncio.to_thread(db.set_config, "game_difficulty_global", label)
+        await update.message.reply_html(f"✅ Global default difficulty set to <b>{label}</b>.")
+
+
+@owner_only
 async def scramblereloadwords_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global SCRAMBLE_WORDS
     importlib.reload(mw)
     SCRAMBLE_WORDS = _build_scramble_words()
+    _invalidate_difficulty_cache()
     await update.message.reply_text(
         f"🔄 Word Scramble word list reloaded. Total words loaded: {len(SCRAMBLE_WORDS)}"
     )
@@ -1199,8 +1260,12 @@ async def scramblemaintenance_command(update: Update, context: ContextTypes.DEFA
     )
 
 
-@owner_only
 async def scrambleallcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_bot_admin_or_owner(update.effective_user.id) and not await is_chat_creator(update, context):
+        await update.message.reply_text(
+            "🚫 This command is for the bot owner or this group's creator."
+        )
+        return
     text = """
 📖 <b>All Word Scramble Commands</b>
 
@@ -1208,6 +1273,7 @@ async def scrambleallcommands_command(update: Update, context: ContextTypes.DEFA
 /wordscramble - start a round (works in groups and DM)
 /scramblehelp - how to play
 /scrambleleaderboard - this chat's leaderboard
+/ranks - the full rank/level ladder and what balance unlocks each one (shared with Word Game)
 /scrambletopplayers - top 15, this chat or global
 /scrambletopgroups - the most active groups
 
@@ -1220,15 +1286,18 @@ async def scrambleallcommands_command(update: Update, context: ContextTypes.DEFA
 /scramblestats - Word Scramble bot-wide statistics
 /scramblesetreward &lt;amount&gt; - set the win reward
 /scramblereloadwords - reload the word pool from medium_words_raw.py
+/shufflewords - reshuffle the shared word pool (Word Game and Word Scramble both draw from it)
+/gamedifficulty easy|easy3-6|medium|hard|off [group] - control which word lengths get picked (shared with Word Game)
 /scrambleforceend [Chat ID] - force-end a stuck round in one chat
 /scramblestopallgroups - force-end the active round in EVERY chat at once and pause new ones (until /scramblemaintenance off)
 /scramblemaintenance on|off - pause new Word Scramble rounds only (Word Game unaffected)
 /scramblemode &lt;time&gt;|off - my DM only: auto-start a round in EVERY group on a repeating interval
 /scrambletopup &lt;@user or ID&gt; &lt;+/-amount&gt; - adjust a player's Word Scramble balance only
+/scrambletopupspecific &lt;@user or ID&gt; &lt;+/-amount&gt; &lt;group ID or @username&gt; - adjust a player's balance as if earned in that specific group (reflects in that group's "in this chat" total and Global)
 /scrambleusers - every player who's used the command or guessed a word, tappable for details
 /scrambleallcommands - this list
 
-<i>Note: Word Scramble intentionally has no /scramblebanuser, /scramblebroadcast, /scrambletopup, /scrambleshare, or /scrambleadmins - banning, broadcasting, balance, and bot-admin management are bot-wide systems shared with the Word Game, so /banuser, /broadcast, /topup, /share, and /addadmin already cover Word Scramble too. There's also no daily-reward feature specific to Word Scramble - the 🎁 Daily Reward always credits the Word Game balance, and every player's displayed Balance/Level/Rank on /start combines both games automatically.</i>
+<i>Note: Word Scramble intentionally has no /scramblebanuser, /scramblebroadcast, /scrambleshare, or /scrambleadmins - banning, broadcasting, and bot-admin management are bot-wide systems shared with the Word Game, so /banuser, /broadcast, /share, and /addadmin already cover Word Scramble too. There's also no daily-reward feature specific to Word Scramble - the 🎁 Daily Reward always credits the Word Game balance, and every player's displayed Balance/Level/Rank on /start combines both games automatically. This list and /allcommands are visible to the bot owner, Bot Admins, and each group's own Telegram creator.</i>
 """
     await update.message.reply_html(text)
 
@@ -1684,14 +1753,67 @@ def is_valid_english_word(text: str) -> bool:
     return _word_in_dictionary(word.lower())
 
 
+# --- Feature: word difficulty ------------------------------------------
+
+_DIFFICULTY_CACHE = {}  # (pool_name, label) -> filtered word list
+
+
+def _is_compound_word(word: str) -> bool:
+    """Heuristic only: True if `word` splits into two dictionary words of
+    3+ letters each (e.g. 'weightlifting' -> 'weight' + 'lifting'). Used to
+    keep compounds out of the 'medium' difficulty tier. Reuses the same
+    dictionary check the write-word validator already relies on."""
+    w = word.lower()
+    if len(w) < 6:
+        return False
+    for i in range(3, len(w) - 2):
+        left, right = w[:i], w[i:]
+        try:
+            if _word_in_dictionary(left) and _word_in_dictionary(right):
+                return True
+        except Exception:
+            return False
+    return False
+
+
+def _filter_by_difficulty(pool, label):
+    if not label or label == "off":
+        return pool
+    if label == "easy":
+        result = [w for w in pool if len(w) in (3, 4, 5, 6)]
+    elif label in ("easy3", "easy4", "easy5", "easy6"):
+        n = int(label[-1])
+        result = [w for w in pool if len(w) == n]
+    elif label == "medium":
+        result = [w for w in pool if len(w) >= 8 and not _is_compound_word(w)]
+    elif label == "hard":
+        result = [w for w in pool if len(w) >= 11]
+    else:
+        result = pool
+    return result or pool  # never hand back an empty pool
+
+
+def _get_difficulty_pool(pool_name, base_pool, label):
+    key = (pool_name, label or "off")
+    if key not in _DIFFICULTY_CACHE:
+        _DIFFICULTY_CACHE[key] = _filter_by_difficulty(base_pool, label)
+    return _DIFFICULTY_CACHE[key]
+
+
+def _invalidate_difficulty_cache():
+    _DIFFICULTY_CACHE.clear()
+
+
 def random_word(chat_id, exclude=None):
+    difficulty = db.get_effective_game_difficulty(chat_id)
+    pool = _get_difficulty_pool("wordgame", WORDS, difficulty)
     used = db.get_used_words(chat_id)
 
-    choices = [w for w in WORDS if w not in used and w != exclude]
+    choices = [w for w in pool if w not in used and w != exclude]
 
     if not choices:
         db.reset_used_words(chat_id)
-        choices = [w for w in WORDS if w != exclude] or WORDS
+        choices = [w for w in pool if w != exclude] or pool
 
     word = random.choice(choices)
     db.mark_word_used(chat_id, word)
@@ -1741,6 +1863,83 @@ def schedule_explain_timeout(context: ContextTypes.DEFAULT_TYPE, chat_id, leader
     )
 
 
+# --- Feature: auto-delete -----------------------------------------------
+
+_autodelete_tracker = defaultdict(list)  # chat_id -> [message_id, ...] pending possible deletion
+
+
+def _parse_autodelete_interval(text):
+    """'9m' -> 540, '30s' -> 30, etc. Accepts s/m/h/d, number 1-50. None if invalid."""
+    if not text:
+        return None
+    m = re.fullmatch(r"([1-9]|[1-4][0-9]|50)([smhd])", text.strip().lower())
+    if not m:
+        return None
+    n, unit = int(m.group(1)), m.group(2)
+    mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
+    return n * mult
+
+
+async def _flush_round_messages(context, chat_id, keep_message_id=None):
+    """Deletes every tracked bot message for this chat except keep_message_id,
+    then resets tracking to just that kept message (if any)."""
+    ids = _autodelete_tracker.pop(chat_id, [])
+    if not ids:
+        return
+    for mid in ids:
+        if keep_message_id is not None and mid == keep_message_id:
+            continue
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+        except Exception:
+            pass
+    if keep_message_id is not None:
+        _autodelete_tracker[chat_id] = [keep_message_id]
+
+
+def _autodelete_job_name(chat_id):
+    return f"autodelete_{chat_id}"
+
+
+def cancel_autodelete_job(job_queue, chat_id):
+    if job_queue is None:
+        return
+    for job in job_queue.get_jobs_by_name(_autodelete_job_name(chat_id)):
+        job.schedule_removal()
+
+
+def schedule_autodelete_job(job_queue, chat_id, interval_seconds):
+    if job_queue is None:
+        return
+    cancel_autodelete_job(job_queue, chat_id)
+    job_queue.run_repeating(
+        autodelete_interval_tick,
+        interval=interval_seconds,
+        first=interval_seconds,
+        chat_id=chat_id,
+        name=_autodelete_job_name(chat_id),
+    )
+
+
+async def autodelete_interval_tick(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.chat_id
+    ids = _autodelete_tracker.get(chat_id, [])
+    if len(ids) <= 1:
+        return
+    keep = ids[-1]
+    for mid in ids[:-1]:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+        except Exception:
+            pass
+    _autodelete_tracker[chat_id] = [keep]
+
+
+def restore_autodelete_jobs(job_queue):
+    for chat_id, interval_seconds in db.get_all_autodelete_interval_groups():
+        schedule_autodelete_job(job_queue, chat_id, interval_seconds)
+
+
 async def explain_timeout_callback(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
     chat_id = job.chat_id
@@ -1757,7 +1956,7 @@ async def explain_timeout_callback(context: ContextTypes.DEFAULT_TYPE):
     await asyncio.to_thread(db.clear_leader, chat_id)
     await asyncio.to_thread(db.set_explaining_started, chat_id, False)
 
-    await safe_send(
+    sent = await safe_send(
         context.bot,
         chat_id,
         text=(
@@ -1768,6 +1967,9 @@ async def explain_timeout_callback(context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML",
         reply_markup=volunteer_keyboard(),
     )
+    round_on, _ = await asyncio.to_thread(db.get_autodelete_settings, chat_id)
+    if round_on and sent:
+        await _flush_round_messages(context, chat_id, keep_message_id=sent.message_id)
 
 
 # --- Feature 1: "Add to a Group" button -------------------------------------
@@ -2110,6 +2312,20 @@ async def is_chat_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> b
         return False
 
 
+async def is_chat_creator(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """True only for the Telegram creator/owner of the CURRENT group - not
+    regular admins, and not meaningful outside a group chat."""
+    chat = update.effective_chat
+    user = update.effective_user
+    if chat.type == ChatType.PRIVATE:
+        return False
+    try:
+        member = await context.bot.get_chat_member(chat.id, user.id)
+        return member.status == "creator"
+    except (Forbidden, BadRequest):
+        return False
+
+
 async def word_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type == ChatType.PRIVATE:
         await update.message.reply_text(
@@ -2404,7 +2620,11 @@ Tap a button below to continue your adventure!
     if query.data == "play":
         if chat.type == ChatType.PRIVATE:
             await query.answer()
-            await query.edit_message_text(SCRAMBLE_GROUPS_ONLY_TEXT, parse_mode="HTML")
+            await query.edit_message_text(
+                SCRAMBLE_GROUPS_ONLY_TEXT,
+                parse_mode="HTML",
+                reply_markup=add_to_group_keyboard(context),
+            )
             return
         if _slowmode_enabled(chat.id) and not await asyncio.to_thread(db.scramble_get_round, chat.id):
             interval = (await asyncio.to_thread(db.get_scramble_slowmode, chat.id))[0]
@@ -2556,12 +2776,29 @@ Tap a button below to continue your adventure!
         await query.edit_message_text(header, parse_mode="HTML", reply_markup=keyboard)
         return
 
+    if query.data.startswith("gsort:"):
+        if not is_owner(user.id):
+            await query.answer("🚫 Owner only.", show_alert=True)
+            return
+        _, which, sort = query.data.split(":")
+        if which == "bot":
+            header, keyboard = build_botgroups_list_page(0, sort)
+        else:
+            header, keyboard = build_groups_list_page(0, sort)
+        await query.answer()
+        if header is None:
+            await query.edit_message_text("No groups registered yet.")
+            return
+        await query.edit_message_text(header, parse_mode="HTML", reply_markup=keyboard)
+        return
+
     if query.data.startswith("glpg:"):
         if not is_owner(user.id):
             await query.answer("🚫 Owner only.", show_alert=True)
             return
-        page = int(query.data.split(":", 1)[1])
-        header, keyboard = build_groups_list_page(page)
+        _, sort, page_str = query.data.split(":")
+        page = int(page_str)
+        header, keyboard = build_groups_list_page(page, sort)
         await query.answer()
         if header is None:
             await query.edit_message_text("No groups registered yet.")
@@ -2573,8 +2810,9 @@ Tap a button below to continue your adventure!
         if not is_owner(user.id):
             await query.answer("🚫 Owner only.", show_alert=True)
             return
-        page = int(query.data.split(":", 1)[1])
-        header, keyboard = build_botgroups_list_page(page)
+        _, sort, page_str = query.data.split(":")
+        page = int(page_str)
+        header, keyboard = build_botgroups_list_page(page, sort)
         await query.answer()
         if header is None:
             await query.edit_message_text("No groups registered yet.")
@@ -2586,7 +2824,7 @@ Tap a button below to continue your adventure!
         if not is_owner(user.id):
             await query.answer("🚫 Owner only.", show_alert=True)
             return
-        _, chat_id_str, page_str = query.data.split(":")
+        _, chat_id_str, bg_sort, page_str = query.data.split(":")
         target_chat_id = int(chat_id_str)
         page = int(page_str)
 
@@ -2637,7 +2875,7 @@ Tap a button below to continue your adventure!
         keyboard_rows = []
         if invite_link:
             keyboard_rows.append([InlineKeyboardButton("🔗 Join Group", url=invite_link)])
-        keyboard_rows.append([InlineKeyboardButton("⬅ Back", callback_data=f"bglpg:{page}")])
+        keyboard_rows.append([InlineKeyboardButton("⬅ Back", callback_data=f"bglpg:{bg_sort}:{page}")])
 
         await query.answer()
         await query.edit_message_text(
@@ -2717,11 +2955,12 @@ Tap a button below to continue your adventure!
             return
         parts = query.data.split(":")
         backscope = parts[1] if len(parts) > 1 else "top"
-        backpage = int(parts[2]) if len(parts) > 2 else 0
+        ogb_sort = parts[2] if len(parts) > 2 else "games"
+        backpage = int(parts[3]) if len(parts) > 3 else 0
         await query.answer()
 
         if backscope == "gl":
-            header, keyboard = build_groups_list_page(backpage)
+            header, keyboard = build_groups_list_page(backpage, ogb_sort)
             if header is None:
                 await query.edit_message_text("No groups registered yet.")
                 return
@@ -2746,7 +2985,12 @@ Tap a button below to continue your adventure!
         parts = query.data.split(":")
         target_chat_id = int(parts[1])
         backscope = parts[2] if len(parts) > 2 else "top"
-        backpage = int(parts[3]) if len(parts) > 3 else 0
+        if backscope == "gl":
+            og_sort = parts[3] if len(parts) > 3 else "games"
+            backpage = int(parts[4]) if len(parts) > 4 else 0
+        else:
+            og_sort = "games"
+            backpage = int(parts[3]) if len(parts) > 3 else 0
 
         details = await asyncio.to_thread(db.get_group_full_details, target_chat_id)
 
@@ -2793,7 +3037,7 @@ Tap a button below to continue your adventure!
         keyboard_rows = []
         if invite_link:
             keyboard_rows.append([InlineKeyboardButton("🔗 Join Group", url=invite_link)])
-        keyboard_rows.append([InlineKeyboardButton("⬅ Back", callback_data=f"og_back:{backscope}:{backpage}")])
+        keyboard_rows.append([InlineKeyboardButton("⬅ Back", callback_data=f"og_back:{backscope}:{og_sort}:{backpage}")])
 
         await query.answer()
         await query.edit_message_text(
@@ -3156,7 +3400,11 @@ async def group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.to_thread(db.set_explaining_started, chat.id, False)
             await asyncio.to_thread(db.start_explain_log, chat.id, winner.id)
 
-            await safe_send(context.bot, chat.id, text=result_text)
+            result_msg = await safe_send(context.bot, chat.id, text=result_text)
+            round_on, _ = await asyncio.to_thread(db.get_autodelete_settings, chat.id)
+            if round_on and result_msg:
+                await _flush_round_messages(context, chat.id, keep_message_id=result_msg.message_id)
+
 
             sent = await safe_send(
                 context.bot,
@@ -3183,7 +3431,11 @@ async def group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.to_thread(db.clear_leader, chat.id)
             await asyncio.to_thread(db.set_explaining_started, chat.id, False)
 
-            await safe_send(context.bot, chat.id, text=result_text)
+            result_msg = await safe_send(context.bot, chat.id, text=result_text)
+            round_on, _ = await asyncio.to_thread(db.get_autodelete_settings, chat.id)
+            if round_on and result_msg:
+                await _flush_round_messages(context, chat.id, keep_message_id=result_msg.message_id)
+
             await safe_send(
                 context.bot,
                 chat.id,
@@ -3601,6 +3853,22 @@ async def topplayers_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_html(
         "🏆 <b>Top Players</b>\n\nChoose a scope:",
         reply_markup=topplayers_keyboard(),
+    )
+
+
+async def ranks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lines = [
+        "🏆 <b>Rank Ladder</b>\n",
+        "<i>Based on your combined balance - Word Game + Word Scramble earnings added together.</i>\n",
+    ]
+    for threshold, rank_name, level in db.RANKS:
+        lines.append(f"Level {level} — {rank_name} — {DOLLAR}{threshold:,}")
+
+    text = "\n".join(lines) + ad_footer_html()
+
+    await update.message.reply_html(
+        text,
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
     )
 
 
@@ -4108,10 +4376,12 @@ def build_users_list_page(page: int):
     return header, InlineKeyboardMarkup(keyboard)
 
 
-def build_groups_list_page(page: int):
+def build_groups_list_page(page: int, sort: str = "games"):
+    if sort not in ("games", "time"):
+        sort = "games"
     total = db.get_groups_count()
     offset = page * OWNER_LIST_PAGE_SIZE
-    rows = db.get_groups_page(offset, OWNER_LIST_PAGE_SIZE)
+    rows = db.get_groups_page(offset, OWNER_LIST_PAGE_SIZE, sort)
 
     if not rows:
         return None, None
@@ -4119,10 +4389,11 @@ def build_groups_list_page(page: int):
     total_pages = max(1, (total + OWNER_LIST_PAGE_SIZE - 1) // OWNER_LIST_PAGE_SIZE)
     start_n = offset + 1
     end_n = offset + len(rows)
+    sort_label = "🎮 Games Played" if sort == "games" else "🕒 Time Added"
 
     header = (
         f"👨‍👩‍👧‍👦 <b>Groups</b> ({total} total) — Page {page + 1}/{total_pages}\n"
-        f"<i>Entries {start_n}–{end_n} • Tap a group for full details.</i>"
+        f"<i>Sorted by: {sort_label} • Entries {start_n}–{end_n} • Tap a group for full details.</i>"
     )
     if offset + OWNER_LIST_PAGE_SIZE >= total:
         header += "\n<i>This is the end of the group list.</i>"
@@ -4130,26 +4401,28 @@ def build_groups_list_page(page: int):
     keyboard = [
         [InlineKeyboardButton(
             f"{start_n + i}. {truncate_name(title or 'Untitled Group')} — {games:,} Games",
-            callback_data=f"og:{chat_id}:gl:{page}",
+            callback_data=f"og:{chat_id}:gl:{sort}:{page}",
         )]
         for i, (chat_id, title, member_count, games, last_active) in enumerate(rows)
     ]
 
     nav_row = []
     if page > 0:
-        nav_row.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"glpg:{page - 1}"))
+        nav_row.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"glpg:{sort}:{page - 1}"))
     if offset + OWNER_LIST_PAGE_SIZE < total:
-        nav_row.append(InlineKeyboardButton("➡️ Next", callback_data=f"glpg:{page + 1}"))
+        nav_row.append(InlineKeyboardButton("➡️ Next", callback_data=f"glpg:{sort}:{page + 1}"))
     if nav_row:
         keyboard.append(nav_row)
 
     return header, InlineKeyboardMarkup(keyboard)
 
 
-def build_botgroups_list_page(page: int):
+def build_botgroups_list_page(page: int, sort: str = "games"):
+    if sort not in ("games", "time"):
+        sort = "games"
     total = db.get_botgroups_count()
     offset = page * BOTGROUPS_PAGE_SIZE
-    rows = db.get_botgroups_page(offset, BOTGROUPS_PAGE_SIZE)
+    rows = db.get_botgroups_page(offset, BOTGROUPS_PAGE_SIZE, sort)
 
     if not rows:
         return None, None
@@ -4157,12 +4430,13 @@ def build_botgroups_list_page(page: int):
     total_pages = max(1, (total + BOTGROUPS_PAGE_SIZE - 1) // BOTGROUPS_PAGE_SIZE)
     start_n = offset + 1
     end_n = offset + len(rows)
+    sort_label = "🎮 Games Played" if sort == "games" else "🕒 Time Added"
 
     s = db.get_bot_groups_stats()
     header = (
         f"👥 <b>Bot Groups</b>\n"
         f"📊 Total Ever: <b>{s['total']}</b> | 🟢 Current: <b>{s['current']}</b> | 🔴 Removed: <b>{s['removed']}</b>\n\n"
-        f"Page {page + 1}/{total_pages} • <code>🎮 Word Game | 🔤 Scramble</code>\n"
+        f"Page {page + 1}/{total_pages} • Sorted by: {sort_label} • <code>🎮 Word Game | 🔤 Scramble</code>\n"
         f"<i>Entries {start_n}–{end_n} • Tap a group to inspect/join.</i>"
     )
 
@@ -4170,13 +4444,13 @@ def build_botgroups_list_page(page: int):
     for i, (chat_id, title, wg_played, left_at, scr_played) in enumerate(rows):
         status = "🟢" if not left_at else "🔴"
         label = f"{start_n + i}. {status} {truncate_name(title or 'Untitled Group')} — 🎮{wg_played} 🔤{scr_played}"
-        keyboard.append([InlineKeyboardButton(label, callback_data=f"bg:{chat_id}:{page}")])
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"bg:{chat_id}:{sort}:{page}")])
 
     nav_row = []
     if page > 0:
-        nav_row.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"bglpg:{page - 1}"))
+        nav_row.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"bglpg:{sort}:{page - 1}"))
     if offset + BOTGROUPS_PAGE_SIZE < total:
-        nav_row.append(InlineKeyboardButton("➡️ Next", callback_data=f"bglpg:{page + 1}"))
+        nav_row.append(InlineKeyboardButton("➡️ Next", callback_data=f"bglpg:{sort}:{page + 1}"))
     if nav_row:
         keyboard.append(nav_row)
 
@@ -4185,11 +4459,16 @@ def build_botgroups_list_page(page: int):
 
 @owner_only
 async def botgroups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    header, keyboard = build_botgroups_list_page(0)
-    if header is None:
+    if await asyncio.to_thread(db.get_botgroups_count) == 0:
         await update.message.reply_text("No groups registered yet.")
         return
-    await update.message.reply_html(header, reply_markup=keyboard)
+    await update.message.reply_html(
+        "👥 <b>Bot Groups</b>\n\nHow would you like the list ordered?",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🎮 Games Played", callback_data="gsort:bot:games")],
+            [InlineKeyboardButton("🕒 Time Added", callback_data="gsort:bot:time")],
+        ]),
+    )
 
 
 @owner_only
@@ -4216,12 +4495,17 @@ async def groups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_html("\n".join(lines))
         return
 
-    header, keyboard = build_groups_list_page(0)
-    if header is None:
+    if await asyncio.to_thread(db.get_groups_count) == 0:
         await update.message.reply_text("No groups registered yet.")
         return
 
-    await update.message.reply_html(header, reply_markup=keyboard)
+    await update.message.reply_html(
+        "👨‍👩‍👧‍👦 <b>Groups</b>\n\nHow would you like the list ordered?",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🎮 Games Played", callback_data="gsort:gl:games")],
+            [InlineKeyboardButton("🕒 Time Added", callback_data="gsort:gl:time")],
+        ]),
+    )
 
 
 @owner_only
@@ -4324,6 +4608,58 @@ async def unbangroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(f"✅ Group <code>{target_id}</code> has been unbanned.", parse_mode="HTML")
 
 
+@owner_only
+async def sendgroupmessage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
+        await update.message.reply_html(
+            "Usage:\n"
+            "<code>/sendgroupmessage &lt;group ID or @username&gt; &lt;message&gt;</code>\n"
+            "<code>/sendgroupmessage allgroups &lt;message&gt;</code>\n\n"
+            "The message is sent as this bot, not from your own account."
+        )
+        return
+
+    target_arg = context.args[0]
+    message_text = " ".join(context.args[1:]).strip()
+
+    if not message_text:
+        await update.message.reply_text("❌ Provide a message to send.")
+        return
+
+    if target_arg.lower() == "allgroups":
+        groups = await asyncio.to_thread(db.get_current_groups)
+        recipients = list(groups)
+    else:
+        resolved = await resolve_group_arg(target_arg)
+        if not resolved:
+            await update.message.reply_html(
+                f"❌ No group found matching <code>{esc(target_arg)}</code> that I'm currently in."
+            )
+            return
+        recipients = [resolved]
+
+    status = await update.message.reply_text(
+        f"📣 Sending to {len(recipients)} group(s)..."
+    )
+
+    success, failed = 0, 0
+    for chat_id, _title in recipients:
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=message_text)
+            success += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)
+
+    await status.edit_text(
+        f"📣 <b>Message Sent</b>\n\n"
+        f"✅ Successful: {success}\n"
+        f"❌ Failed: {failed}\n"
+        f"👥 Total: {len(recipients)}",
+        parse_mode="HTML",
+    )
+
+
 @owner_or_admin_only
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args or context.args[0].lower() not in ("users", "groups"):
@@ -4374,6 +4710,118 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👥 Total Recipients: {len(recipients)}",
         parse_mode="HTML",
     )
+
+
+async def autodelete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if not context.args:
+        if chat.type == ChatType.PRIVATE:
+            await update.message.reply_html(
+                "Usage (inside a group, by that group's admins or the bot owner):\n"
+                "<code>/autodelete on</code> — clean up bot messages after each round, "
+                "keep the winner announcement\n"
+                "<code>/autodelete off</code>\n"
+                "<code>/autodelete on &lt;number&gt;&lt;s|m|h|d&gt;</code> — periodic cleanup "
+                "(e.g. <code>/autodelete on 9m</code>)\n\n"
+                "From my DM (owner only):\n"
+                "<code>/autodelete on allgroups</code>\n"
+                "<code>/autodelete on &lt;group ID or @username&gt;</code>\n"
+                "<code>/autodelete on/off &lt;number&gt;&lt;s|m|h|d&gt; &lt;group ID or @username&gt;</code>"
+            )
+            return
+        if not await is_chat_admin(update, context) and not is_bot_admin_or_owner(user.id):
+            await update.message.reply_text("🚫 Group admins or the bot owner only.")
+            return
+        round_on, interval = await asyncio.to_thread(db.get_autodelete_settings, chat.id)
+        await update.message.reply_html(
+            f"⚙️ <b>Auto-Delete (this group)</b>\n\n"
+            f"Round cleanup: {'🟢 ON' if round_on else '🔴 OFF'}\n"
+            f"Interval cleanup: "
+            f"{'🟢 every ' + _format_duration_words(interval) if interval else '🔴 OFF'}\n\n"
+            f"Usage:\n<code>/autodelete on</code>\n<code>/autodelete off</code>\n"
+            f"<code>/autodelete on &lt;number&gt;&lt;s|m|h|d&gt;</code>"
+        )
+        return
+
+    action = context.args[0].lower()
+    if action not in ("on", "off"):
+        await update.message.reply_text("Usage: /autodelete on|off [interval] [group]")
+        return
+
+    rest = context.args[1:]
+    interval_token = None
+    group_token = None
+    for tok in rest:
+        if interval_token is None and _parse_autodelete_interval(tok) is not None:
+            interval_token = tok
+        elif group_token is None:
+            group_token = tok
+
+    interval_seconds = _parse_autodelete_interval(interval_token) if interval_token else None
+
+    if group_token:
+        if not is_owner(user.id):
+            await update.message.reply_text("🚫 Owner only.")
+            return
+        if group_token.lower() == "allgroups":
+            targets = list(await asyncio.to_thread(db.get_current_groups))
+        else:
+            resolved = await resolve_group_arg(group_token)
+            if not resolved:
+                await update.message.reply_html(
+                    f"❌ No group found matching <code>{esc(group_token)}</code> that I'm currently in."
+                )
+                return
+            targets = [resolved]
+    else:
+        if chat.type == ChatType.PRIVATE:
+            await update.message.reply_html(
+                "Run this inside the group you want to configure, or give me an explicit "
+                "group (owner only): <code>/autodelete on allgroups</code> or "
+                "<code>/autodelete on &lt;group ID or @username&gt;</code>"
+            )
+            return
+        if not await is_chat_admin(update, context) and not is_bot_admin_or_owner(user.id):
+            await update.message.reply_text("🚫 Group admins or the bot owner only.")
+            return
+        targets = [(chat.id, chat.title)]
+
+    applied = 0
+    for target_chat_id, _target_title in targets:
+        if action == "off":
+            if interval_token:
+                await asyncio.to_thread(db.set_autodelete_interval, target_chat_id, 0)
+                cancel_autodelete_job(context.job_queue, target_chat_id)
+            else:
+                await asyncio.to_thread(db.set_autodelete_round_mode, target_chat_id, "off")
+        else:
+            if interval_token:
+                await asyncio.to_thread(db.set_autodelete_interval, target_chat_id, interval_seconds)
+                schedule_autodelete_job(context.job_queue, target_chat_id, interval_seconds)
+            else:
+                await asyncio.to_thread(db.set_autodelete_round_mode, target_chat_id, "on")
+        applied += 1
+
+    if interval_token:
+        if action == "on":
+            summary = (
+                f"🟢 Interval Auto-Delete (every {_format_duration_words(interval_seconds)}) "
+                f"turned ON for {applied} group(s)."
+            )
+        else:
+            summary = f"🔴 Interval Auto-Delete turned OFF for {applied} group(s)."
+    else:
+        if action == "on":
+            summary = (
+                f"🟢 Round-based Auto-Delete turned ON for {applied} group(s) "
+                f"(bot messages cleared after each round, winner announcement kept)."
+            )
+        else:
+            summary = f"🔴 Round-based Auto-Delete turned OFF for {applied} group(s)."
+
+    await update.message.reply_text(summary)
 
 
 @owner_or_admin_only
@@ -4485,12 +4933,47 @@ async def setreward_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @owner_only
+async def shufflewords_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global MEDIUM_WORDS, WORDS, SCRAMBLE_WORDS
+
+    importlib.reload(mw)
+    MEDIUM_WORDS = _build_medium_words()
+    WORDS = _merge_all_words()
+    SCRAMBLE_WORDS = _build_scramble_words()
+
+    used_global = {w.lower() for w in await asyncio.to_thread(db.get_all_used_words_global)}
+
+    unused = [w for w in WORDS if w.lower() not in used_global]
+    used = [w for w in WORDS if w.lower() in used_global]
+    random.shuffle(unused)
+    random.shuffle(used)
+    WORDS = unused + used
+
+    scramble_unused = [w for w in SCRAMBLE_WORDS if w.lower() not in used_global]
+    scramble_used = [w for w in SCRAMBLE_WORDS if w.lower() in used_global]
+    random.shuffle(scramble_unused)
+    random.shuffle(scramble_used)
+    SCRAMBLE_WORDS = scramble_unused + scramble_used
+
+    _invalidate_difficulty_cache()
+
+    await update.message.reply_html(
+        f"🔀 <b>Word pool reshuffled.</b>\n\n"
+        f"📦 Total words: {len(WORDS)}\n"
+        f"🆕 Not yet used anywhere: {len(unused)}\n"
+        f"♻️ Already used somewhere: {len(used)}\n\n"
+        f"<i>Unused words are now prioritized at the front of the pool.</i>"
+    )
+
+
+@owner_only
 async def reloadwords_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global MEDIUM_WORDS, WORDS
 
     importlib.reload(mw)
     MEDIUM_WORDS = _build_medium_words()
     WORDS = _merge_all_words()
+    _invalidate_difficulty_cache()
 
     await update.message.reply_text(
         f"🔄 Word list reloaded. Total words loaded: {len(WORDS)}"
@@ -4791,8 +5274,12 @@ async def admins_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html("\n".join(lines))
 
 
-@owner_only
 async def allcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_bot_admin_or_owner(update.effective_user.id) and not await is_chat_creator(update, context):
+        await update.message.reply_text(
+            "🚫 This command is for the bot owner or this group's creator."
+        )
+        return
     text = f"""
 📖 <b>All Bot Commands</b>
 
@@ -4804,6 +5291,8 @@ async def allcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 /globaltop - top players across all chats
 /topplayers - top 15 players, this chat or global
 /topgroups - the 10 most active groups
+/ranks - the full rank/level ladder and what balance unlocks each one
+/claimdailyreward - claim today's daily reward
 
 <b>🎮 Group Commands</b>
 /wordgame - start a round (admins only once a round is live)
@@ -4816,10 +5305,13 @@ async def allcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 <b>🛡️ Group Admin Commands</b>
 /stopgame - group admins (or the owner) can stop a round instantly
+/autodelete on|off [interval] - group admins (or the owner) can enable cleanup of the bot's own messages here; add a number+s/m/h/d (e.g. 9m) for periodic cleanup instead of round-based
+/groupadminmode on|off &lt;group ID or @username&gt; - owner/Bot Admins only, works from my DM: require (or not) that I'm an admin here before games can start, overriding the global /adminmode default
+/gamedifficulty easy|easy3-6|medium|hard|off [group] - owner only: control which word lengths get picked; add a group to target just that group
 
 <b>👑 Owner Commands</b>
 /stats - bot-wide statistics
-/botgroups - total/current/removed groups, tappable, with per-group Word Game and Scramble activity
+/botgroups (alias: /botsgroups) - total/current/removed groups, tappable, with per-group Word Game and Scramble activity
 /groups [query] - list/search every group the bot has seen
 /users [query] - list/search every registered user
 /banuser &lt;ID&gt; - ban a user from the bot
@@ -4830,6 +5322,7 @@ async def allcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 /maintenance on|off - lock the bot to owner/admins only
 /setreward win|cheat|daily &lt;amount&gt; - tune reward amounts
 /reloadwords - reload the word pool from disk
+/shufflewords - reshuffle the word pool; unused words are prioritized, used ones pushed to the end
 /addwords word1, word2, ... - add new words to the pool (never deletes existing ones)
 /forceend [Group ID] - force-end a stuck round
 /forceleader &lt;@user or ID&gt; - assign a leader directly
@@ -4840,6 +5333,10 @@ async def allcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 /removeadmin &lt;@user or ID&gt; - revoke a Bot Admin
 /admins - list current Bot Admins
 /allcommands - this list
+/adminmode on|off - owner/Bot Admins only: require the bot to be a group admin before games can start, everywhere that hasn't set its own /groupadminmode override
+/sendgroupmessage &lt;group ID or @username&gt;|allgroups &lt;message&gt; - send a message to one group or every group, as the bot
+/prompt on|off - owner/Bot Admins only: toggle the welcome message sent when the bot joins a new group
+/editprompt &lt;text&gt; - owner/Bot Admins only: change that welcome message
 /claimeddailyreward [YYYY-MM-DD] - who claimed the daily reward
 /addadmanager &lt;@username&gt; - assign the Advertisement Manager
 /changeadmanager &lt;@username&gt; - replace the Advertisement Manager
@@ -4849,7 +5346,7 @@ async def allcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 /sponsoredad on|off - owner only: show/hide just the Sponsored Ad line
 /changesponsoredad &lt;text, link, @username, or 'label | link'&gt; - owner only: replace the Sponsored Ad content (or 'clear' to reset)
 
-<i>Note: banuser/unbanuser/bangroup/unbangroup/broadcast/maintenance/addadmanager/changeadmanager/removeadmanager/admanager can also be used by Bot Admins. /ad on|off, /botgroups, and /addwords are owner-only. Word Scramble has its own command list - see /scrambleallcommands (includes /scramblestopallgroups). The 🎁 Daily Reward always credits the Word Game balance, and every player's Balance/Level/Rank on /start combines their Word Game + Word Scramble balances automatically.</i>
+<i>Note: banuser/unbanuser/bangroup/unbangroup/broadcast/maintenance/addadmanager/changeadmanager/removeadmanager/admanager/adminmode/prompt/editprompt/groupadminmode can also be used by Bot Admins. /ad on|off, /botgroups, /addwords, /shufflewords, and /gamedifficulty are owner-only. /autodelete's bare on/off form works for group admins too; its explicit-group and allgroups forms are owner-only. This list and /scrambleallcommands are visible to the bot owner, Bot Admins, and each group's own Telegram creator. Word Scramble has its own command list - see /scrambleallcommands (includes /scramblestopallgroups). The 🎁 Daily Reward always credits the Word Game balance, and every player's Balance/Level/Rank on /start combines their Word Game + Word Scramble balances automatically.</i>
 """
     await update.message.reply_html(text)
 
@@ -4913,6 +5410,24 @@ def main():
 
     print("GAME BOT: application built", flush=True)
 
+    _original_bot_send_message = app.bot.send_message
+
+    async def _tracked_send_message(*args, **kwargs):
+        result = await _original_bot_send_message(*args, **kwargs)
+        try:
+            cid = kwargs.get("chat_id")
+            if cid is None and args:
+                cid = args[0]
+            if cid is not None:
+                cid = int(cid)
+                if cid < 0 and await asyncio.to_thread(db.is_autodelete_tracking_active, cid):
+                    _autodelete_tracker[cid].append(result.message_id)
+        except Exception:
+            pass
+        return result
+
+    app.bot.send_message = _tracked_send_message
+
     app.add_error_handler(error_handler)
 
     app.add_handler(TypeHandler(Update, pre_process), group=-1)
@@ -4949,6 +5464,7 @@ def main():
     app.add_handler(CommandHandler("globaltop", global_top))
     app.add_handler(CommandHandler("topgroups", topgroups_command))
     app.add_handler(CommandHandler("topplayers", topplayers_command))
+    app.add_handler(CommandHandler("ranks", ranks_command))
     app.add_handler(CommandHandler("stopvote", stopvote_command))
     app.add_handler(CommandHandler("stopgame", stopgame_command))
 
@@ -4965,11 +5481,15 @@ def main():
     app.add_handler(CommandHandler("bangroup", bangroup_command))
     app.add_handler(CommandHandler("unbangroup", unbangroup_command))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
+    app.add_handler(CommandHandler("sendgroupmessage", sendgroupmessage_command))
     app.add_handler(CommandHandler("maintenance", maintenance_command))
     app.add_handler(CommandHandler("adminmode", adminmode_command))
+    app.add_handler(CommandHandler("autodelete", autodelete_command))
     app.add_handler(CommandHandler("groupadminmode", groupadminmode_command))
     app.add_handler(CommandHandler("setreward", setreward_command))
     app.add_handler(CommandHandler("reloadwords", reloadwords_command))
+    app.add_handler(CommandHandler("shufflewords", shufflewords_command))
+    app.add_handler(CommandHandler("gamedifficulty", gamedifficulty_command))
     app.add_handler(CommandHandler("addwords", addwords_command))
     app.add_handler(CommandHandler("forceend", forceend_command))
     app.add_handler(CommandHandler("forceleader", forceleader_command))
@@ -5012,6 +5532,7 @@ def main():
         restore_stale_scramble_rounds(app.job_queue)
         restore_stale_slowmode_waits(app.job_queue)
         restore_stale_word_games(app.job_queue)
+        restore_autodelete_jobs(app.job_queue)
 
         if db.get_config("scramble_mode_enabled", "0") == "1":
             try:
