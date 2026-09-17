@@ -5410,23 +5410,40 @@ def main():
 
     print("GAME BOT: application built", flush=True)
 
-    _original_bot_send_message = app.bot.send_message
+    # NOTE: python-telegram-bot's TelegramObject blocks setting attributes
+    # directly on a Bot *instance* (app.bot.send_message = ... raises
+    # AttributeError - "can't be set"). Patching the *class* instead is not
+    # blocked, since that goes through Python's normal type.__setattr__, not
+    # TelegramObject's instance-level guard. The `self is app.bot` check
+    # keeps this scoped to only this Application's bot even though the class
+    # itself is shared process-wide with @UFFAdsBot's own Bot instance.
+    try:
+        _bot_class = type(app.bot)
+        if not getattr(_bot_class, "_autodelete_send_patched", False):
+            _original_bot_send_message = _bot_class.send_message
 
-    async def _tracked_send_message(*args, **kwargs):
-        result = await _original_bot_send_message(*args, **kwargs)
-        try:
-            cid = kwargs.get("chat_id")
-            if cid is None and args:
-                cid = args[0]
-            if cid is not None:
-                cid = int(cid)
-                if cid < 0 and await asyncio.to_thread(db.is_autodelete_tracking_active, cid):
-                    _autodelete_tracker[cid].append(result.message_id)
-        except Exception:
-            pass
-        return result
+            async def _tracked_send_message(self, *args, **kwargs):
+                result = await _original_bot_send_message(self, *args, **kwargs)
+                try:
+                    if self is app.bot:
+                        cid = kwargs.get("chat_id")
+                        if cid is None and args:
+                            cid = args[0]
+                        if cid is not None:
+                            cid = int(cid)
+                            if cid < 0 and await asyncio.to_thread(db.is_autodelete_tracking_active, cid):
+                                _autodelete_tracker[cid].append(result.message_id)
+                except Exception:
+                    pass
+                return result
 
-    app.bot.send_message = _tracked_send_message
+            _bot_class.send_message = _tracked_send_message
+            _bot_class._autodelete_send_patched = True
+    except Exception:
+        logger.exception(
+            "GAME BOT: could not attach auto-delete message tracking - "
+            "/autodelete will not delete anything until this is fixed"
+        )
 
     app.add_error_handler(error_handler)
 
