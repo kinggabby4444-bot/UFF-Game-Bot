@@ -376,6 +376,28 @@ def create_tables():
         )
         """)
 
+        # Words added at runtime via /addwords. Backed by Postgres (not the
+        # medium_words_raw.py file) because Render wipes any local file
+        # changes on every redeploy/restart - this table is what actually
+        # survives.
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS custom_words (
+            word TEXT PRIMARY KEY,
+            added_at TEXT
+        )
+        """)
+
+        # Words hidden via /removewords, regardless of which source (a
+        # built-in medium_words_raw.py category, or custom_words above) they
+        # originally came from. Subtracted from the merged pool as the final
+        # step wherever it's built.
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS removed_words (
+            word TEXT PRIMARY KEY,
+            removed_at TEXT
+        )
+        """)
+
         conn.commit()
     finally:
         conn.close()
@@ -777,26 +799,44 @@ def clear_leader(chat_id):
         conn.close()
 
 
-def claim_word_game_round(chat_id, leader_id, secret_word):
-    """Atomically claims a Word Game round's win. Only clears the round (and
-    returns True) if it still has exactly this leader_id/secret_word - i.e.
-    nobody else has already claimed it. If two players guess the correct
-    word at nearly the same instant, only the first UPDATE to actually reach
-    Postgres matches this WHERE clause; by the time the second one runs,
-    leader_id is already NULL so it matches zero rows and returns False.
-    Callers should back off silently on False - someone else already won."""
+def claim_word_game_win(chat_id):
+    """Atomically claims the currently active Word Game round for chat_id -
+    the Word Game equivalent of scramble_claim_round()'s DELETE...RETURNING
+    pattern (see that function below). Modeled directly on it: only the
+    FIRST concurrent caller gets the round's pre-claim data back; any other
+    caller arriving after it's already been claimed gets None and knows it
+    lost the race.
+
+    Word Game can't just DELETE the row like Word Scramble does (word_games
+    is a persistent per-chat record other logic reads, not a disposable
+    round row), so instead this clears the round's fields the same way
+    clear_leader() does, but atomically and only when a round is actually
+    active - and it returns the PRE-clear values (via the `old` subquery
+    below), including explaining_started, so the caller can tell win from
+    cheat-guess using the value that was true at the moment of the claim,
+    not a stale earlier read.
+
+    Returns (leader_id, leader_name, secret_word, explaining_started) or
+    None if there was no active round to claim.
+    """
     conn = connect()
     try:
         cursor = conn.cursor()
         cursor.execute("""
-            UPDATE word_games
+            UPDATE word_games AS w
             SET leader_id=NULL, leader_name=NULL, secret_word=NULL, explaining_started=0, leader_message_id=NULL
-            WHERE chat_id=%s AND leader_id=%s AND secret_word=%s
-            RETURNING chat_id
-        """, (chat_id, leader_id, secret_word))
+            FROM (
+                SELECT chat_id, leader_id, leader_name, secret_word, explaining_started
+                FROM word_games
+                WHERE chat_id=%s AND leader_id IS NOT NULL
+                FOR UPDATE
+            ) AS old
+            WHERE w.chat_id = old.chat_id
+            RETURNING old.leader_id, old.leader_name, old.secret_word, old.explaining_started
+        """, (chat_id,))
         row = cursor.fetchone()
         conn.commit()
-        return row is not None
+        return row
     finally:
         conn.close()
 
@@ -1516,6 +1556,68 @@ def get_config(key, default=None):
         cursor.execute("SELECT value FROM bot_config WHERE key=%s", (key,))
         row = cursor.fetchone()
         return row[0] if row else default
+    finally:
+        conn.close()
+
+
+def get_custom_words():
+    """All words ever added via /addwords, persisted in Postgres so they
+    survive Render's redeploy/restart wipe of local files."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT word FROM custom_words")
+        return [row[0] for row in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+def add_custom_words(words):
+    """Persists new /addwords words. Safe to call repeatedly - ON CONFLICT
+    DO NOTHING means re-adding an existing word is a no-op, never an error."""
+    if not words:
+        return
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        now = datetime.now().isoformat()
+        cursor.executemany(
+            "INSERT INTO custom_words (word, added_at) VALUES (%s, %s) ON CONFLICT (word) DO NOTHING",
+            [(w, now) for w in words]
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_removed_words():
+    """All words ever hidden via /removewords, regardless of which source
+    (a medium_words_raw.py category or a custom_words entry) they came
+    from - subtracted from the merged pool wherever it's built."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT word FROM removed_words")
+        return [row[0] for row in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+def add_removed_words(words):
+    """Persists new /removewords entries. Safe to call repeatedly - ON
+    CONFLICT DO NOTHING means re-removing an already-removed word is a
+    no-op, never an error."""
+    if not words:
+        return
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        now = datetime.now().isoformat()
+        cursor.executemany(
+            "INSERT INTO removed_words (word, removed_at) VALUES (%s, %s) ON CONFLICT (word) DO NOTHING",
+            [(w, now) for w in words]
+        )
+        conn.commit()
     finally:
         conn.close()
 

@@ -352,6 +352,15 @@ HARD_WORDS = [
 ]
 
 
+# Words added via /addwords, and words hidden via /removewords - both
+# database-backed (see database.py's custom_words / removed_words tables)
+# since Render wipes local file changes on every redeploy/restart. Populated
+# from the DB at startup and kept live-updated by their respective commands,
+# same pattern as everything else that feeds _build_medium_words().
+CUSTOM_WORDS_CACHE = []
+REMOVED_WORDS_CACHE = []
+
+
 def _build_medium_words():
     lists = [
         mw.ANIMALS, mw.FOOD_DRINK, mw.SPORTS_GAMES, mw.PROFESSIONS,
@@ -371,6 +380,7 @@ def _build_medium_words():
         mw.PHOTOGRAPHY_MEDIA, mw.OUTDOORS_CAMPING, mw.FASHION_STYLE_EXTRA,
         mw.HOLIDAYS_FESTIVALS, mw.SCIENCE_LAB_EXTRA,
         getattr(mw, "OWNER_ADDED", []),
+        CUSTOM_WORDS_CACHE,
     ]
     seen = set()
     merged = []
@@ -380,6 +390,9 @@ def _build_medium_words():
             if key not in seen:
                 seen.add(key)
                 merged.append(w)
+    if REMOVED_WORDS_CACHE:
+        removed_lower = {w.lower() for w in REMOVED_WORDS_CACHE}
+        merged = [w for w in merged if w.lower() not in removed_lower]
     return merged
 
 
@@ -398,6 +411,19 @@ def _merge_all_words():
 
 
 WORDS = _merge_all_words()
+
+
+def _rebuild_word_pools():
+    """Rebuilds MEDIUM_WORDS/WORDS/SCRAMBLE_WORDS from the current
+    medium_words_raw.py categories, CUSTOM_WORDS_CACHE, and
+    REMOVED_WORDS_CACHE. Callers that just changed CUSTOM_WORDS_CACHE or
+    REMOVED_WORDS_CACHE (e.g. after a DB write) should call this right after
+    so the live pools reflect it immediately, with no restart needed."""
+    global MEDIUM_WORDS, WORDS, SCRAMBLE_WORDS
+    MEDIUM_WORDS = _build_medium_words()
+    WORDS = _merge_all_words()
+    SCRAMBLE_WORDS = _build_scramble_words()
+    _invalidate_difficulty_cache()
 
 
 WORDS_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "medium_words_raw.py")
@@ -423,6 +449,12 @@ def _read_owner_added_words():
 
 
 def _write_owner_added_words(words):
+    """Kept only as dead-code documentation of the old (buggy) write path -
+    no longer called. /addwords now writes to the custom_words table via
+    db.add_custom_words() instead, since Render wipes this file on every
+    redeploy/restart. _read_owner_added_words() above is still used once, at
+    startup, to migrate any words already sitting in this file into the
+    database."""
     with open(WORDS_FILE_PATH, "r", encoding="utf-8") as f:
         content = f.read()
 
@@ -460,7 +492,7 @@ async def addwords_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ No valid words provided.")
         return
 
-    global MEDIUM_WORDS, WORDS, SCRAMBLE_WORDS
+    global CUSTOM_WORDS_CACHE
     existing_lower = {w.lower() for w in WORDS}
     seen_this_call = set()
 
@@ -493,29 +525,90 @@ async def addwords_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg, parse_mode="Markdown")
         return
 
-    owner_added = _read_owner_added_words()
-    owner_added_lower = {w.lower() for w in owner_added}
-    for w in to_add:
-        if w.lower() not in owner_added_lower:
-            owner_added.append(w)
-            owner_added_lower.add(w.lower())
-
     try:
-        _write_owner_added_words(owner_added)
-    except OSError as e:
-        logger.error(f"Failed to write medium_words_raw.py: {e}")
-        await update.message.reply_text("❌ Failed to save the new words - check the bot's file permissions.")
+        await asyncio.to_thread(db.add_custom_words, to_add)
+    except Exception as e:
+        logger.error(f"Failed to save new words to the database: {e}")
+        await update.message.reply_text("❌ Failed to save the new words - database error.")
         return
 
-    importlib.reload(mw)
-    MEDIUM_WORDS = _build_medium_words()
-    WORDS = _merge_all_words()
-    SCRAMBLE_WORDS = _build_scramble_words()
-    _invalidate_difficulty_cache()
+    CUSTOM_WORDS_CACHE = await asyncio.to_thread(db.get_custom_words)
+    _rebuild_word_pools()
 
     msg = f"✅ Successful. Added: {', '.join(to_add)}"
     if already_existing:
         msg += f"\n\n*These already existing words were not added*:\n{', '.join(already_existing)}"
+    if invalid:
+        msg += f"\n\n❌ Invalid (letters only, skipped): {', '.join(invalid)}"
+
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+@owner_only
+async def removewords_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /removewords word1, word2, word3\n"
+            "(comma or newline separated - single alphabetic words only)"
+        )
+        return
+
+    raw = " ".join(context.args)
+    candidates = [w.strip() for w in re.split(r"[,\n]", raw) if w.strip()]
+
+    if not candidates:
+        await update.message.reply_text("❌ No valid words provided.")
+        return
+
+    global CUSTOM_WORDS_CACHE, REMOVED_WORDS_CACHE
+    pool_lower = {w.lower() for w in WORDS}
+    seen_this_call = set()
+
+    to_remove = []
+    not_found = []
+    invalid = []
+
+    for w in candidates:
+        cleaned = w.strip()
+        if not re.fullmatch(r"[A-Za-z]+", cleaned):
+            invalid.append(cleaned)
+            continue
+        normalized = cleaned.capitalize()
+        key = normalized.lower()
+        if key in seen_this_call:
+            continue
+        if key not in pool_lower:
+            not_found.append(normalized)
+            continue
+        seen_this_call.add(key)
+        to_remove.append(normalized)
+
+    if not to_remove:
+        if len(candidates) == 1 and not_found and not invalid:
+            await update.message.reply_text(f"⚠️ {not_found[0]} isn't in the word pool.")
+            return
+        msg = "⚠️ No words were removed."
+        if not_found:
+            msg += f"\n\n*Not found in the word pool*:\n{', '.join(not_found)}"
+        if invalid:
+            msg += f"\n\n❌ Invalid (letters only, skipped): {', '.join(invalid)}"
+        await update.message.reply_text(msg, parse_mode="Markdown")
+        return
+
+    try:
+        await asyncio.to_thread(db.add_removed_words, to_remove)
+    except Exception as e:
+        logger.error(f"Failed to save removed words to the database: {e}")
+        await update.message.reply_text("❌ Failed to remove the words - database error.")
+        return
+
+    REMOVED_WORDS_CACHE = await asyncio.to_thread(db.get_removed_words)
+    CUSTOM_WORDS_CACHE = await asyncio.to_thread(db.get_custom_words)
+    _rebuild_word_pools()
+
+    msg = f"✅ Successful. Removed: {', '.join(to_remove)}"
+    if not_found:
+        msg += f"\n\n*Not found in the word pool*:\n{', '.join(not_found)}"
     if invalid:
         msg += f"\n\n❌ Invalid (letters only, skipped): {', '.join(invalid)}"
 
@@ -1259,8 +1352,10 @@ async def gamedifficulty_command(update: Update, context: ContextTypes.DEFAULT_T
 
 @owner_only
 async def scramblereloadwords_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global SCRAMBLE_WORDS
+    global SCRAMBLE_WORDS, CUSTOM_WORDS_CACHE, REMOVED_WORDS_CACHE
     importlib.reload(mw)
+    CUSTOM_WORDS_CACHE = await asyncio.to_thread(db.get_custom_words)
+    REMOVED_WORDS_CACHE = await asyncio.to_thread(db.get_removed_words)
     SCRAMBLE_WORDS = _build_scramble_words()
     _invalidate_difficulty_cache()
     await update.message.reply_text(
@@ -3434,18 +3529,25 @@ async def group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     guess_clean = re.sub(r"[^\w\s]", "", text_lower).strip()
     if guess_clean == word_lower:
-        winner = user
-
-        # Atomically claim the win: only the FIRST concurrent correct guess
-        # (even by milliseconds) actually clears the round here. Any other
-        # guess that matched at nearly the same instant gets claimed=False
-        # and quietly backs off - this closes the race where two players
-        # guessing at once could both be declared the winner.
-        claimed = await asyncio.to_thread(db.claim_word_game_round, chat.id, leader_id, secret_word)
-        if not claimed:
+        # Atomically claim the round FIRST, before anything else - this is
+        # the fix for the double-winner race. Modeled on
+        # db.scramble_claim_round() (Word Scramble's existing atomic
+        # DELETE...RETURNING claim): only the FIRST concurrent correct guess
+        # (even by milliseconds) gets a row back; any other guess that
+        # matched at nearly the same instant gets None and backs off with no
+        # reward, no announcement, and no leader change.
+        claim = await asyncio.to_thread(db.claim_word_game_win, chat.id)
+        if not claim:
+            try:
+                await message.delete()
+            except (Forbidden, BadRequest):
+                pass
             return
 
-        if not await asyncio.to_thread(db.is_explaining_started, chat.id):
+        leader_id, leader_name, secret_word, was_explaining_started = claim
+        winner = user
+
+        if not was_explaining_started:
             cheat_penalty = get_reward("cheat")
 
             try:
@@ -3454,8 +3556,6 @@ async def group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
 
             await asyncio.to_thread(db.award_coins, winner.id, chat.id, winner.first_name, cheat_penalty)
-            await asyncio.to_thread(db.clear_leader, chat.id)
-            await asyncio.to_thread(db.set_explaining_started, chat.id, False)
             cancel_explain_timeout(context, chat.id)
             await asyncio.to_thread(db.clear_stop_votes, chat.id)
 
@@ -3532,9 +3632,6 @@ async def group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 schedule_explain_timeout(context, chat.id, winner.id, winner.first_name)
         else:
-            await asyncio.to_thread(db.clear_leader, chat.id)
-            await asyncio.to_thread(db.set_explaining_started, chat.id, False)
-
             result_msg = await safe_send(context.bot, chat.id, text=result_text)
             round_on, _ = await asyncio.to_thread(db.get_autodelete_settings, chat.id)
             if round_on and result_msg:
@@ -5083,9 +5180,11 @@ async def setreward_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @owner_only
 async def shufflewords_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global MEDIUM_WORDS, WORDS, SCRAMBLE_WORDS
+    global MEDIUM_WORDS, WORDS, SCRAMBLE_WORDS, CUSTOM_WORDS_CACHE, REMOVED_WORDS_CACHE
 
     importlib.reload(mw)
+    CUSTOM_WORDS_CACHE = await asyncio.to_thread(db.get_custom_words)
+    REMOVED_WORDS_CACHE = await asyncio.to_thread(db.get_removed_words)
     MEDIUM_WORDS = _build_medium_words()
     WORDS = _merge_all_words()
     SCRAMBLE_WORDS = _build_scramble_words()
@@ -5117,9 +5216,11 @@ async def shufflewords_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 @owner_only
 async def reloadwords_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global MEDIUM_WORDS, WORDS
+    global MEDIUM_WORDS, WORDS, CUSTOM_WORDS_CACHE, REMOVED_WORDS_CACHE
 
     importlib.reload(mw)
+    CUSTOM_WORDS_CACHE = await asyncio.to_thread(db.get_custom_words)
+    REMOVED_WORDS_CACHE = await asyncio.to_thread(db.get_removed_words)
     MEDIUM_WORDS = _build_medium_words()
     WORDS = _merge_all_words()
     _invalidate_difficulty_cache()
@@ -5473,6 +5574,7 @@ async def allcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 /reloadwords - reload the word pool from disk
 /shufflewords - reshuffle the word pool; unused words are prioritized, used ones pushed to the end
 /addwords word1, word2, ... - add new words to the pool (never deletes existing ones)
+/removewords word1, word2, ... - hide a word from the pool regardless of which source it came from (built-in category or /addwords)
 /forceend [Group ID] - force-end a stuck round
 /forceleader &lt;@user or ID&gt; - assign a leader directly
 /topup &lt;@user or ID&gt; &lt;+/-amount&gt; - adjust a player's balance
@@ -5496,7 +5598,7 @@ async def allcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 /changesponsoredad &lt;text, link, @username, or 'label | link'&gt; - owner only: replace the Sponsored Ad content (or 'clear' to reset)
 /showgamemedal on|off - owner/Bot Admins only: toggle the 🥇🥈🥉 medal prefix on Word Game names (global, no args shows current status)
 
-<i>Note: banuser/unbanuser/bangroup/unbangroup/broadcast/maintenance/addadmanager/changeadmanager/removeadmanager/admanager/adminmode/prompt/editprompt/groupadminmode can also be used by Bot Admins. /ad on|off, /botgroups, /addwords, /shufflewords, and /gamedifficulty are owner-only. /autodelete's bare on/off form works for group admins too; its explicit-group and allgroups forms are owner-only. This list and /scrambleallcommands are visible to the bot owner, Bot Admins, and each group's own Telegram creator. Word Scramble has its own command list - see /scrambleallcommands (includes /scramblestopallgroups). The 🎁 Daily Reward always credits the Word Game balance, and every player's Balance/Level/Rank on /start combines their Word Game + Word Scramble balances automatically.</i>
+<i>Note: banuser/unbanuser/bangroup/unbangroup/broadcast/maintenance/addadmanager/changeadmanager/removeadmanager/admanager/adminmode/prompt/editprompt/groupadminmode can also be used by Bot Admins. /ad on|off, /botgroups, /addwords, /removewords, /shufflewords, and /gamedifficulty are owner-only. /autodelete's bare on/off form works for group admins too; its explicit-group and allgroups forms are owner-only. This list and /scrambleallcommands are visible to the bot owner, Bot Admins, and each group's own Telegram creator. Word Scramble has its own command list - see /scrambleallcommands (includes /scramblestopallgroups). The 🎁 Daily Reward always credits the Word Game balance, and every player's Balance/Level/Rank on /start combines their Word Game + Word Scramble balances automatically.</i>
 """
     await update.message.reply_html(text)
 
@@ -5547,6 +5649,25 @@ def main():
 
     db.create_tables()
     print("GAME BOT: database tables created", flush=True)
+
+    # One-time migration: anything still sitting in the old file-based
+    # OWNER_ADDED storage (from before /addwords was moved to the database)
+    # gets copied into custom_words now, so it isn't lost. Safe to run every
+    # startup - add_custom_words() uses ON CONFLICT DO NOTHING.
+    global CUSTOM_WORDS_CACHE, REMOVED_WORDS_CACHE
+    legacy_file_words = _read_owner_added_words()
+    if legacy_file_words:
+        db.add_custom_words(legacy_file_words)
+        print(f"GAME BOT: migrated {len(legacy_file_words)} legacy file-based word(s) into the database", flush=True)
+
+    CUSTOM_WORDS_CACHE = db.get_custom_words()
+    REMOVED_WORDS_CACHE = db.get_removed_words()
+    _rebuild_word_pools()
+    print(
+        f"GAME BOT: word pools built ({len(CUSTOM_WORDS_CACHE)} custom, "
+        f"{len(REMOVED_WORDS_CACHE)} removed, {len(WORDS)} total in Word Game pool)",
+        flush=True,
+    )
 
     app = (
         Application.builder()
@@ -5658,6 +5779,7 @@ def main():
     app.add_handler(CommandHandler("shufflewords", shufflewords_command))
     app.add_handler(CommandHandler("gamedifficulty", gamedifficulty_command))
     app.add_handler(CommandHandler("addwords", addwords_command))
+    app.add_handler(CommandHandler("removewords", removewords_command))
     app.add_handler(CommandHandler("forceend", forceend_command))
     app.add_handler(CommandHandler("forceleader", forceleader_command))
     app.add_handler(CommandHandler("topup", topup_command))
