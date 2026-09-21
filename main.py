@@ -1456,6 +1456,42 @@ async def scramblemaintenance_command(update: Update, context: ContextTypes.DEFA
     )
 
 
+async def reply_html_in_parts(message, text, limit=3800):
+    """Telegram rejects any message over 4096 characters. Split a long HTML text
+    into several messages, breaking only between blank-line-separated blocks
+    (or, if one block is itself too long, between its lines) so no section
+    heading gets separated from its entries and no <b>/<i> tag is cut in half."""
+    blocks = [b for b in text.strip("\n").split("\n\n") if b.strip()]
+
+    pieces = []
+    for block in blocks:
+        if len(block) <= limit:
+            pieces.append(block)
+            continue
+        current = ""
+        for line in block.split("\n"):
+            if current and len(current) + 1 + len(line) > limit:
+                pieces.append(current)
+                current = line
+            else:
+                current = (current + "\n" + line) if current else line
+        if current:
+            pieces.append(current)
+
+    parts, current = [], ""
+    for piece in pieces:
+        if current and len(current) + 2 + len(piece) > limit:
+            parts.append(current)
+            current = piece
+        else:
+            current = (current + "\n\n" + piece) if current else piece
+    if current:
+        parts.append(current)
+
+    for part in parts:
+        await message.reply_html(part)
+
+
 async def scrambleallcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_bot_admin_or_owner(update.effective_user.id) and not await is_chat_creator(update, context):
         await update.message.reply_text(
@@ -1497,7 +1533,7 @@ async def scrambleallcommands_command(update: Update, context: ContextTypes.DEFA
 
 <i>Note: Word Scramble intentionally has no /scramblebanuser, /scramblebroadcast, /scrambleshare, or /scrambleadmins - banning, broadcasting, and bot-admin management are bot-wide systems shared with the Word Game, so /banuser, /broadcast, /share, and /addadmin already cover Word Scramble too. There's also no daily-reward feature specific to Word Scramble - the 🎁 Daily Reward always credits the Word Game balance, and every player's displayed Balance/Level/Rank on /start combines both games automatically. This list and /allcommands are visible to the bot owner, Bot Admins, and each group's own Telegram creator.</i>
 """
-    await update.message.reply_html(text)
+    await reply_html_in_parts(update.message, text)
 
 
 def _slowmode_next_job_name(chat_id):
@@ -5608,7 +5644,7 @@ async def allcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 <i>Note: banuser/unbanuser/bangroup/unbangroup/broadcast/maintenance/addadmanager/changeadmanager/removeadmanager/admanager/adminmode/prompt/editprompt/groupadminmode can also be used by Bot Admins. /ad on|off, /botgroups, /addwords, /removewords, /shufflewords, and /gamedifficulty are owner-only. /autodelete's bare on/off form works for group admins too; its explicit-group and allgroups forms are owner-only. This list and /scrambleallcommands are visible to the bot owner, Bot Admins, and each group's own Telegram creator. Word Scramble has its own command list - see /scrambleallcommands (includes /scramblestopallgroups). The 🎁 Daily Reward always credits the Word Game balance, and every player's Balance/Level/Rank on /start combines their Word Game + Word Scramble balances automatically.</i>
 """
-    await update.message.reply_html(text)
+    await reply_html_in_parts(update.message, text)
 
 
 @owner_only

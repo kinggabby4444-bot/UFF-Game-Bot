@@ -2731,7 +2731,9 @@ async def allcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 <b>PUBLIC</b>
 /start - welcome menu
+/help - how the bot works and how to submit an advertisement
 /submitad - submit an advertisement
+/skip - skip the optional "Additional notes" question while submitting
 /myads - your advertisements &amp; total spend
 /receipts - your past invoices
 /cancel - cancel an in-progress submission
@@ -2741,6 +2743,7 @@ async def allcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 /open &lt;id&gt; - view one application
 /approved - approved applications
 /rejected - rejected applications
+/payments - payments waiting for verification (owner/admin)
 /searchads &lt;query&gt; - search by user/business/link/ID (owner)
 /broadcast &lt;everyone|approved|pending|rejected&gt; &lt;message&gt;
 /approveall - approve every currently pending application (owner)
