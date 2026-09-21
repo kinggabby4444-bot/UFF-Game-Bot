@@ -304,14 +304,27 @@ def build_message_link(chat, message_id):
     return None
 
 
-def format_numbered_hints(log: str, chat, leader_message_id) -> str:
-    lines = [line for line in log.split("\n") if line.strip()]
-    link = build_message_link(chat, leader_message_id)
+def format_numbered_hints(log: str, chat, message_ids: str) -> str:
+    log_lines = log.split("\n")
+    id_lines = message_ids.split("\n") if message_ids else []
 
+    # Pair every log line with the message id at the SAME position first, and only
+    # then drop blank hint lines - so removing blanks can't shift ids onto the
+    # wrong hint. A missing/short/blank id (e.g. a round that was already under
+    # way when per-hint ids were introduced) just means that hint gets no link.
     formatted = []
-    for i, line in enumerate(lines, start=1):
-        number = f'<a href="{link}">{i}</a>' if link else str(i)
-        formatted.append(f"{number}. {esc(line)}")
+    number = 0
+    for position, line in enumerate(log_lines):
+        if not line.strip():
+            continue
+        number += 1
+
+        raw_id = id_lines[position].strip() if position < len(id_lines) else ""
+        message_id = int(raw_id) if raw_id.isdigit() else None
+        link = build_message_link(chat, message_id)
+
+        label = f'<a href="{link}">{number}</a>' if link else str(number)
+        formatted.append(f"{label}. {esc(line)}")
     return "\n".join(formatted)
 
 
@@ -3479,10 +3492,9 @@ async def group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     word_pattern = re.compile(r"\b" + re.escape(word_lower) + r"\b")
 
     if text_lower == "hint" and user.id != leader_id:
-        log = await asyncio.to_thread(db.get_explain_log, chat.id, leader_id)
+        log, message_ids = await asyncio.to_thread(db.get_explain_log, chat.id, leader_id)
         if log:
-            leader_message_id = await asyncio.to_thread(db.get_leader_message_id, chat.id)
-            hints_text = format_numbered_hints(log, chat, leader_message_id)
+            hints_text = format_numbered_hints(log, chat, message_ids)
             await safe_send(
                 context.bot,
                 chat.id,
@@ -3521,10 +3533,7 @@ async def group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=volunteer_keyboard(),
             )
         else:
-            existing_log = await asyncio.to_thread(db.get_explain_log, chat.id, leader_id)
-            if not existing_log:
-                await asyncio.to_thread(db.set_leader_message_id, chat.id, message.message_id)
-            await asyncio.to_thread(db.append_explain_log, chat.id, leader_id, text)
+            await asyncio.to_thread(db.append_explain_log, chat.id, leader_id, text, message.message_id)
         return
 
     guess_clean = re.sub(r"[^\w\s]", "", text_lower).strip()
@@ -3665,11 +3674,10 @@ async def hint_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     leader_id, leader_name = game[1], game[2]
-    log = await asyncio.to_thread(db.get_explain_log, chat.id, leader_id)
+    log, message_ids = await asyncio.to_thread(db.get_explain_log, chat.id, leader_id)
 
     if log:
-        leader_message_id = await asyncio.to_thread(db.get_leader_message_id, chat.id)
-        hints_text = format_numbered_hints(log, chat, leader_message_id)
+        hints_text = format_numbered_hints(log, chat, message_ids)
         await update.message.reply_html(
             f"💡 <b>Hints from {esc_name(leader_name)}:</b>\n\n{hints_text}",
             link_preview_options=LinkPreviewOptions(is_disabled=True),

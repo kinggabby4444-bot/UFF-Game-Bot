@@ -8,6 +8,7 @@ import json
 import asyncio
 import html as html_lib
 from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation
 
 try:
     from dotenv import load_dotenv
@@ -15,14 +16,15 @@ try:
 except ImportError:
     pass
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
 from telegram.constants import ChatType
-from telegram.error import TimedOut, NetworkError
+from telegram.error import TimedOut, NetworkError, TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
     MessageHandler,
+    PreCheckoutQueryHandler,
     ConversationHandler,
     ContextTypes,
     filters,
@@ -103,7 +105,7 @@ def owner_or_admin_only(func):
     return wrapper
 
 
-CURRENCY_SYMBOLS = {"NGN": "₦", "USD": "$", "GBP": "£", "EUR": "€"}
+CURRENCY_SYMBOLS = {"NGN": "₦", "USD": "$", "GBP": "£", "EUR": "€", "XTR": "⭐"}
 
 
 def format_price(price, currency) -> str:
@@ -380,6 +382,95 @@ async def rates_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         lines.append(f"{days} Day{'s' if days != 1 else ''} — {format_price(price, currency)}")
 
     await update.message.reply_html("\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# Native Telegram Stars payments (send_invoice -> pre_checkout_query ->
+# successful_payment). Pricing tiers live in their own star_rates table so
+# nothing that reads ad_rates has to change.
+# ---------------------------------------------------------------------------
+
+STARS_METHOD_NAME = "Telegram Stars"
+STARS_PAYLOAD_PREFIX = "starpay:"
+
+
+def _format_usd(value) -> str:
+    if value is None:
+        return "—"
+    try:
+        return "$" + format(Decimal(value).normalize(), "f")
+    except (InvalidOperation, ValueError, TypeError):
+        return f"${value}"
+
+
+def _format_star_tier(days, usd_price, stars) -> str:
+    return f"{days} Day{'s' if days != 1 else ''} — {_format_usd(usd_price)} — ⭐{stars}"
+
+
+@owner_only
+async def configurestarpaymentmethod_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    usage = (
+        "Usage:\n"
+        "/configurestarpaymentmethod - list current Stars tiers\n"
+        "/configurestarpaymentmethod <duration_days> <usd_price> <stars> - add or update a tier\n"
+        "/configurestarpaymentmethod <duration_days> remove - remove a tier\n\n"
+        "Example: /configurestarpaymentmethod 7 20 800"
+    )
+
+    if not args:
+        rows = await asyncio.to_thread(db.get_star_rates)
+        if not rows:
+            await update.message.reply_text("No Telegram Stars tiers configured yet.\n\n" + usage)
+            return
+        lines = ["⭐ Telegram Stars tiers\n"] + [_format_star_tier(d, u, st) for d, u, st in rows]
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    if not args[0].isdigit() or int(args[0]) <= 0:
+        await update.message.reply_text("❌ duration_days must be a positive whole number.\n\n" + usage)
+        return
+    days = int(args[0])
+
+    if len(args) == 2 and args[1].lower() == "remove":
+        removed = await asyncio.to_thread(db.delete_star_rate, days)
+        await asyncio.to_thread(db.audit, update.effective_user.id, "delete_star_rate", str(days))
+        if removed:
+            await update.message.reply_text(f"✅ Stars tier for {days} Day{'s' if days != 1 else ''} removed.")
+        else:
+            await update.message.reply_text(f"❌ No Stars tier configured for {days} Day{'s' if days != 1 else ''}.")
+        return
+
+    if len(args) != 3:
+        await update.message.reply_text(usage)
+        return
+
+    try:
+        usd_price = Decimal(args[1].lstrip("$"))
+        if not usd_price.is_finite() or usd_price < 0:
+            raise InvalidOperation
+    except InvalidOperation:
+        await update.message.reply_text("❌ usd_price must be a number like 20 or 12.50.\n\n" + usage)
+        return
+
+    if not args[2].isdigit() or int(args[2]) <= 0:
+        await update.message.reply_text("❌ stars must be a positive whole number.\n\n" + usage)
+        return
+    stars = int(args[2])
+
+    await asyncio.to_thread(db.set_star_rate, days, usd_price, stars)
+    await asyncio.to_thread(
+        db.audit, update.effective_user.id, "set_star_rate",
+        f"{days}d = {_format_usd(usd_price)} / {stars} stars",
+    )
+
+    reply = f"✅ Stars tier saved: {_format_star_tier(days, usd_price, stars)}"
+    if not await asyncio.to_thread(db.get_rate, days):
+        reply += (
+            f"\n\n⚠️ There's no advertisement rate for {days} Day{'s' if days != 1 else ''} yet, "
+            f"so applicants can't pick that duration. Add one with /setrate {days} <amount>."
+        )
+    await update.message.reply_text(reply)
 
 
 async def submit_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -690,6 +781,16 @@ async def send_payment_instructions(context, application_id, applicant_id, price
 
     if mode == "single" or len(methods) == 1:
         name, config = methods[0]
+        if name == STARS_METHOD_NAME:
+            # No picker in single-method mode, so the usual "pick a different
+            # method" advice doesn't apply - point them at support instead.
+            error = await start_stars_payment(context, application_id)
+            if error:
+                await context.bot.send_message(
+                    chat_id=applicant_id,
+                    text=f"⭐ Telegram Stars\n\n{error}\n\nPlease contact support to arrange payment.",
+                )
+            return
         await context.bot.send_message(
             chat_id=applicant_id,
             text=format_payment_method_instructions(name, config, price, currency),
@@ -725,11 +826,18 @@ async def payment_method_choice_callback(update: Update, context: ContextTypes.D
 
     method_name = methods[idx][0]
 
-    if method_name == "Telegram Stars":
+    if method_name == STARS_METHOD_NAME:
+        error = await start_stars_payment(context, application_id)
+        if error:
+            text = f"⭐ Telegram Stars\n\n{error}\n\nPlease choose a different payment method."
+        else:
+            text = (
+                "⭐ Telegram Stars\n\n"
+                "Your invoice is right below - tap its Pay button to complete the payment. "
+                "It's confirmed instantly, no screenshot needed."
+            )
         await query.edit_message_text(
-            "⭐ Telegram Stars\n\n"
-            f"Please send the payment to @{await asyncio.to_thread(db.get_config, 'stars_recipient', '')}.\n\n"
-            "After payment, send your payment proof here.",
+            text,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton(
                     "🔙 Change Payment Method",
@@ -767,6 +875,320 @@ async def payment_method_choice_callback(update: Update, context: ContextTypes.D
             )]
         ]),
     )
+
+
+async def _alert_owner(context, text):
+    """Best-effort plain-text message to the owner; never raises."""
+    try:
+        await context.bot.send_message(chat_id=OWNER_ID, text=text)
+    except Exception as e:
+        logger.error(f"Failed to alert owner: {e}")
+
+
+def _parse_star_payload(payload):
+    """payment_id encoded in an invoice payload ("starpay:<id>"), or None."""
+    if not payload or not payload.startswith(STARS_PAYLOAD_PREFIX):
+        return None
+    rest = payload[len(STARS_PAYLOAD_PREFIX):]
+    return int(rest) if rest.isdigit() else None
+
+
+async def start_stars_payment(context, application_id):
+    """Send the applicant a native Telegram Stars invoice for this application.
+
+    Returns None when the invoice was sent, or a short user-facing reason it
+    couldn't be (callers decide what to offer next)."""
+    app_row = await asyncio.to_thread(db.get_application, application_id)
+    if not app_row:
+        return "This application could not be found."
+
+    applicant_id, business_name, duration_days, status = app_row[1], app_row[4], app_row[7], app_row[10]
+
+    if status != "approved":
+        return "There's no payment due for this application right now."
+
+    tier = await asyncio.to_thread(db.get_star_rate, duration_days)
+    if not tier:
+        return f"Telegram Stars isn't available for the {duration_days}-day duration."
+    _usd_price, stars = tier
+
+    payment_id = await asyncio.to_thread(db.get_or_create_star_payment, application_id)
+
+    day_word = "Day" if duration_days == 1 else "Days"
+    title = f"{duration_days} {day_word} Advertisement"
+    description = f"Advertisement for {business_name} - {duration_days} {day_word}"
+
+    try:
+        await context.bot.send_invoice(
+            chat_id=applicant_id,
+            title=title[:32],
+            description=description[:255],
+            payload=f"{STARS_PAYLOAD_PREFIX}{payment_id}",
+            provider_token="",  # must be empty for Telegram Stars
+            currency="XTR",
+            # Stars amounts are the raw star count - NOT multiplied by 100 like
+            # normal currencies - and Stars invoices allow exactly one price line.
+            prices=[LabeledPrice(label=title[:32], amount=int(stars))],
+        )
+    except Exception as e:
+        logger.error(f"Failed to send Stars invoice for application {application_id}: {e}")
+        await _alert_owner(
+            context,
+            f"⚠️ Couldn't send a Stars invoice for Application #{application_id} "
+            f"({stars} stars, {duration_days}d): {e}",
+        )
+        return "Couldn't create the Stars invoice right now. Please try again in a moment."
+
+    return None
+
+
+async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Telegram waits ~10 seconds for this answer, so it must always answer -
+    an unhandled exception here would show the payer a vague failure."""
+    query = update.pre_checkout_query
+
+    async def refuse(reason):
+        await query.answer(ok=False, error_message=reason)
+
+    try:
+        payment_id = _parse_star_payload(query.invoice_payload)
+        if payment_id is None or query.currency != "XTR":
+            await refuse("This payment isn't recognised. Please request a new invoice.")
+            return
+
+        info = await asyncio.to_thread(db.get_payment_star_info, payment_id)
+        if not info:
+            await refuse("This invoice no longer exists. Please request a new one.")
+            return
+
+        _pid, application_id, status, payment_method, _charge_id, _amt, _cur = info
+        if payment_method != STARS_METHOD_NAME:
+            await refuse("This payment isn't recognised. Please request a new invoice.")
+            return
+        if status != "pending":
+            await refuse("This invoice has already been paid or is no longer valid.")
+            return
+
+        app_row = await asyncio.to_thread(db.get_application, application_id)
+        if not app_row or app_row[10] != "approved":
+            await refuse("This advertisement is no longer awaiting payment.")
+            return
+
+        # Refunds go back to the applicant's own account, so only they may pay.
+        if query.from_user.id != app_row[1]:
+            await refuse("This invoice belongs to a different account.")
+            return
+
+        await query.answer(ok=True)
+    except Exception as e:
+        logger.error(f"pre_checkout_query failed: {e}", exc_info=True)
+        try:
+            await query.answer(ok=False, error_message="Something went wrong. Please try again in a moment.")
+        except Exception:
+            pass
+
+
+async def send_start_time_choice(context, chat_id, payment_id, application_id):
+    """Ask the owner/admin when a paid-for advertisement should go live.
+    Shared by the manual "Payment Confirmed" button and the automatic Stars path."""
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("▶ Start Immediately", callback_data=f"paystart:{payment_id}:immediate"),
+        InlineKeyboardButton("🗓 Custom Start Time", callback_data=f"paystart:{payment_id}:custom"),
+    ]])
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"When should Application #{application_id}'s advertisement go live?",
+        reply_markup=keyboard,
+    )
+
+
+async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    payment = message.successful_payment
+    payment_id = _parse_star_payload(payment.invoice_payload)
+    if payment_id is None:
+        logger.warning(f"successful_payment with unrecognised payload {payment.invoice_payload!r}")
+        return
+
+    charge_id = payment.telegram_payment_charge_id
+    payer_id = message.from_user.id
+
+    try:
+        recorded = await asyncio.to_thread(
+            db.confirm_star_payment, payment_id, charge_id, payment.total_amount, payment.currency
+        )
+
+        if not recorded:
+            # The row wasn't 'pending'. Either Telegram redelivered an update we
+            # already handled (same charge id - nothing to do), or the payer was
+            # charged for something we can't fulfil - refund that charge in full.
+            info = await asyncio.to_thread(db.get_payment_star_info, payment_id)
+            if info and info[4] == charge_id:
+                return
+            try:
+                await context.bot.refund_star_payment(user_id=payer_id, telegram_payment_charge_id=charge_id)
+                outcome = "It was refunded automatically."
+                await context.bot.send_message(
+                    chat_id=payer_id,
+                    text="⚠️ That payment couldn't be applied (this invoice was already settled), "
+                         "so it has been refunded to you in full.",
+                )
+            except Exception as e:
+                outcome = f"AUTOMATIC REFUND FAILED ({e}) - refund it manually."
+            await _alert_owner(
+                context,
+                f"⚠️ Stars charge that couldn't be recorded against Payment #{payment_id} "
+                f"(status: {info[2] if info else 'missing'}).\nCharge ID: {charge_id}\n{outcome}",
+            )
+            return
+
+        info = await asyncio.to_thread(db.get_payment_star_info, payment_id)
+        application_id = info[1]
+        app_row = await asyncio.to_thread(db.get_application, application_id)
+
+        # Same state the manual flow is in once an owner has confirmed a payment
+        # but hasn't chosen a start time yet; finalize_subscription moves it on.
+        await asyncio.to_thread(db.set_application_status, application_id, "awaiting_payment")
+        await asyncio.to_thread(
+            db.audit, None, "stars_payment_confirmed",
+            f"Payment #{payment_id}, Application #{application_id}, {payment.total_amount} XTR, charge {charge_id}",
+        )
+    except Exception as e:
+        logger.error(f"Failed to process successful Stars payment {payment_id}: {e}", exc_info=True)
+        await _alert_owner(
+            context,
+            f"🚨 A Stars payment went through but the bot failed to record it: {e}\n"
+            f"Payment #{payment_id}\nCharge ID: {charge_id}\nPayer ID: {payer_id}",
+        )
+        return
+
+    try:
+        await context.bot.send_message(
+            chat_id=payer_id,
+            text=(
+                f"✅ Payment received - {format_price(payment.total_amount, payment.currency)}. Thank you!\n\n"
+                "Your advertisement is being scheduled. You'll get your receipt as soon as its start time is set."
+            ),
+        )
+    except Exception as e:
+        logger.error(f"Failed to confirm Stars payment {payment_id} to payer {payer_id}: {e}")
+
+    business_name = app_row[4] if app_row else "—"
+    applicant_name = app_row[2] if app_row else "—"
+    applicant_username = f"@{app_row[3]}" if app_row and app_row[3] else "—"
+    try:
+        await context.bot.send_message(
+            chat_id=OWNER_ID,
+            text=(
+                "⭐ <b>Telegram Stars payment received automatically</b>\n\n"
+                f"Payment #{payment_id} - Application #{application_id}\n"
+                f"Business: {esc(business_name)}\n"
+                f"Advertiser: {esc(applicant_name)} ({esc(applicant_username)})\n"
+                f"Amount: {format_price(payment.total_amount, payment.currency)}\n"
+                f"Charge ID: <code>{esc(charge_id)}</code>\n\n"
+                "No manual confirmation is needed - Telegram already confirmed this payment. "
+                "Choose a start time in the next message."
+            ),
+            parse_mode="HTML",
+        )
+        await send_start_time_choice(context, OWNER_ID, payment_id, application_id)
+    except Exception as e:
+        logger.error(f"Failed to notify owner of Stars payment {payment_id}: {e}")
+
+
+@owner_or_admin_only
+async def refundstars_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: /refundstars <payment_id>")
+        return
+
+    payment_id = int(context.args[0])
+    info = await asyncio.to_thread(db.get_payment_star_info, payment_id)
+    if not info:
+        await update.message.reply_text("❌ No payment with that ID.")
+        return
+
+    _pid, application_id, status, _method, charge_id, paid_amount, paid_currency = info
+
+    if not charge_id:
+        await update.message.reply_text(
+            f"❌ Payment #{payment_id} wasn't paid through native Telegram Stars, "
+            "so it can't be refunded with this command."
+        )
+        return
+    if status == "refunded":
+        await update.message.reply_text(f"⚠️ Payment #{payment_id} has already been refunded.")
+        return
+
+    app_row = await asyncio.to_thread(db.get_application, application_id)
+    if not app_row:
+        await update.message.reply_text(f"❌ Application #{application_id} for this payment was not found.")
+        return
+    applicant_id = app_row[1]
+
+    note = ""
+    try:
+        # Stars refunds are always for the full amount - there is no partial option.
+        await context.bot.refund_star_payment(user_id=applicant_id, telegram_payment_charge_id=charge_id)
+    except TelegramError as e:
+        if "already_refunded" in str(e).lower():
+            note = "\n(Telegram reports this charge was already refunded - records updated to match.)"
+        else:
+            logger.error(f"refund_star_payment failed for payment {payment_id}: {e}")
+            await update.message.reply_text(f"❌ Telegram refused the refund: {e}")
+            return
+
+    await asyncio.to_thread(db.set_payment_refunded, payment_id)
+
+    # Cancelling is the same mechanism /cancelad uses; get_active_ads_for_rotation
+    # only serves 'active'/'expiring_soon' subscriptions, so this pulls it out.
+    cancelled = await asyncio.to_thread(db.get_subscription_ids_for_application, application_id)
+    for subscription_id in cancelled:
+        await asyncio.to_thread(db.set_subscription_status, subscription_id, "cancelled")
+
+    await asyncio.to_thread(
+        db.audit, update.effective_user.id, "refund_stars_payment",
+        f"Payment #{payment_id}, Application #{application_id}, charge {charge_id}"
+        + (f", cancelled subscription(s) {cancelled}" if cancelled else ""),
+    )
+
+    amount_text = format_price(paid_amount, paid_currency or "XTR") if paid_amount is not None else "your payment"
+    try:
+        await context.bot.send_message(
+            chat_id=applicant_id,
+            text=(
+                f"💸 Your Telegram Stars payment ({amount_text}) for Application #{application_id} "
+                "has been refunded in full."
+                + (" Your advertisement has been cancelled." if cancelled else "")
+            ),
+        )
+    except Exception as e:
+        logger.error(f"Failed to notify applicant {applicant_id} of refund: {e}")
+
+    sub_text = (
+        f"\nSubscription(s) marked cancelled: {', '.join('#' + str(i) for i in cancelled)}"
+        if cancelled else "\nNo subscription had been created from this payment yet."
+    )
+    await update.message.reply_text(f"✅ Payment #{payment_id} refunded and the advertiser notified.{sub_text}{note}")
+
+
+async def _payment_finalize_overrides(payment_id):
+    """kwargs for finalize_subscription: {} for ordinary payments, the real Stars
+    amount/currency/method for native Stars payments, or None if the payment has
+    been refunded (its ad must not be started)."""
+    info = await asyncio.to_thread(db.get_payment_star_info, payment_id)
+    if not info:
+        return {}
+    _pid, _aid, status, _method, charge_id, paid_amount, paid_currency = info
+    if status == "refunded":
+        return None
+    if charge_id:
+        return {
+            "override_amount": paid_amount,
+            "override_currency": paid_currency or "XTR",
+            "override_method_name": STARS_METHOD_NAME,
+        }
+    return {}
 
 
 async def change_payment_method_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1135,15 +1557,7 @@ async def payment_decision_callback(update: Update, context: ContextTypes.DEFAUL
         except Exception:
             pass
 
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("▶ Start Immediately", callback_data=f"paystart:{payment_id}:immediate"),
-            InlineKeyboardButton("🗓 Custom Start Time", callback_data=f"paystart:{payment_id}:custom"),
-        ]])
-        await context.bot.send_message(
-            chat_id=user.id,
-            text=f"When should Application #{application_id}'s advertisement go live?",
-            reply_markup=keyboard,
-        )
+        await send_start_time_choice(context, user.id, payment_id, application_id)
     else:
         await asyncio.to_thread(db.set_payment_status, payment_id, "rejected", confirmed_by=user.id)
         await asyncio.to_thread(db.set_application_status, application_id, "payment_rejected", decided_by=user.id)
@@ -1185,7 +1599,13 @@ async def paystart_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await query.answer()
-    subscription_id, status_value = await finalize_subscription(context, payment_id, datetime.now(), user.id)
+    overrides = await _payment_finalize_overrides(payment_id)
+    if overrides is None:
+        await query.edit_message_text("⚠️ This payment was refunded, so its advertisement can't be started.")
+        return
+    subscription_id, status_value = await finalize_subscription(
+        context, payment_id, datetime.now(), user.id, **overrides
+    )
     state_note = "🟢 LIVE now" if status_value == "active" else "🟡 scheduled"
     await query.edit_message_text(
         f"✅ Advertisement scheduled to start immediately.\n\n"
@@ -1210,7 +1630,13 @@ async def custom_start_time_message(update: Update, context: ContextTypes.DEFAUL
         )
         return True
 
-    subscription_id, status_value = await finalize_subscription(context, payment_id, start_at, update.effective_user.id)
+    overrides = await _payment_finalize_overrides(payment_id)
+    if overrides is None:
+        await update.message.reply_text("⚠️ This payment was refunded, so its advertisement can't be started.")
+        return True
+    subscription_id, status_value = await finalize_subscription(
+        context, payment_id, start_at, update.effective_user.id, **overrides
+    )
     state_note = "🟢 LIVE now" if status_value == "active" else "🟡 scheduled"
     await update.message.reply_text(
         f"✅ Advertisement scheduled to start {start_at.strftime('%Y-%m-%d %H:%M')}.\n\n"
@@ -1225,7 +1651,8 @@ def _publish_to_sponsored_slot(ad_text, ad_link):
     db.set_config("ads_enabled", "1")
 
 
-async def finalize_subscription(context, payment_id, start_at, actor_id):
+async def finalize_subscription(context, payment_id, start_at, actor_id,
+                                override_amount=None, override_currency=None, override_method_name=None):
     payment_row = await asyncio.to_thread(db.get_payment, payment_id)
     application_id = payment_row[1]
     app_row = await asyncio.to_thread(db.get_application, application_id)
@@ -1238,6 +1665,10 @@ async def finalize_subscription(context, payment_id, start_at, actor_id):
     rate_row = await asyncio.to_thread(db.get_rate_with_currency, duration_days)
     base_price, currency = rate_row if rate_row else (0, "NGN")
     amount_paid = final_price if final_price is not None else base_price
+    if override_amount is not None:
+        amount_paid = override_amount
+    if override_currency is not None:
+        currency = override_currency
 
     now = datetime.now()
     end_at = start_at + timedelta(days=duration_days)
@@ -1254,8 +1685,11 @@ async def finalize_subscription(context, payment_id, start_at, actor_id):
 
     await asyncio.to_thread(db.set_application_status, application_id, "payment_confirmed", decided_by=actor_id)
 
-    methods = await asyncio.to_thread(db.get_enabled_payment_methods)
-    method_name = methods[0][0] if len(methods) == 1 else "Unspecified"
+    if override_method_name is not None:
+        method_name = override_method_name
+    else:
+        methods = await asyncio.to_thread(db.get_enabled_payment_methods)
+        method_name = methods[0][0] if len(methods) == 1 else "Unspecified"
 
     invoice_id = await asyncio.to_thread(db.create_invoice, 
         application_id=application_id, subscription_id=subscription_id,
@@ -1265,7 +1699,7 @@ async def finalize_subscription(context, payment_id, start_at, actor_id):
         ad_start=start_at.isoformat(), ad_end=end_at.isoformat(), currency=currency,
     )
 
-    if coupon_code:
+    if coupon_code and override_amount is None:
         await asyncio.to_thread(db.redeem_coupon, coupon_code)
 
     await asyncio.to_thread(db.audit, actor_id, "activate_subscription",
@@ -2326,6 +2760,7 @@ async def allcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 /setpayment &lt;Name&gt; | &lt;Field: Value&gt; | ... - configure ANY payment method
 /setpaystack, /setflutterwave, /setcrypto - step-by-step config for those methods
 /setstarsrecipient &lt;@username&gt; - Telegram Stars recipient
+/refundstars &lt;payment_id&gt; - refund a native Telegram Stars payment in full (owner/admin)
 /setgiftsrecipient &lt;@username&gt; - Telegram Gifts recipient
 /addstars, /addgifts, /fixcrypto - maintenance helpers
 
@@ -2333,6 +2768,7 @@ async def allcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 /setrate &lt;duration_days&gt; &lt;amount&gt; [currency] - add or update a rate
 /deleterate &lt;duration_days&gt; - remove a rate
 /rates - view all configured rates
+/configurestarpaymentmethod [&lt;duration_days&gt; &lt;usd_price&gt; &lt;stars&gt; | &lt;duration_days&gt; remove] - list, set, or remove Telegram Stars tiers
 /setrates - legacy single-rate setter (NGN only, kept for compatibility)
 
 <b>SUBSCRIPTIONS &amp; BILLING</b> (owner/admin unless noted)
@@ -2494,6 +2930,8 @@ def main():
     app.add_handler(CommandHandler("setrate", setrate_command))
     app.add_handler(CommandHandler("deleterate", deleterate_command))
     app.add_handler(CommandHandler("rates", rates_admin_command))
+    app.add_handler(CommandHandler("configurestarpaymentmethod", configurestarpaymentmethod_command))
+    app.add_handler(CommandHandler("refundstars", refundstars_command))
 
     app.add_handler(CommandHandler("createcoupon", createcoupon_command))
     app.add_handler(CommandHandler("coupons", coupons_command))
@@ -2536,6 +2974,8 @@ def main():
     app.add_handler(CallbackQueryHandler(renew_dismiss_callback, pattern="^renew_dismiss$"))
     app.add_handler(CallbackQueryHandler(renew_duration_callback, pattern="^adduration:"))
 
+    app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & filters.TEXT & ~filters.COMMAND,
         private_text_dispatcher,

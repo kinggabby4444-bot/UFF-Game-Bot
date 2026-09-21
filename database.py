@@ -174,6 +174,10 @@ def create_tables():
         )
         """)
 
+        # One message id per line of `log`, newline-joined in the same order, so
+        # each numbered hint can link to the exact message it came from.
+        cursor.execute("ALTER TABLE explain_log ADD COLUMN IF NOT EXISTS message_ids TEXT DEFAULT ''")
+
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS groups (
             chat_id BIGINT PRIMARY KEY,
@@ -1070,44 +1074,71 @@ def start_explain_log(chat_id, leader_id):
     try:
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT INTO explain_log (chat_id, leader_id, log)
-            VALUES (%s, %s, '')
-            ON CONFLICT (chat_id) DO UPDATE SET leader_id=EXCLUDED.leader_id, log=''
+            INSERT INTO explain_log (chat_id, leader_id, log, message_ids)
+            VALUES (%s, %s, '', '')
+            ON CONFLICT (chat_id) DO UPDATE SET leader_id=EXCLUDED.leader_id, log='', message_ids=''
         """, (chat_id, leader_id))
         conn.commit()
     finally:
         conn.close()
 
 
-def append_explain_log(chat_id, leader_id, text):
+def append_explain_log(chat_id, leader_id, text, message_id):
     conn = connect()
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT leader_id, log FROM explain_log WHERE chat_id=%s", (chat_id,))
+        cursor.execute(
+            "SELECT leader_id, log, COALESCE(message_ids, '') FROM explain_log WHERE chat_id=%s",
+            (chat_id,)
+        )
         row = cursor.fetchone()
+
+        # A hint message can itself contain line breaks, and the log is split on
+        # "\n" when it's displayed. Record the message id once per line of `text`
+        # so message_ids always has exactly as many lines as log does.
+        new_ids = [str(message_id)] * len(text.split("\n"))
+
         if row is None or row[0] != leader_id:
             cursor.execute("""
-                INSERT INTO explain_log (chat_id, leader_id, log)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (chat_id) DO UPDATE SET leader_id=EXCLUDED.leader_id, log=EXCLUDED.log
-            """, (chat_id, leader_id, text))
+                INSERT INTO explain_log (chat_id, leader_id, log, message_ids)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (chat_id) DO UPDATE SET
+                    leader_id=EXCLUDED.leader_id, log=EXCLUDED.log, message_ids=EXCLUDED.message_ids
+            """, (chat_id, leader_id, text, "\n".join(new_ids)))
         else:
-            new_log = (row[1] + "\n" + text) if row[1] else text
-            cursor.execute("UPDATE explain_log SET log=%s WHERE chat_id=%s", (new_log, chat_id))
+            existing_log, existing_ids_raw = row[1], row[2]
+            new_log = (existing_log + "\n" + text) if existing_log else text
+
+            # A round that was already under way when message_ids was introduced
+            # has log lines but no ids for them. Pad with blanks (rendered as
+            # unlinked numbers) so the ids for NEW hints land on the right lines.
+            existing_line_count = len(existing_log.split("\n")) if existing_log else 0
+            existing_ids = existing_ids_raw.split("\n") if existing_ids_raw else []
+            existing_ids = (existing_ids + [""] * existing_line_count)[:existing_line_count]
+
+            cursor.execute(
+                "UPDATE explain_log SET log=%s, message_ids=%s WHERE chat_id=%s",
+                (new_log, "\n".join(existing_ids + new_ids), chat_id)
+            )
         conn.commit()
     finally:
         conn.close()
 
 
 def get_explain_log(chat_id, leader_id):
+    """Returns (log, message_ids) - two newline-joined strings that line up
+    line-for-line. Both are "" when there's no log for this leader."""
     conn = connect()
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT leader_id, log FROM explain_log WHERE chat_id=%s", (chat_id,))
+        cursor.execute(
+            "SELECT leader_id, log, COALESCE(message_ids, '') FROM explain_log WHERE chat_id=%s",
+            (chat_id,)
+        )
         row = cursor.fetchone()
         if row is None or row[0] != leader_id:
-            return ""
-        return row[1]
+            return "", ""
+        return row[1] or "", row[2]
     finally:
         conn.close()
 

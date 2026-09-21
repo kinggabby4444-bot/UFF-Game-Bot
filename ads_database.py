@@ -136,6 +136,30 @@ def create_tables():
 
         cursor.execute("ALTER TABLE ad_rates ADD COLUMN IF NOT EXISTS currency TEXT NOT NULL DEFAULT 'NGN'")
 
+        # Native Telegram Stars pricing tiers. Separate from ad_rates on purpose:
+        # ad_rates has one row per duration (PK = duration_days), and Stars need
+        # their own fixed integer amount that's independent of that price.
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS star_rates (
+            duration_days INTEGER PRIMARY KEY,
+            usd_price NUMERIC,
+            stars INTEGER NOT NULL
+        )
+        """)
+
+        # Native Stars payments (send_invoice / pre_checkout_query / successful_payment)
+        # store their bookkeeping on the same ad_payments row the manual proof
+        # pipeline uses. All nullable, so every existing row and every existing
+        # code path that ignores these columns is unaffected.
+        cursor.execute("ALTER TABLE ad_payments ADD COLUMN IF NOT EXISTS payment_method TEXT")
+        cursor.execute("ALTER TABLE ad_payments ADD COLUMN IF NOT EXISTS telegram_charge_id TEXT")
+        cursor.execute("ALTER TABLE ad_payments ADD COLUMN IF NOT EXISTS paid_amount INTEGER")
+        cursor.execute("ALTER TABLE ad_payments ADD COLUMN IF NOT EXISTS paid_currency TEXT")
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_ad_payments_charge_id "
+            "ON ad_payments (telegram_charge_id) WHERE telegram_charge_id IS NOT NULL"
+        )
+
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS ad_subscriptions (
             id BIGSERIAL PRIMARY KEY,
@@ -341,6 +365,55 @@ def delete_rate(duration_days):
     try:
         cursor = conn.cursor()
         cursor.execute("DELETE FROM ad_rates WHERE duration_days=%s", (duration_days,))
+        removed = cursor.rowcount > 0
+        conn.commit()
+        return removed
+    finally:
+        conn.close()
+
+
+def get_star_rates():
+    """All Stars tiers as (duration_days, usd_price, stars), shortest duration first."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT duration_days, usd_price, stars FROM star_rates ORDER BY duration_days ASC")
+        return cursor.fetchall()
+    finally:
+        conn.close()
+
+
+def get_star_rate(duration_days):
+    """One Stars tier as (usd_price, stars), or None if that duration has no tier."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT usd_price, stars FROM star_rates WHERE duration_days=%s", (duration_days,))
+        return cursor.fetchone()
+    finally:
+        conn.close()
+
+
+def set_star_rate(duration_days, usd_price, stars):
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO star_rates (duration_days, usd_price, stars)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (duration_days) DO UPDATE SET
+                usd_price=EXCLUDED.usd_price, stars=EXCLUDED.stars
+        """, (duration_days, usd_price, stars))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def delete_star_rate(duration_days):
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM star_rates WHERE duration_days=%s", (duration_days,))
         removed = cursor.rowcount > 0
         conn.commit()
         return removed
@@ -597,6 +670,104 @@ def set_payment_status(payment_id, status, confirmed_by=None):
         conn.close()
 
 
+def get_or_create_star_payment(application_id):
+    """payment_id of this application's still-unpaid native Stars payment row,
+    creating one (status='pending', no proof file) if there isn't one yet.
+
+    Reusing the open row - rather than inserting a new one every time the
+    applicant taps "Telegram Stars" - means every invoice sent for one
+    application carries the SAME payment_id, so once one of them is paid the
+    others fail pre-checkout instead of letting the applicant pay twice."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id FROM ad_payments
+            WHERE application_id=%s AND payment_method='Telegram Stars' AND status='pending'
+            ORDER BY id DESC LIMIT 1
+        """, (application_id,))
+        row = cursor.fetchone()
+        if row:
+            return row[0]
+        cursor.execute("""
+            INSERT INTO ad_payments (application_id, submitted_at, status, payment_method)
+            VALUES (%s, %s, 'pending', 'Telegram Stars')
+            RETURNING id
+        """, (application_id, datetime.now().isoformat()))
+        payment_id = cursor.fetchone()[0]
+        conn.commit()
+        return payment_id
+    finally:
+        conn.close()
+
+
+def get_payment_star_info(payment_id):
+    """(id, application_id, status, payment_method, telegram_charge_id,
+    paid_amount, paid_currency) or None. Separate from get_payment() so that
+    function's column order - which its callers index into - stays untouched."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, application_id, status, payment_method, telegram_charge_id,
+                   paid_amount, paid_currency
+            FROM ad_payments WHERE id=%s
+        """, (payment_id,))
+        return cursor.fetchone()
+    finally:
+        conn.close()
+
+
+def confirm_star_payment(payment_id, telegram_charge_id, paid_amount, paid_currency):
+    """System-confirm a native Stars payment (confirmed_by stays NULL).
+
+    The `status='pending'` guard makes this a compare-and-set: returns True only
+    for the one call that actually flipped pending -> confirmed, so a redelivered
+    successful_payment update can't be processed twice."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE ad_payments
+            SET status='confirmed', confirmed_at=%s, confirmed_by=NULL,
+                telegram_charge_id=%s, paid_amount=%s, paid_currency=%s
+            WHERE id=%s AND status='pending'
+            RETURNING id
+        """, (datetime.now().isoformat(), telegram_charge_id, paid_amount, paid_currency, payment_id))
+        updated = cursor.fetchone() is not None
+        conn.commit()
+        return updated
+    finally:
+        conn.close()
+
+
+def set_payment_refunded(payment_id):
+    """Mark refunded without touching confirmed_at / confirmed_by, so the record
+    of when and how the payment was originally confirmed is kept."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE ad_payments SET status='refunded' WHERE id=%s", (payment_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_subscription_ids_for_application(application_id):
+    """Ids of every not-yet-cancelled subscription created from this application."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id FROM ad_subscriptions
+            WHERE application_id=%s AND status <> 'cancelled'
+            ORDER BY id ASC
+        """, (application_id,))
+        return [r[0] for r in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
 def get_pending_payments(offset=0, limit=20):
     conn = connect()
     try:
@@ -605,7 +776,7 @@ def get_pending_payments(offset=0, limit=20):
             SELECT p.id, p.application_id, p.submitted_at, a.business_name, a.applicant_name
             FROM ad_payments p
             JOIN ad_applications a ON a.id = p.application_id
-            WHERE p.status='pending'
+            WHERE p.status='pending' AND p.payment_method IS DISTINCT FROM 'Telegram Stars'
             ORDER BY p.submitted_at ASC
             LIMIT %s OFFSET %s
         """, (limit, offset))
@@ -618,7 +789,10 @@ def count_pending_payments():
     conn = connect()
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM ad_payments WHERE status='pending'")
+        cursor.execute(
+            "SELECT COUNT(*) FROM ad_payments "
+            "WHERE status='pending' AND payment_method IS DISTINCT FROM 'Telegram Stars'"
+        )
         return cursor.fetchone()[0]
     finally:
         conn.close()
@@ -641,7 +815,10 @@ def get_stats():
         cursor.execute("SELECT COUNT(*) FROM ad_applications WHERE status='pending'")
         pending = cursor.fetchone()[0]
 
-        cursor.execute("SELECT COUNT(*) FROM ad_payments WHERE status='pending'")
+        cursor.execute(
+            "SELECT COUNT(*) FROM ad_payments "
+            "WHERE status='pending' AND payment_method IS DISTINCT FROM 'Telegram Stars'"
+        )
         payments_waiting = cursor.fetchone()[0]
 
         cursor.execute("SELECT COALESCE(SUM(amount_paid), 0) FROM ad_invoices")
