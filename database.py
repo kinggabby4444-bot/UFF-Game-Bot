@@ -201,6 +201,11 @@ def create_tables():
         cursor.execute("ALTER TABLE groups ADD COLUMN IF NOT EXISTS autodelete_interval_seconds INTEGER DEFAULT 0")
         cursor.execute("ALTER TABLE groups ADD COLUMN IF NOT EXISTS game_difficulty_override TEXT")
 
+        # Feature: Invite & Earn. Separate from first_seen (set once, ever) -
+        # this reflects when the bot's CURRENT continuous stint in the group
+        # began, and is refreshed by register_group() on every add/re-add.
+        cursor.execute("ALTER TABLE groups ADD COLUMN IF NOT EXISTS current_stint_started_at TEXT")
+
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS banned_users (
             user_id BIGINT PRIMARY KEY,
@@ -401,6 +406,30 @@ def create_tables():
             removed_at TEXT
         )
         """)
+
+        # Feature: Invite & Earn. chat_id is deliberately NOT unique/primary -
+        # the same chat_id can accumulate multiple rows over time (e.g. one
+        # 'failed' attempt followed by a later 'pending' or 'rewarded' one).
+        # The only permanent gate is a chat_id that already has a 'rewarded'
+        # row - see create_pending_invite_reward()/create_rewarded_invite_direct()
+        # below, which both enforce that gate atomically in a single INSERT.
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS invite_rewards (
+            id BIGSERIAL PRIMARY KEY,
+            chat_id BIGINT NOT NULL,
+            group_title TEXT,
+            inviter_id BIGINT NOT NULL,
+            inviter_name TEXT,
+            member_count_at_add INTEGER,
+            added_at TEXT,
+            status TEXT DEFAULT 'pending',
+            amount_paid INTEGER,
+            rewarded_at TEXT
+        )
+        """)
+
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_invite_rewards_chat ON invite_rewards (chat_id, status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_invite_rewards_inviter ON invite_rewards (inviter_id, status)")
 
         conn.commit()
     finally:
@@ -1148,9 +1177,13 @@ def register_group(chat_id, title, username=None, invite_link=None, added_by_id=
     try:
         cursor = conn.cursor()
         now = datetime.now().isoformat()
+        # current_stint_started_at is set to now() on EVERY call (both the
+        # initial insert and the ON CONFLICT re-add path), so it always
+        # reflects when the bot's CURRENT continuous membership began - unlike
+        # first_seen, which is only ever set once, on the very first insert.
         cursor.execute("""
-            INSERT INTO groups (chat_id, title, first_seen, last_active, username, invite_link, added_by_id, added_by_name)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO groups (chat_id, title, first_seen, last_active, username, invite_link, added_by_id, added_by_name, current_stint_started_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (chat_id) DO UPDATE SET
                 title=EXCLUDED.title,
                 last_active=EXCLUDED.last_active,
@@ -1158,8 +1191,9 @@ def register_group(chat_id, title, username=None, invite_link=None, added_by_id=
                 username=COALESCE(EXCLUDED.username, groups.username),
                 invite_link=COALESCE(EXCLUDED.invite_link, groups.invite_link),
                 added_by_id=COALESCE(EXCLUDED.added_by_id, groups.added_by_id),
-                added_by_name=COALESCE(EXCLUDED.added_by_name, groups.added_by_name)
-        """, (chat_id, title, now, now, username, invite_link, added_by_id, added_by_name))
+                added_by_name=COALESCE(EXCLUDED.added_by_name, groups.added_by_name),
+                current_stint_started_at=EXCLUDED.current_stint_started_at
+        """, (chat_id, title, now, now, username, invite_link, added_by_id, added_by_name, now))
         conn.commit()
     finally:
         conn.close()
@@ -2624,5 +2658,264 @@ def scramble_get_global_earned(user_id):
         cursor.execute("SELECT earned FROM scramble_global_stats WHERE user_id=%s", (user_id,))
         row = cursor.fetchone()
         return row[0] if row else 0
+    finally:
+        conn.close()
+
+# --- Invite & Earn feature ---------------------------------------------
+# Add the bot to a 200+ member group and keep it there 72 hours for a
+# configurable Word Scramble reward. See main.py's on_bot_membership_change,
+# start(), /claim, /invitereward and the "Invite & Earn" menu for the flow
+# these functions support.
+
+def has_rewarded_invite(chat_id) -> bool:
+    """True if this chat_id already has a 'rewarded' row - the one permanent
+    gate that blocks it from ever earning the invite reward again."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT 1 FROM invite_rewards WHERE chat_id=%s AND status='rewarded' LIMIT 1",
+            (chat_id,)
+        )
+        return cursor.fetchone() is not None
+    finally:
+        conn.close()
+
+
+def create_pending_invite_reward(chat_id, group_title, inviter_id, inviter_name, member_count_at_add):
+    """Creates a new 'pending' invite_rewards row for a fresh, qualifying add -
+    UNLESS this chat_id already has a 'rewarded' row (permanent gate) or
+    already has another still-'pending' row (duplicate-fire guard). Both
+    checks and the insert happen in one atomic statement. Returns the new
+    row's id, or None if nothing was inserted (either gate blocked it)."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        now = datetime.now().isoformat()
+        cursor.execute("""
+            INSERT INTO invite_rewards (chat_id, group_title, inviter_id, inviter_name, member_count_at_add, added_at, status)
+            SELECT %s, %s, %s, %s, %s, %s, 'pending'
+            WHERE NOT EXISTS (
+                SELECT 1 FROM invite_rewards WHERE chat_id=%s AND status IN ('rewarded', 'pending')
+            )
+            RETURNING id
+        """, (chat_id, group_title, inviter_id, inviter_name, member_count_at_add, now, chat_id))
+        row = cursor.fetchone()
+        conn.commit()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def fail_pending_invite_reward_for_chat(chat_id):
+    """Immediately marks any still-pending invite_rewards row for this
+    chat_id as 'failed' (used when the bot is removed before the 72-hour
+    check ever fires). Returns the row's id (so its scheduled job can be
+    cancelled), or None if there was nothing pending."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE invite_rewards SET status='failed'
+            WHERE chat_id=%s AND status='pending'
+            RETURNING id
+        """, (chat_id,))
+        row = cursor.fetchone()
+        conn.commit()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def get_invite_reward(row_id):
+    """Returns (id, chat_id, group_title, inviter_id, inviter_name,
+    member_count_at_add, added_at, status, amount_paid, rewarded_at) or None."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, chat_id, group_title, inviter_id, inviter_name,
+                   member_count_at_add, added_at, status, amount_paid, rewarded_at
+            FROM invite_rewards WHERE id=%s
+        """, (row_id,))
+        return cursor.fetchone()
+    finally:
+        conn.close()
+
+
+def mark_invite_reward_failed_by_id(row_id):
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE invite_rewards SET status='failed' WHERE id=%s AND status='pending'",
+            (row_id,)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def mark_invite_reward_rewarded_by_id(row_id, amount_paid):
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        now = datetime.now().isoformat()
+        cursor.execute("""
+            UPDATE invite_rewards
+            SET status='rewarded', amount_paid=%s, rewarded_at=%s
+            WHERE id=%s AND status='pending'
+        """, (amount_paid, now, row_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def update_invite_reward_inviter(row_id, inviter_id, inviter_name):
+    """Referral attribution override (point 5) - only ever touches a row
+    that's still 'pending', so it can never reattribute an already-resolved
+    (rewarded/failed) row."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE invite_rewards SET inviter_id=%s, inviter_name=%s
+            WHERE id=%s AND status='pending'
+        """, (inviter_id, inviter_name, row_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_recent_pending_invite_reward_for_chat(chat_id, max_age_seconds=180):
+    """Most recently-created still-pending invite_rewards row for this
+    chat_id, but only if it was created within the last max_age_seconds -
+    so a stray /start invite_<id> relay can never reattribute an old,
+    unrelated pending row. Returns the row id, or None."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, added_at FROM invite_rewards
+            WHERE chat_id=%s AND status='pending'
+            ORDER BY id DESC LIMIT 1
+        """, (chat_id,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        row_id, added_at = row
+        try:
+            added_dt = datetime.fromisoformat(added_at)
+        except (TypeError, ValueError):
+            return None
+        if (datetime.now() - added_dt).total_seconds() > max_age_seconds:
+            return None
+        return row_id
+    finally:
+        conn.close()
+
+
+def get_all_pending_invite_reward_ids_with_time():
+    """(id, chat_id, added_at) for every still-'pending' row - used on
+    startup to reschedule (or immediately run) each one's 72-hour payout
+    check, mirroring restore_stale_scramble_rounds/_slowmode_waits/_word_games."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, chat_id, added_at FROM invite_rewards WHERE status='pending'")
+        return cursor.fetchall()
+    finally:
+        conn.close()
+
+
+def get_user_invite_rewards(user_id):
+    """Returns (claimed, pending) for the 'My Invites' view, where claimed is
+    a list of (group_title, amount_paid) and pending is a list of
+    (group_title,) - both newest first."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT group_title, amount_paid FROM invite_rewards
+            WHERE inviter_id=%s AND status='rewarded'
+            ORDER BY rewarded_at DESC
+        """, (user_id,))
+        claimed = cursor.fetchall()
+        cursor.execute("""
+            SELECT group_title FROM invite_rewards
+            WHERE inviter_id=%s AND status='pending'
+            ORDER BY added_at DESC
+        """, (user_id,))
+        pending = cursor.fetchall()
+        return claimed, pending
+    finally:
+        conn.close()
+
+
+def is_group_currently_present(chat_id) -> bool:
+    """True if the bot is currently (still) in this group, i.e. groups.left_at
+    IS NULL for it. False if it's never been seen at all, or has left."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT left_at FROM groups WHERE chat_id=%s", (chat_id,))
+        row = cursor.fetchone()
+        return bool(row) and row[0] is None
+    finally:
+        conn.close()
+
+
+def get_group_current_stint(chat_id):
+    """Returns (title, current_stint_started_at, left_at) for /claim's
+    72-hour-since-current-stint check, or None if the group has never been seen."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT title, current_stint_started_at, left_at FROM groups WHERE chat_id=%s",
+            (chat_id,)
+        )
+        return cursor.fetchone()
+    finally:
+        conn.close()
+
+
+def count_invite_rewards_for_chat(chat_id) -> int:
+    """/claim is only for a chat_id with ZERO invite_rewards rows at all -
+    any row (pending OR rewarded OR failed) means it's already been handled
+    automatically at some point, or already paid."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM invite_rewards WHERE chat_id=%s", (chat_id,))
+        return cursor.fetchone()[0]
+    finally:
+        conn.close()
+
+
+def create_rewarded_invite_direct(chat_id, group_title, user_id, user_name, member_count, added_at_iso, amount, rewarded_at_iso):
+    """/claim's manual-fallback payout: creates a row that's ALREADY
+    'rewarded' directly, but only if this chat_id truly has zero rows at
+    all - checked and inserted atomically in one statement so two players
+    racing to run /claim in the same group can't both succeed. Returns the
+    new row's id, or None if another row already existed (already handled
+    automatically, already paid, or another /claim beat this one to it)."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO invite_rewards
+                (chat_id, group_title, inviter_id, inviter_name, member_count_at_add,
+                 added_at, status, amount_paid, rewarded_at)
+            SELECT %s, %s, %s, %s, %s, %s, 'rewarded', %s, %s
+            WHERE NOT EXISTS (
+                SELECT 1 FROM invite_rewards WHERE chat_id=%s
+            )
+            RETURNING id
+        """, (chat_id, group_title, user_id, user_name, member_count,
+              added_at_iso, amount, rewarded_at_iso, chat_id))
+        row = cursor.fetchone()
+        conn.commit()
+        return row[0] if row else None
     finally:
         conn.close()

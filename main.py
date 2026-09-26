@@ -63,6 +63,12 @@ START_TIME = datetime.now()
 
 DEFAULT_REWARDS = {"win": 1, "cheat": -1}
 
+# --- Invite & Earn feature ---------------------------------------------
+INVITE_REWARD_MIN_MEMBERS = 200
+INVITE_REWARD_HOURS = 72
+INVITE_REWARD_SECONDS = INVITE_REWARD_HOURS * 3600
+DEFAULT_INVITE_REWARD_AMOUNT = 1000
+
 
 def is_owner(user_id) -> bool:
     return user_id == OWNER_ID
@@ -108,6 +114,17 @@ def get_reward(kind: str) -> int:
         return int(val)
     except ValueError:
         return DEFAULT_REWARDS[kind]
+
+
+async def get_invite_reward_amount() -> int:
+    """Live invite_reward_amount config value (default 1000) - always read
+    fresh at the moment it's needed for display or payout, never hardcoded
+    or cached, per the Invite & Earn spec."""
+    val = await asyncio.to_thread(db.get_config, "invite_reward_amount", str(DEFAULT_INVITE_REWARD_AMOUNT))
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return DEFAULT_INVITE_REWARD_AMOUNT
 
 
 def format_uptime(delta) -> str:
@@ -1508,6 +1525,9 @@ async def scrambleallcommands_command(update: Update, context: ContextTypes.DEFA
 /ranks - the full rank/level ladder and what balance unlocks each one (shared with Word Game)
 /scrambletopplayers - top 15, this chat or global
 /scrambletopgroups - the most active groups
+/inviteandearn - add me to a 200+ member group and keep me there 72 hours for a Word Scramble reward
+/claim - manual fallback to claim the Invite &amp; Earn reward for a qualifying group that was never automatically tracked
+/profile - view your own profile (balance, level, rank)
 
 <b>🛡️ Group Admin Commands</b>
 /scramblestopgame - group admins (or the owner) can stop an active round instantly
@@ -1529,6 +1549,7 @@ async def scrambleallcommands_command(update: Update, context: ContextTypes.DEFA
 /scrambleusers - every player who's used the command or guessed a word, tappable for details
 /showlevel on|off - bot owner or Bot Admins: toggle the Level/Rank badge on Word Scramble winner messages (global, no args shows current status)
 /showmedal on|off - bot owner or Bot Admins: toggle the 🥇🥈🥉 medal prefix on Word Scramble messages (global, no args shows current status)
+/invitereward &lt;amount&gt; - owner only: set the Invite &amp; Earn reward amount (no args shows the current amount, default 💵1000)
 /scrambleallcommands - this list
 
 <i>Note: Word Scramble intentionally has no /scramblebanuser, /scramblebroadcast, /scrambleshare, or /scrambleadmins - banning, broadcasting, and bot-admin management are bot-wide systems shared with the Word Game, so /banuser, /broadcast, /share, and /addadmin already cover Word Scramble too. There's also no daily-reward feature specific to Word Scramble - the 🎁 Daily Reward always credits the Word Game balance, and every player's displayed Balance/Level/Rank on /start combines both games automatically. This list and /allcommands are visible to the bot owner, Bot Admins, and each group's own Telegram creator.</i>
@@ -2330,11 +2351,236 @@ async def _notify_owner_group_event(context, kind, chat, actor, group_link):
         logger.error(f"Failed to notify owner of group {kind}: {e}")
 
 
+# --- Invite & Earn: job scheduling + payout processing ---------------------
+# Mirrors the restore_stale_scramble_rounds/_slowmode_waits/_word_games and
+# schedule_scramble_timeout/cancel_scramble_timeout patterns already used
+# elsewhere in this file, for both scheduling style and restart recovery.
+
+def _invite_reward_job_name(row_id):
+    return f"invite_reward_payout_{row_id}"
+
+
+def cancel_invite_reward_job(job_queue, row_id):
+    if job_queue is None:
+        return
+    for job in job_queue.get_jobs_by_name(_invite_reward_job_name(row_id)):
+        job.schedule_removal()
+
+
+def schedule_invite_reward_payout(job_queue, row_id, delay_seconds):
+    if job_queue is None:
+        return
+    cancel_invite_reward_job(job_queue, row_id)
+    job_queue.run_once(
+        invite_reward_payout_callback,
+        max(delay_seconds, 1),
+        data=row_id,
+        name=_invite_reward_job_name(row_id),
+    )
+
+
+def restore_stale_invite_rewards(job_queue):
+    """Re-reads every still-pending invite_rewards row on startup and either
+    reschedules the remaining time until its 72-hour check, or - if that
+    window already elapsed while the bot was down - runs the payout check
+    almost immediately (mirrors restore_stale_scramble_rounds' `remaining=1`
+    catch-up pattern)."""
+    if job_queue is None:
+        return
+
+    now = datetime.now()
+
+    for row_id, chat_id, added_at in db.get_all_pending_invite_reward_ids_with_time():
+        remaining = INVITE_REWARD_SECONDS
+        try:
+            added_dt = datetime.fromisoformat(added_at)
+            remaining = INVITE_REWARD_SECONDS - (now - added_dt).total_seconds()
+        except (TypeError, ValueError):
+            remaining = INVITE_REWARD_SECONDS
+
+        if remaining <= 0:
+            remaining = 1
+
+        job_queue.run_once(
+            invite_reward_payout_callback,
+            remaining,
+            data=row_id,
+            name=_invite_reward_job_name(row_id),
+        )
+
+
+def build_invite_claim_message(inviter_id, inviter_name, group_title, amount, new_balance) -> str:
+    mention = f'<b><a href="tg://user?id={inviter_id}">{esc_name(inviter_name)}</a></b>'
+    return (
+        f"🎉 {mention}! Your invite to <b>{esc(group_title)}</b> just paid off — "
+        f"{DOLLAR}{amount} has been added. Your new balance: {DOLLAR}{new_balance}."
+    )
+
+
+async def send_invite_claim_message(context, inviter_id, inviter_name, group_title, amount, new_balance):
+    text = build_invite_claim_message(inviter_id, inviter_name, group_title, amount, new_balance)
+    try:
+        await context.bot.send_message(chat_id=inviter_id, text=text, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Invite & Earn: failed to DM claim message to {inviter_id}: {e}")
+
+
+async def _run_invite_reward_payout(context: ContextTypes.DEFAULT_TYPE, row_id):
+    """The actual payout check - shared by both the 72-hour job and the
+    startup catch-up pass. Re-verifies BOTH that the bot is still in the
+    group AND that the member count is still ≥200 right now (never trusts
+    the count captured at add-time)."""
+    row = await asyncio.to_thread(db.get_invite_reward, row_id)
+    if not row:
+        return
+
+    (_id, chat_id, group_title, inviter_id, inviter_name,
+     _member_count_at_add, _added_at, status, _amount_paid, _rewarded_at) = row
+
+    if status != "pending":
+        return
+
+    still_present = await asyncio.to_thread(db.is_group_currently_present, chat_id)
+    if not still_present:
+        await asyncio.to_thread(db.mark_invite_reward_failed_by_id, row_id)
+        return
+
+    try:
+        member_count = await context.bot.get_chat_member_count(chat_id)
+    except Exception as e:
+        logger.warning(f"Invite & Earn: get_chat_member_count failed for {chat_id}: {e}")
+        member_count = None
+
+    if member_count is None or member_count < INVITE_REWARD_MIN_MEMBERS:
+        await asyncio.to_thread(db.mark_invite_reward_failed_by_id, row_id)
+        return
+
+    amount = await get_invite_reward_amount()
+    new_balance = await asyncio.to_thread(db.scramble_adjust_global_earned, inviter_id, inviter_name, amount)
+    await asyncio.to_thread(db.mark_invite_reward_rewarded_by_id, row_id, amount)
+
+    await send_invite_claim_message(context, inviter_id, inviter_name, group_title, amount, new_balance)
+
+
+async def invite_reward_payout_callback(context: ContextTypes.DEFAULT_TYPE):
+    row_id = context.job.data
+    await _run_invite_reward_payout(context, row_id)
+
+
+async def _retry_invite_attribution(context: ContextTypes.DEFAULT_TYPE):
+    """One-shot retry for the /start invite_<id> relay arriving into the
+    group before on_bot_membership_change had a chance to create the
+    pending row it needs to attach to."""
+    data = context.job.data
+    chat_id = data["chat_id"]
+    referred_id = data["referred_id"]
+
+    row_id = await asyncio.to_thread(db.get_recent_pending_invite_reward_for_chat, chat_id)
+    if not row_id:
+        return
+
+    referred_user = await asyncio.to_thread(db.get_user_by_id, referred_id)
+    referred_name = referred_user[1] if referred_user else str(referred_id)
+    await asyncio.to_thread(db.update_invite_reward_inviter, row_id, referred_id, referred_name)
+
+
+# --- Invite & Earn: "Copy your invite link" button revert -------------------
+
+def _invite_copy_revert_job_name(chat_id, message_id):
+    return f"invite_copy_revert_{chat_id}_{message_id}"
+
+
+def cancel_invite_copy_revert(job_queue, chat_id, message_id):
+    if job_queue is None:
+        return
+    for job in job_queue.get_jobs_by_name(_invite_copy_revert_job_name(chat_id, message_id)):
+        job.schedule_removal()
+
+
+def schedule_invite_copy_revert(job_queue, chat_id, message_id, user_id):
+    if job_queue is None:
+        return
+    cancel_invite_copy_revert(job_queue, chat_id, message_id)
+    job_queue.run_once(
+        _invite_copy_revert_callback,
+        20,
+        data={"chat_id": chat_id, "message_id": message_id, "user_id": user_id},
+        name=_invite_copy_revert_job_name(chat_id, message_id),
+    )
+
+
+async def _invite_copy_revert_callback(context: ContextTypes.DEFAULT_TYPE):
+    data = context.job.data
+    amount = await get_invite_reward_amount()
+    uname = _bot_username(context)
+    rows = _invite_earn_keyboard_rows(amount, uname, data["user_id"])
+    try:
+        await context.bot.edit_message_reply_markup(
+            chat_id=data["chat_id"],
+            message_id=data["message_id"],
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+    except Exception:
+        pass
+
+
+# --- Invite & Earn: menu ----------------------------------------------------
+
+def _invite_earn_keyboard_rows(amount, uname, user_id, copy_label="Copy your invite link 🔗"):
+    rows = []
+    if uname:
+        rows.append([InlineKeyboardButton(
+            f"➕ Add to a group to earn {DOLLAR}{amount}",
+            url=f"https://t.me/{uname}?startgroup=invite_{user_id}",
+        )])
+    rows.append([InlineKeyboardButton(copy_label, callback_data="invite_copy_link")])
+    rows.append([InlineKeyboardButton("My Invites", callback_data="invite_my_invites")])
+    rows.append([InlineKeyboardButton("How to Invite & Earn", callback_data="invite_how_to")])
+    rows.append([InlineKeyboardButton("⬅ Back", callback_data="home")])
+    return rows
+
+
+async def build_invite_earn_keyboard(context, user_id, copy_label="Copy your invite link 🔗"):
+    amount = await get_invite_reward_amount()
+    uname = _bot_username(context)
+    return InlineKeyboardMarkup(_invite_earn_keyboard_rows(amount, uname, user_id, copy_label))
+
+
+async def build_invite_earn_text() -> str:
+    amount = await get_invite_reward_amount()
+    return (
+        f"{DOLLAR} <b>Invite & Earn</b>\n\n"
+        f"Add me to a group with 200+ members and keep me there for a full "
+        f"72 hours, and you'll earn {DOLLAR}{amount} straight into your Word "
+        f"Scramble balance - once per group, credited to whoever's link "
+        f"actually did the inviting.\n\n"
+        f"Use the buttons below to grab your personal invite link, check "
+        f"your invites, or see exactly how it works."
+    )
+
+
+def invite_how_to_text(amount) -> str:
+    return (
+        "📖 <b>How to Invite & Earn</b>\n\n"
+        "1️⃣ Already an admin somewhere with 200+ members? Tap \"Add to a "
+        "group\" above - Telegram will show you a picker of eligible groups, "
+        "and you're automatically credited as soon as it's added.\n\n"
+        "2️⃣ Not an admin anywhere yourself? Tap \"Copy your invite link\" and "
+        "send it to someone who IS a group admin. As long as they add me "
+        "using YOUR link, you get the reward, not them - Telegram just shows "
+        "them the group picker, it doesn't matter whose finger does the "
+        "tapping.\n\n"
+        f"Either way, keep the group above 200 members and don't let me get "
+        f"removed - after 72 straight hours, {DOLLAR}{amount} lands in your "
+        f"Word Scramble balance automatically, no need to ask."
+    )
+
+
 def main_menu():
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("🎮 Play Game", callback_data="play"),
-            InlineKeyboardButton("👤 Profile", callback_data="profile"),
+            InlineKeyboardButton(f"{DOLLAR} Invite & Earn", callback_data="invite_earn"),
         ],
         [
             InlineKeyboardButton("🏆 Leaderboard", callback_data="leaderboard"),
@@ -2358,6 +2604,32 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.args:
         first_arg = context.args[0]
+        chat = update.effective_chat
+
+        # Invite & Earn referral attribution (point 5) - check chat type
+        # FIRST, before any of the private-chat-only branches below, since
+        # this is the /start invite_<id> relay Telegram posts into a group
+        # right after it's added via a player's ?startgroup=invite_<id> link.
+        # The literal "invite_" prefix can never collide with "adclick_" or
+        # the bare-digit profile-view fallback further down.
+        if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP) and re.fullmatch(r"invite_\d+", first_arg):
+            referred_id = int(first_arg.split("_", 1)[1])
+
+            row_id = await asyncio.to_thread(db.get_recent_pending_invite_reward_for_chat, chat.id)
+            if row_id:
+                referred_user = await asyncio.to_thread(db.get_user_by_id, referred_id)
+                referred_name = referred_user[1] if referred_user else str(referred_id)
+                await asyncio.to_thread(db.update_invite_reward_inviter, row_id, referred_id, referred_name)
+            elif context.job_queue is not None:
+                # my_chat_member may not have created the pending row yet -
+                # retry once, a few seconds later, rather than giving up.
+                context.job_queue.run_once(
+                    _retry_invite_attribution,
+                    5,
+                    data={"chat_id": chat.id, "referred_id": referred_id},
+                    name=f"invite_attrib_retry_{chat.id}_{referred_id}",
+                )
+            return
 
         if first_arg.startswith("adclick_"):
             try:
@@ -2783,6 +3055,69 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML",
             reply_markup=scramble_topplayers_keyboard(),
             link_preview_options=LinkPreviewOptions(is_disabled=True),
+        )
+        return
+
+    if query.data == "invite_earn":
+        await query.answer()
+        text = await build_invite_earn_text()
+        keyboard = await build_invite_earn_keyboard(context, user.id)
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+        return
+
+    if query.data == "invite_copy_link":
+        uname = _bot_username(context)
+        if not uname:
+            await query.answer(
+                "⚠️ Couldn't build your invite link right now - try again shortly.",
+                show_alert=True,
+            )
+            return
+
+        link = f"https://t.me/{uname}?startgroup=invite_{user.id}"
+
+        try:
+            await context.bot.send_message(chat_id=user.id, text=link)
+        except Forbidden:
+            await query.answer(
+                "⚠️ Please start a DM with me first, then try again.", show_alert=True
+            )
+            return
+
+        await query.answer()
+        copied_keyboard = await build_invite_earn_keyboard(context, user.id, copy_label="✅ Copied")
+        await query.edit_message_reply_markup(reply_markup=copied_keyboard)
+        schedule_invite_copy_revert(context.job_queue, chat.id, query.message.message_id, user.id)
+        return
+
+    if query.data == "invite_my_invites":
+        await query.answer()
+        claimed, pending = await asyncio.to_thread(db.get_user_invite_rewards, user.id)
+
+        lines = [f"{DOLLAR} <b>My Invites</b>\n", "<b>Claimed</b>"]
+        if claimed:
+            for group_title, amount_paid in claimed:
+                lines.append(f"• {esc(group_title)} — {DOLLAR}{amount_paid}")
+        else:
+            lines.append("— none yet —")
+
+        lines.append("\n<b>Pending</b>")
+        if pending:
+            for (group_title,) in pending:
+                lines.append(f"• {esc(group_title)} — — —")
+        else:
+            lines.append("— none —")
+
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="invite_earn")]])
+        await query.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=keyboard)
+        return
+
+    if query.data == "invite_how_to":
+        await query.answer()
+        amount = await get_invite_reward_amount()
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="invite_earn")]])
+        await query.edit_message_text(
+            invite_how_to_text(amount), parse_mode="HTML", reply_markup=keyboard
         )
         return
 
@@ -3971,6 +4306,44 @@ async def on_bot_membership_change(update: Update, context: ContextTypes.DEFAULT
                     logger.error(f"Failed to send group join prompt: {e}")
 
             await _notify_owner_group_event(context, "added", chat, actor, group_link)
+
+            # Invite & Earn (point 4) - this is the ONLY place that creates
+            # invite_rewards rows. Skip entirely for bot actors.
+            if actor and not actor.is_bot:
+                already_rewarded = await asyncio.to_thread(db.has_rewarded_invite, chat.id)
+                if not already_rewarded:
+                    try:
+                        member_count = await context.bot.get_chat_member_count(chat.id)
+                    except Exception as e:
+                        logger.warning(f"Invite & Earn: get_chat_member_count failed for {chat.id}: {e}")
+                        member_count = None
+
+                    if member_count is not None:
+                        if member_count >= INVITE_REWARD_MIN_MEMBERS:
+                            new_id = await asyncio.to_thread(
+                                db.create_pending_invite_reward,
+                                chat.id,
+                                chat.title or str(chat.id),
+                                actor.id,
+                                actor.first_name,
+                                member_count,
+                            )
+                            if new_id:
+                                schedule_invite_reward_payout(
+                                    context.job_queue, new_id, INVITE_REWARD_SECONDS
+                                )
+                        else:
+                            try:
+                                await context.bot.send_message(
+                                    chat_id=chat.id,
+                                    text=(
+                                        f"ℹ️ This group needs at least "
+                                        f"{INVITE_REWARD_MIN_MEMBERS} members to qualify for "
+                                        f"the Invite & Earn reward (currently {member_count})."
+                                    ),
+                                )
+                            except Exception:
+                                pass
         return
 
     if new_status in ("left", "kicked"):
@@ -3988,6 +4361,12 @@ async def on_bot_membership_change(update: Update, context: ContextTypes.DEFAULT
 
         if not stored_link and getattr(chat, "username", None):
             stored_link = f"https://t.me/{chat.username}"
+
+        # Invite & Earn (point 4) - don't wait for the 72-hour check to
+        # discover the group already left; fail it and cancel the job now.
+        failed_id = await asyncio.to_thread(db.fail_pending_invite_reward_for_chat, chat.id)
+        if failed_id:
+            cancel_invite_reward_job(context.job_queue, failed_id)
 
         await asyncio.to_thread(
             db.mark_group_left,
@@ -5648,6 +6027,135 @@ async def allcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 @owner_only
+async def invitereward_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        current = await get_invite_reward_amount()
+        await update.message.reply_text(f"{DOLLAR} Current Invite & Earn reward: {DOLLAR}{current}")
+        return
+
+    try:
+        amount = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Usage: /invitereward <amount> - a plain integer.")
+        return
+
+    if amount < 0:
+        await update.message.reply_text("❌ Amount must be zero or positive.")
+        return
+
+    await asyncio.to_thread(db.set_config, "invite_reward_amount", str(amount))
+    await update.message.reply_text(f"✅ Invite & Earn reward set to {DOLLAR}{amount}.")
+
+
+async def claim_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if chat.type == ChatType.PRIVATE:
+        await update.message.reply_text(
+            "📍 Run /claim inside the group you want to claim the Invite & Earn reward for."
+        )
+        return
+
+    existing_count = await asyncio.to_thread(db.count_invite_rewards_for_chat, chat.id)
+    if existing_count > 0:
+        await update.message.reply_text(
+            "ℹ️ This group is already being tracked for Invite & Earn (or has already been "
+            "paid), so /claim doesn't apply here."
+        )
+        return
+
+    stint_info = await asyncio.to_thread(db.get_group_current_stint, chat.id)
+    if not stint_info or not stint_info[1]:
+        await update.message.reply_text(
+            "⚠️ I couldn't find how long I've been in this group yet - try again shortly."
+        )
+        return
+
+    title, stint_started_at, _left_at = stint_info
+    try:
+        started_dt = datetime.fromisoformat(stint_started_at)
+    except (TypeError, ValueError):
+        started_dt = datetime.now()
+
+    remaining_seconds = INVITE_REWARD_SECONDS - (datetime.now() - started_dt).total_seconds()
+    if remaining_seconds > 0:
+        await update.message.reply_text(
+            f"⏳ Not quite yet - I need to be in this group for a full "
+            f"{INVITE_REWARD_HOURS} hours before /claim works here. "
+            f"About {_format_duration_words(int(remaining_seconds))} left."
+        )
+        return
+
+    try:
+        member_count = await context.bot.get_chat_member_count(chat.id)
+    except Exception:
+        await update.message.reply_text("⚠️ Couldn't check the member count right now - try again in a moment.")
+        return
+
+    if member_count < INVITE_REWARD_MIN_MEMBERS:
+        await update.message.reply_text(
+            f"👥 This group needs at least {INVITE_REWARD_MIN_MEMBERS} members to qualify "
+            f"(currently {member_count})."
+        )
+        return
+
+    amount = await get_invite_reward_amount()
+    now_iso = datetime.now().isoformat()
+
+    new_id = await asyncio.to_thread(
+        db.create_rewarded_invite_direct,
+        chat.id,
+        chat.title or title or str(chat.id),
+        user.id,
+        user.first_name,
+        member_count,
+        stint_started_at,
+        amount,
+        now_iso,
+    )
+
+    if not new_id:
+        await update.message.reply_text(
+            "ℹ️ Someone already claimed the Invite & Earn reward for this group."
+        )
+        return
+
+    new_balance = await asyncio.to_thread(db.scramble_adjust_global_earned, user.id, user.first_name, amount)
+    await send_invite_claim_message(
+        context, user.id, user.first_name, chat.title or title or str(chat.id), amount, new_balance
+    )
+    await update.message.reply_text("✅ Reward claimed - check your DM with me!")
+
+
+async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    player = await asyncio.to_thread(db.get_user, user.id)
+    if not player:
+        await asyncio.to_thread(db.add_user, user.id, user.first_name)
+        player = await asyncio.to_thread(db.get_user, user.id)
+
+    await update.message.reply_html(f"""
+👤 <b>Your Profile</b>
+
+🆔 User ID: <code>{player[0]}</code>
+
+👤 Name: {esc_name(player[1])}
+
+💵 Balance: {player[2]}
+⭐ Level: {player[3]}
+🏅 Rank: {player[4]}
+""")
+
+
+async def inviteandearn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    text = await build_invite_earn_text()
+    keyboard = await build_invite_earn_keyboard(context, user.id)
+    await update.message.reply_html(text, reply_markup=keyboard)
+
+
+@owner_only
 async def claimeddailyreward_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args:
         date_str = context.args[0]
@@ -5844,6 +6352,12 @@ def main():
     app.add_handler(CommandHandler("sponsoredad", sponsoredad_command))
     app.add_handler(CommandHandler("changesponsoredad", changesponsoredad_command))
 
+    # --- Invite & Earn -------------------------------------------------
+    app.add_handler(CommandHandler("invitereward", invitereward_command))
+    app.add_handler(CommandHandler("claim", claim_command))
+    app.add_handler(CommandHandler("profile", profile_command))
+    app.add_handler(CommandHandler("inviteandearn", inviteandearn_command))
+
     app.add_handler(CallbackQueryHandler(button))
 
     app.add_handler(MessageHandler(
@@ -5869,6 +6383,7 @@ def main():
         restore_stale_slowmode_waits(app.job_queue)
         restore_stale_word_games(app.job_queue)
         restore_autodelete_jobs(app.job_queue)
+        restore_stale_invite_rewards(app.job_queue)
 
         if db.get_config("scramble_mode_enabled", "0") == "1":
             try:
