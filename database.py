@@ -462,6 +462,10 @@ def create_tables():
         """)
         cursor.execute("ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS lobby_message_id BIGINT")
         cursor.execute("ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS lobby_extra_seconds INTEGER DEFAULT 0")
+        # Pause support: when a tournament was paused, and when the last round
+        # ended (so a restart can tell "idle between rounds" from "just now").
+        cursor.execute("ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS paused_at TEXT")
+        cursor.execute("ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS idle_since TEXT")
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS tournament_players (
             id BIGSERIAL PRIMARY KEY,
@@ -474,9 +478,20 @@ def create_tables():
         """)
         # Hard guarantees behind the app-level checks: one open tournament per
         # chat, and one row per player per tournament.
+        # 'paused' counts as open too. The index is only dropped when the
+        # live one doesn't already mention 'paused' (so this is a no-op on
+        # every boot after the first), and drop + create happen in the same
+        # transaction, so there is never a moment without the guarantee.
+        cursor.execute(
+            "SELECT indexdef FROM pg_indexes "
+            "WHERE indexname = 'idx_tournaments_one_open_per_chat'"
+        )
+        _idx_row = cursor.fetchone()
+        if _idx_row and "paused" not in (_idx_row[0] or ""):
+            cursor.execute("DROP INDEX IF EXISTS idx_tournaments_one_open_per_chat")
         cursor.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_tournaments_one_open_per_chat "
-            "ON tournaments (chat_id) WHERE status IN ('lobby', 'active')"
+            "ON tournaments (chat_id) WHERE status IN ('lobby', 'active', 'paused')"
         )
         cursor.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_tournament_players_unique "
@@ -502,6 +517,73 @@ def create_tables():
         )
         """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_invite_rewards_inviter ON invite_rewards (inviter_id, status)")
+
+        # One row per Stars charge for /buydollar, so a redelivered
+        # successful_payment can never credit coins twice.
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS dollar_purchases (
+            charge_id TEXT PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            coins BIGINT,
+            stars INTEGER,
+            paid_at TEXT
+        )
+        """)
+
+        # ---- Stage 3: transfers / requests --------------------------------
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS balance_transfers (
+            id BIGSERIAL PRIMARY KEY,
+            kind TEXT,
+            from_id BIGINT,
+            to_id BIGINT,
+            amount BIGINT,
+            chat_id BIGINT,
+            created_at TEXT
+        )
+        """)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS money_requests (
+            id BIGSERIAL PRIMARY KEY,
+            chat_id BIGINT,
+            message_id BIGINT,
+            requester_id BIGINT NOT NULL,
+            requester_name TEXT,
+            target_id BIGINT NOT NULL,
+            target_name TEXT,
+            amount BIGINT NOT NULL,
+            status TEXT DEFAULT 'pending',
+            created_at TEXT,
+            resolved_at TEXT
+        )
+        """)
+        # Hard guarantee behind the app-level check: one pending request per
+        # requester -> target pair.
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_money_requests_pending_pair "
+            "ON money_requests (requester_id, target_id) WHERE status = 'pending'"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_money_requests_requester "
+            "ON money_requests (requester_id, status)"
+        )
+        # Per-group /deleterequestprompt setting (same shape as scramble_slowmode:
+        # one row per chat, upserted). No row = default (ON, 30s). 0 = off.
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS request_prompt_settings (
+            chat_id BIGINT PRIMARY KEY,
+            delete_seconds INTEGER
+        )
+        """)
+        # Individually scheduled message deletions that must survive a restart.
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS scheduled_deletions (
+            chat_id BIGINT NOT NULL,
+            message_id BIGINT NOT NULL,
+            delete_at TEXT,
+            PRIMARY KEY (chat_id, message_id)
+        )
+        """)
 
         conn.commit()
     finally:
@@ -1702,7 +1784,7 @@ def is_tournament_banned(target_type, target_id):
 _TOURNAMENT_COLS = (
     "id, chat_id, host_id, fee, difficulty, total_rounds, current_round, status, "
     "current_word, current_scrambled, round_started_at, created_at, lobby_message_id, "
-    "lobby_extra_seconds"
+    "lobby_extra_seconds, paused_at, idle_since"
 )
 _TOURNAMENT_KEYS = [c.strip() for c in _TOURNAMENT_COLS.split(",")]
 
@@ -1770,7 +1852,7 @@ def tournament_create(chat_id, host_id, host_name, fee, difficulty, total_rounds
                                          current_round, status, created_at)
                 SELECT %s, %s, %s, %s, %s, 0, 'lobby', %s
                 WHERE NOT EXISTS (
-                    SELECT 1 FROM tournaments WHERE chat_id=%s AND status IN ('lobby', 'active')
+                    SELECT 1 FROM tournaments WHERE chat_id=%s AND status IN ('lobby', 'active', 'paused')
                 )
                 RETURNING id
             """, (chat_id, host_id, fee, difficulty, total_rounds, datetime.now().isoformat(), chat_id))
@@ -1848,13 +1930,13 @@ def tournament_get(tournament_id):
 
 
 def tournament_get_open_for_chat(chat_id):
-    """The chat's lobby/active tournament (at most one), or None."""
+    """The chat's lobby/active/paused tournament (at most one), or None."""
     conn = connect()
     try:
         cursor = conn.cursor()
         cursor.execute(
             f"SELECT {_TOURNAMENT_COLS} FROM tournaments "
-            f"WHERE chat_id=%s AND status IN ('lobby', 'active')",
+            f"WHERE chat_id=%s AND status IN ('lobby', 'active', 'paused')",
             (chat_id,),
         )
         return _tournament_row(cursor.fetchone())
@@ -1867,7 +1949,7 @@ def tournament_get_all_open():
     try:
         cursor = conn.cursor()
         cursor.execute(
-            f"SELECT {_TOURNAMENT_COLS} FROM tournaments WHERE status IN ('lobby', 'active')"
+            f"SELECT {_TOURNAMENT_COLS} FROM tournaments WHERE status IN ('lobby', 'active', 'paused')"
         )
         return [_tournament_row(r) for r in cursor.fetchall()]
     finally:
@@ -1938,9 +2020,9 @@ def tournament_activate(tournament_id):
     try:
         cursor = conn.cursor()
         cursor.execute("""
-            UPDATE tournaments SET status='active', current_round=0
+            UPDATE tournaments SET status='active', current_round=0, idle_since=%s
             WHERE id=%s AND status='lobby' RETURNING id
-        """, (tournament_id,))
+        """, (datetime.now().isoformat(), tournament_id))
         ok = cursor.fetchone() is not None
         conn.commit()
         return ok
@@ -1976,9 +2058,9 @@ def tournament_unset_round(tournament_id, round_number):
         cursor.execute("""
             UPDATE tournaments
             SET current_word=NULL, current_scrambled=NULL, round_started_at=NULL,
-                current_round = current_round - 1
+                current_round = current_round - 1, idle_since=%s
             WHERE id=%s AND status='active' AND current_round=%s AND current_word IS NOT NULL
-        """, (tournament_id, round_number))
+        """, (datetime.now().isoformat(), tournament_id, round_number))
         conn.commit()
     finally:
         conn.close()
@@ -2000,10 +2082,11 @@ def tournament_claim_round(tournament_id, scorer_id=None, points=0):
                 FOR UPDATE
             )
             UPDATE tournaments t
-            SET current_word=NULL, current_scrambled=NULL, round_started_at=NULL
+            SET current_word=NULL, current_scrambled=NULL, round_started_at=NULL,
+                idle_since=%s
             FROM old WHERE t.id = old.id
             RETURNING old.current_word, t.current_round, t.total_rounds
-        """, (tournament_id,))
+        """, (tournament_id, datetime.now().isoformat()))
         row = cursor.fetchone()
         if not row:
             conn.rollback()
@@ -2108,7 +2191,7 @@ def tournament_settle(tournament_id):
 
 
 def tournament_abort(tournament_id, delete=False):
-    """Refunds every still-'staked' player and finalizes a lobby/active
+    """Refunds every still-'staked' player and finalizes a lobby/active/paused
     tournament (status 'finished', or the rows deleted when delete=True).
     One transaction, guarded per player by WHERE status='staked'.
     Returns {chat_id, fee, refunds: [(uid, name, fee, new_balance)]} or None
@@ -2122,7 +2205,7 @@ def tournament_abort(tournament_id, delete=False):
                 (tournament_id,),
             )
             trow = cursor.fetchone()
-            if not trow or trow[0] not in ("lobby", "active"):
+            if not trow or trow[0] not in ("lobby", "active", "paused"):
                 conn.rollback()
                 return None
             _status, fee, chat_id = trow
@@ -2151,6 +2234,462 @@ def tournament_abort(tournament_id, delete=False):
                 )
             conn.commit()
             return {"chat_id": chat_id, "fee": fee, "refunds": refunds}
+        except Exception:
+            conn.rollback()
+            raise
+    finally:
+        conn.close()
+
+
+def tournament_pause(tournament_id):
+    """active -> paused, exactly once. Keeps the word, round, scores and every
+    stake untouched. Returns True if THIS call paused it."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE tournaments SET status='paused', paused_at=%s
+            WHERE id=%s AND status='active' RETURNING id
+        """, (datetime.now().isoformat(), tournament_id))
+        ok = cursor.fetchone() is not None
+        conn.commit()
+        return ok
+    finally:
+        conn.close()
+
+
+def tournament_resume(tournament_id, stale_round_cutoff, idle_cutoff):
+    """Atomically resumes a tournament. Allowed when it is:
+      - 'paused', or
+      - 'active' but STUCK: a live round that started before stale_round_cutoff
+        (its deadline + grace has passed), or no live round and idle since
+        before idle_cutoff (or never recorded).
+    Sets status='active', clears paused_at and, if a round is live, restarts
+    its clock (round_started_at = now) WITHOUT touching the word, the round
+    number or any score. The row is locked, so two people running the command
+    at once cannot both resume it (the second sees a healthy, freshly-started
+    round and gets None).
+    Returns the tournament dict plus 'prev_status', or None."""
+    now = datetime.now().isoformat()
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                WITH old AS (
+                    SELECT id, status AS prev_status FROM tournaments
+                    WHERE id=%s AND (
+                        status='paused'
+                        OR (status='active' AND (
+                            (current_word IS NOT NULL AND
+                                (round_started_at IS NULL
+                                 OR round_started_at::timestamp < %s::timestamp))
+                            OR (current_word IS NULL AND
+                                (idle_since IS NULL
+                                 OR idle_since::timestamp < %s::timestamp))
+                        ))
+                    )
+                    FOR UPDATE
+                )
+                UPDATE tournaments t
+                SET status='active', paused_at=NULL,
+                    round_started_at = CASE WHEN t.current_word IS NOT NULL
+                                            THEN %s ELSE t.round_started_at END,
+                    idle_since = CASE WHEN t.current_word IS NULL
+                                      THEN %s ELSE t.idle_since END
+                FROM old WHERE t.id = old.id
+                RETURNING old.prev_status
+            """, (tournament_id, stale_round_cutoff, idle_cutoff, now, now))
+            row = cursor.fetchone()
+            if not row:
+                conn.rollback()
+                return None
+            prev_status = row[0]
+            cursor.execute(f"SELECT {_TOURNAMENT_COLS} FROM tournaments WHERE id=%s", (tournament_id,))
+            t = _tournament_row(cursor.fetchone())
+            conn.commit()
+            t["prev_status"] = prev_status
+            return t
+        except Exception:
+            conn.rollback()
+            raise
+    finally:
+        conn.close()
+
+
+# =======================================================================
+# /transfer, /request  (Word Scramble global balance only)
+# Every balance movement is ONE transaction together with the status change /
+# audit row that guards it. Balance rows are locked in ascending user_id order
+# so two opposite transfers can never deadlock each other.
+# =======================================================================
+
+_REQUEST_COLS = (
+    "id, chat_id, message_id, requester_id, requester_name, target_id, target_name, "
+    "amount, status, created_at, resolved_at"
+)
+_REQUEST_KEYS = [c.strip() for c in _REQUEST_COLS.split(",")]
+
+
+def _request_row(row):
+    return dict(zip(_REQUEST_KEYS, row)) if row else None
+
+
+def _tx_lock_balances(cursor, user_ids):
+    """Locks the existing balance rows for these users in a fixed order."""
+    cursor.execute(
+        "SELECT user_id FROM scramble_global_stats WHERE user_id = ANY(%s) "
+        "ORDER BY user_id FOR UPDATE",
+        (sorted(set(user_ids)),),
+    )
+    cursor.fetchall()
+
+
+def _tx_audit(cursor, kind, from_id, to_id, amount, chat_id):
+    cursor.execute("""
+        INSERT INTO balance_transfers (kind, from_id, to_id, amount, chat_id, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s)
+    """, (kind, from_id, to_id, amount, chat_id, datetime.now().isoformat()))
+
+
+def transfer_execute(from_id, from_name, to_id, to_name, amount, chat_id):
+    """Moves `amount` from one Word Scramble global balance to another in ONE
+    transaction: conditional deduct (never negative) + credit + audit row.
+    Returns ('ok', sender_new_balance, recipient_new_balance) or
+    ('insufficient', sender_current_balance, None)."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        try:
+            _tx_lock_balances(cursor, [from_id, to_id])
+            new_from = _tx_deduct(cursor, from_id, from_name, amount)
+            if new_from is None:
+                cursor.execute("SELECT earned FROM scramble_global_stats WHERE user_id=%s", (from_id,))
+                row = cursor.fetchone()
+                conn.rollback()
+                return "insufficient", (row[0] if row else 0), None
+            new_to = _tx_credit(cursor, to_id, to_name, amount)
+            _tx_audit(cursor, "transfer", from_id, to_id, amount, chat_id)
+            conn.commit()
+            return "ok", new_from, new_to
+        except Exception:
+            conn.rollback()
+            raise
+    finally:
+        conn.close()
+
+
+def request_create(chat_id, requester_id, requester_name, target_id, target_name, amount,
+                   cooldown_seconds, max_pending, expire_seconds):
+    """Creates a pending money request, enforcing the anti-harassment limits
+    inside one transaction (serialised per requester with an advisory lock).
+    Returns (status, value, swept) where status is:
+      'ok'       value = new request id
+      'cooldown' value = seconds left
+      'pair'     value = None   (already one pending request to that person)
+      'max'      value = None   (already at the pending-request limit)
+    `swept` = rows that were overdue-pending and got marked 'expired' on the
+    way (so the caller can update their prompts)."""
+    now = datetime.now()
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT pg_advisory_xact_lock(%s)", (requester_id,))
+
+            stale_cutoff = (now - timedelta(seconds=expire_seconds)).isoformat()
+            cursor.execute(f"""
+                UPDATE money_requests SET status='expired', resolved_at=%s
+                WHERE requester_id=%s AND status='pending' AND created_at < %s
+                RETURNING {_REQUEST_COLS}
+            """, (now.isoformat(), requester_id, stale_cutoff))
+            swept = [_request_row(r) for r in cursor.fetchall()]
+
+            cursor.execute("SELECT MAX(created_at) FROM money_requests WHERE requester_id=%s", (requester_id,))
+            last = cursor.fetchone()[0]
+            if last:
+                try:
+                    since = (now - datetime.fromisoformat(last)).total_seconds()
+                    if since < cooldown_seconds:
+                        conn.commit()  # keep the sweep
+                        return "cooldown", int(cooldown_seconds - since) + 1, swept
+                except (TypeError, ValueError):
+                    pass
+
+            cursor.execute("""
+                SELECT 1 FROM money_requests
+                WHERE requester_id=%s AND target_id=%s AND status='pending'
+            """, (requester_id, target_id))
+            if cursor.fetchone():
+                conn.commit()
+                return "pair", None, swept
+
+            cursor.execute(
+                "SELECT COUNT(*) FROM money_requests WHERE requester_id=%s AND status='pending'",
+                (requester_id,),
+            )
+            if cursor.fetchone()[0] >= max_pending:
+                conn.commit()
+                return "max", None, swept
+
+            cursor.execute("""
+                INSERT INTO money_requests (chat_id, requester_id, requester_name, target_id,
+                                            target_name, amount, status, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, 'pending', %s)
+                RETURNING id
+            """, (chat_id, requester_id, requester_name, target_id, target_name, amount, now.isoformat()))
+            rid = cursor.fetchone()[0]
+            conn.commit()
+            return "ok", rid, swept
+        except Exception as e:
+            conn.rollback()
+            if getattr(e, "pgcode", None) == "23505":  # racing duplicate hit the unique index
+                return "pair", None, []
+            raise
+    finally:
+        conn.close()
+
+
+def request_set_message(request_id, chat_id, message_id):
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE money_requests SET chat_id=%s, message_id=%s WHERE id=%s",
+            (chat_id, message_id, request_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def request_get(request_id):
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT {_REQUEST_COLS} FROM money_requests WHERE id=%s", (request_id,))
+        return _request_row(cursor.fetchone())
+    finally:
+        conn.close()
+
+
+def request_get_pending():
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT {_REQUEST_COLS} FROM money_requests WHERE status='pending'")
+        return [_request_row(r) for r in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+def request_expire(request_id):
+    """pending -> expired, exactly once. Returns the row, or None if it was
+    already resolved (paid/declined/expired). No money moves."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            UPDATE money_requests SET status='expired', resolved_at=%s
+            WHERE id=%s AND status='pending'
+            RETURNING {_REQUEST_COLS}
+        """, (datetime.now().isoformat(), request_id))
+        row = cursor.fetchone()
+        conn.commit()
+        return _request_row(row)
+    finally:
+        conn.close()
+
+
+def _request_lock(cursor, request_id):
+    cursor.execute(f"SELECT {_REQUEST_COLS} FROM money_requests WHERE id=%s FOR UPDATE", (request_id,))
+    return _request_row(cursor.fetchone())
+
+
+def _request_is_overdue(row, expire_seconds):
+    try:
+        return (datetime.now() - datetime.fromisoformat(row["created_at"])).total_seconds() >= expire_seconds
+    except (TypeError, ValueError):
+        return False
+
+
+def request_pay(request_id, actor_id, expire_seconds):
+    """The target pressed Yes. ONE transaction: lock the request row, make sure
+    it is still 'pending' (and not overdue), conditionally deduct from the
+    target, credit the requester, mark 'paid', write the audit row.
+    Returns (code, row, extra):
+      ('paid', row, (target_balance, requester_balance))
+      ('insufficient', row, target_balance)   - stays pending
+      ('expired', row, None)                  - marked expired now, no money moved
+      ('closed', row, None)                   - already paid/declined/expired
+      ('notyours', row, None) | ('gone', None, None)"""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        try:
+            row = _request_lock(cursor, request_id)
+            if not row:
+                conn.rollback()
+                return "gone", None, None
+            if row["target_id"] != actor_id:
+                conn.rollback()
+                return "notyours", row, None
+            if row["status"] != "pending":
+                conn.rollback()
+                return "closed", row, None
+            if _request_is_overdue(row, expire_seconds):
+                cursor.execute(
+                    "UPDATE money_requests SET status='expired', resolved_at=%s "
+                    "WHERE id=%s AND status='pending'",
+                    (datetime.now().isoformat(), request_id),
+                )
+                conn.commit()
+                row["status"] = "expired"
+                return "expired", row, None
+
+            _tx_lock_balances(cursor, [row["target_id"], row["requester_id"]])
+            target_bal = _tx_deduct(cursor, row["target_id"], row["target_name"], row["amount"])
+            if target_bal is None:
+                cursor.execute("SELECT earned FROM scramble_global_stats WHERE user_id=%s", (row["target_id"],))
+                brow = cursor.fetchone()
+                conn.rollback()
+                return "insufficient", row, (brow[0] if brow else 0)
+            req_bal = _tx_credit(cursor, row["requester_id"], row["requester_name"], row["amount"])
+            cursor.execute(
+                "UPDATE money_requests SET status='paid', resolved_at=%s "
+                "WHERE id=%s AND status='pending'",
+                (datetime.now().isoformat(), request_id),
+            )
+            if cursor.rowcount != 1:  # cannot happen under the row lock - belt and braces
+                conn.rollback()
+                return "closed", row, None
+            _tx_audit(cursor, "request", row["target_id"], row["requester_id"], row["amount"], row["chat_id"])
+            conn.commit()
+            row["status"] = "paid"
+            return "paid", row, (target_bal, req_bal)
+        except Exception:
+            conn.rollback()
+            raise
+    finally:
+        conn.close()
+
+
+def request_decline(request_id, actor_id, expire_seconds):
+    """The target pressed No. Returns (code, row): 'declined' | 'expired'
+    (was overdue, marked expired instead) | 'closed' | 'notyours' | 'gone'."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        try:
+            row = _request_lock(cursor, request_id)
+            if not row:
+                conn.rollback()
+                return "gone", None
+            if row["target_id"] != actor_id:
+                conn.rollback()
+                return "notyours", row
+            if row["status"] != "pending":
+                conn.rollback()
+                return "closed", row
+            new_status = "expired" if _request_is_overdue(row, expire_seconds) else "declined"
+            cursor.execute(
+                "UPDATE money_requests SET status=%s, resolved_at=%s WHERE id=%s AND status='pending'",
+                (new_status, datetime.now().isoformat(), request_id),
+            )
+            conn.commit()
+            row["status"] = new_status
+            return new_status, row
+        except Exception:
+            conn.rollback()
+            raise
+    finally:
+        conn.close()
+
+
+# ---- /deleterequestprompt setting + persisted single-message deletions ----
+
+def request_prompt_delete_get(chat_id, default_seconds):
+    """Seconds after which a resolved request prompt is deleted in this group
+    (0 = never). No row = default_seconds."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT delete_seconds FROM request_prompt_settings WHERE chat_id=%s", (chat_id,))
+        row = cursor.fetchone()
+        return default_seconds if not row or row[0] is None else row[0]
+    finally:
+        conn.close()
+
+
+def request_prompt_delete_set(chat_id, seconds):
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO request_prompt_settings (chat_id, delete_seconds) VALUES (%s, %s)
+            ON CONFLICT (chat_id) DO UPDATE SET delete_seconds=EXCLUDED.delete_seconds
+        """, (chat_id, seconds))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def scheduled_deletion_add(chat_id, message_id, delete_at_iso):
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO scheduled_deletions (chat_id, message_id, delete_at) VALUES (%s, %s, %s)
+            ON CONFLICT (chat_id, message_id) DO UPDATE SET delete_at=EXCLUDED.delete_at
+        """, (chat_id, message_id, delete_at_iso))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def scheduled_deletion_remove(chat_id, message_id):
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "DELETE FROM scheduled_deletions WHERE chat_id=%s AND message_id=%s", (chat_id, message_id)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def scheduled_deletion_get_all():
+    """Rows: (chat_id, message_id, delete_at)."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT chat_id, message_id, delete_at FROM scheduled_deletions")
+        return cursor.fetchall()
+    finally:
+        conn.close()
+
+
+def dollar_purchase_credit(charge_id, user_id, name, coins, stars):
+    """Idempotent /buydollar delivery. ONE transaction: record the Stars charge
+    (ON CONFLICT DO NOTHING) and credit `coins` to the buyer's Word Scramble
+    global balance. Returns the new balance, or None if this charge was already
+    applied (redelivered payment - nothing is credited the second time)."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                INSERT INTO dollar_purchases (charge_id, user_id, coins, stars, paid_at)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (charge_id) DO NOTHING
+            """, (charge_id, user_id, coins, stars, datetime.now().isoformat()))
+            if cursor.rowcount == 0:
+                conn.rollback()
+                return None
+            new_balance = _tx_credit(cursor, user_id, name, coins)
+            conn.commit()
+            return new_balance
         except Exception:
             conn.rollback()
             raise

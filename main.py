@@ -4,11 +4,13 @@ import math
 import random
 import re
 import asyncio
+import functools
+import json
 import logging
 import importlib
 import html as html_lib
 import urllib.parse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from collections import defaultdict
 
@@ -1117,10 +1119,14 @@ async def wordscramble_command(update: Update, context: ContextTypes.DEFAULT_TYP
             )
             return
 
-    if await asyncio.to_thread(db.tournament_get_open_for_chat, chat.id):
-        await update.message.reply_text(
-            "🏟️ A tournament is in progress here - Word Scramble rounds are paused until it ends."
-        )
+    _open_t = await asyncio.to_thread(db.tournament_get_open_for_chat, chat.id)
+    if _open_t:
+        if _open_t["status"] == "paused":
+            await update.message.reply_text(TOURNAMENT_PAUSED_BLOCK_TEXT)
+        else:
+            await update.message.reply_text(
+                "🏟️ A tournament is in progress here - Word Scramble rounds are paused until it ends."
+            )
         return
 
     user = update.effective_user
@@ -1672,6 +1678,9 @@ async def scrambleallcommands_command(update: Update, context: ContextTypes.DEFA
 /profile - view your own profile (balance, level, rank)
 /buypremium - premium doubles your 💵 Word Scramble and Word Game rewards (paid with Telegram Stars)
 /premiumstatus - see whether premium is active and how much time is left
+/buydollar - premium only: buy 💵 Word Scramble coins with Telegram Stars (pack sizes and prices are shown live)
+/transfer &lt;@username|id&gt; &lt;amount&gt; - premium only: send 💵 from your Word Scramble balance to another player (or reply to their message with /transfer &lt;amount&gt;)
+/request &lt;@username|id&gt; &lt;amount&gt; - premium only: ask another player for 💵; they get Yes/No buttons (or reply to their message with /request &lt;amount&gt;)
 /settournament &lt;fee&gt; &lt;difficulty&gt; &lt;rounds&gt;rounds - host a Word Scramble tournament in a group (e.g. /settournament 2000 Medium 3rounds); everyone pays the entry fee from their Word Scramble balance and the winner takes the pot
 /tournament - quick-start a tournament instantly: same as /settournament 5 easy 20rounds
 /join - join the tournament lobby that's open in this group
@@ -1680,6 +1689,7 @@ async def scrambleallcommands_command(update: Update, context: ContextTypes.DEFA
 /scramblestopgame - group admins (or the owner) can stop an active round instantly
 /scrambleautomaticmode on|off - group admins (or the owner) can manually control Automatic Mode here (blocked while Slow Mode is on in that chat). The bot never turns this on by itself anymore.
 /slowmode on &lt;time&gt;|off - group admins (or the owner) can control Slow Mode here; next round is sent exactly &lt;time&gt; after the previous one ends (e.g. /slowmode on 2m). Every round still lasts a maximum of 2 minutes, and turning this on also turns Automatic Mode off in this chat.
+/deleterequestprompt off|on [&lt;1-9&gt;s|m] - group admins (or the owner) can control whether resolved /request prompts are deleted here and after how long (default on, 30 seconds; no args shows the current setting)
 
 <b>👑 Owner Commands</b>
 /scramblestats - Word Scramble bot-wide statistics
@@ -1693,12 +1703,14 @@ async def scrambleallcommands_command(update: Update, context: ContextTypes.DEFA
 /scramblemode &lt;time&gt;|off - my DM only: auto-start a round in EVERY group on a repeating interval
 /controlgroup automaticmode on|off &lt;group&gt; | slowmode on &lt;time&gt;|off &lt;group&gt; - owner only: remotely control Slow Mode / Automatic Mode in any group (&lt;group&gt; = ID, @username or allgroups)
 /starttournament - tournament host, bot owner or Bot Admins: start the lobby early
-/stoptournament - tournament host, bot owner or Bot Admins: cancel a lobby and refund everyone
+/stoptournament - tournament host, bot owner or Bot Admins: cancel a lobby (or a paused tournament) and refund everyone
+/resumetournament - tournament host, bot owner or Bot Admins: continue a paused or stuck tournament from where it stopped (owner in DM: /resumetournament &lt;group id|@username&gt; or /resumetournament allgroups)
 /extendlobby &lt;2-9&gt;m - owner only: add minutes to the open tournament lobby in this group (e.g. /extendlobby 5m)
 /tournamentban &lt;username|ID&gt; - owner/Bot Admins: ban a player (or reply to them) from tournaments only; also accepts a group username/ID to ban that group from running tournaments
 /tournamentunban &lt;username|ID&gt; - owner/Bot Admins: undo a tournament ban (player or group)
 /setpremium &lt;stars&gt; &lt;duration&gt; - owner only: set the premium price and length (no args shows current)
 /giftpremium &lt;username|ID&gt; - owner only: give someone 7 days of Premium (or reply to their message); works in DM too
+/setdollarpack &lt;1-5&gt; &lt;dollars&gt; &lt;stars&gt; - owner only: edit one /buydollar pack (no args lists the current packs)
 /seepremiumplayers - owner only: every current premium player with time remaining
 /starbalance - owner only: the bot's current Telegram Stars balance
 /withdraw - owner only: Stars balance + how to withdraw it via @BotFather
@@ -1814,10 +1826,17 @@ async def slowmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = update.effective_chat.id
 
-    if context.args and await asyncio.to_thread(db.tournament_get_open_for_chat, chat_id):
-        await update.message.reply_text(
-            "🏟️ A tournament is in progress here - Slow Mode can't be changed until it ends."
-        )
+    _open_t = await asyncio.to_thread(db.tournament_get_open_for_chat, chat_id) if context.args else None
+    if _open_t:
+        if _open_t["status"] == "paused":
+            await update.message.reply_text(
+                "🏟️ A tournament is paused here and can be resumed with /resumetournament - "
+                "Slow Mode can't be changed until it ends or is cancelled."
+            )
+        else:
+            await update.message.reply_text(
+                "🏟️ A tournament is in progress here - Slow Mode can't be changed until it ends."
+            )
         return
 
     if not context.args:
@@ -2053,10 +2072,17 @@ async def scrambleautomaticmode_command(update: Update, context: ContextTypes.DE
 
     chat_id = update.effective_chat.id
 
-    if context.args and await asyncio.to_thread(db.tournament_get_open_for_chat, chat_id):
-        await update.message.reply_text(
-            "🏟️ A tournament is in progress here - Automatic Mode can't be changed until it ends."
-        )
+    _open_t = await asyncio.to_thread(db.tournament_get_open_for_chat, chat_id) if context.args else None
+    if _open_t:
+        if _open_t["status"] == "paused":
+            await update.message.reply_text(
+                "🏟️ A tournament is paused here and can be resumed with /resumetournament - "
+                "Automatic Mode can't be changed until it ends or is cancelled."
+            )
+        else:
+            await update.message.reply_text(
+                "🏟️ A tournament is in progress here - Automatic Mode can't be changed until it ends."
+            )
         return
 
     if not context.args or context.args[0].lower() not in ("on", "off"):
@@ -6442,6 +6468,9 @@ async def allcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 /claimdailyreward - claim today's daily reward
 /buypremium - premium doubles your 💵 rewards in Word Game and Word Scramble (paid with Telegram Stars)
 /premiumstatus - see whether premium is active and how much time is left
+/buydollar - premium only: buy 💵 Word Scramble coins with Telegram Stars (pack sizes and prices are shown live)
+/transfer &lt;@username|id&gt; &lt;amount&gt; - premium only: send 💵 from your Word Scramble balance to another player (or reply to their message with /transfer &lt;amount&gt;)
+/request &lt;@username|id&gt; &lt;amount&gt; - premium only: ask another player for 💵; they get Yes/No buttons (or reply to their message with /request &lt;amount&gt;)
 /settournament &lt;fee&gt; &lt;difficulty&gt; &lt;rounds&gt;rounds - host a Word Scramble tournament in a group (e.g. /settournament 2000 Medium 3rounds); everyone pays the entry fee from their Word Scramble balance and the winner takes the pot
 /tournament - quick-start a tournament instantly: same as /settournament 5 easy 20rounds
 /join - join the tournament lobby that's open in this group
@@ -6458,6 +6487,7 @@ async def allcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 <b>🛡️ Group Admin Commands</b>
 /stopgame - group admins (or the owner) can stop a round instantly
 /autodelete on|off [interval] - group admins (or the owner) can enable cleanup of the bot's own messages here; add a number+s/m/h/d (e.g. 9m) for periodic cleanup instead of round-based
+/deleterequestprompt off|on [&lt;1-9&gt;s|m] - group admins (or the owner) can control whether resolved /request prompts are deleted here and after how long (default on, 30 seconds; no args shows the current setting)
 /groupadminmode on|off &lt;group ID or @username&gt; - owner/Bot Admins only, works from my DM: require (or not) that I'm an admin here before games can start, overriding the global /adminmode default
 /gamedifficulty easy|easy3-6|medium|hard|off [group] - owner only: control which word lengths get picked; add a group to target just that group
 
@@ -6474,10 +6504,12 @@ async def allcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 /tournamentunban &lt;username|ID&gt; - undo a tournament ban (player or group)
 /controlgroup automaticmode on|off &lt;group&gt; | slowmode on &lt;time&gt;|off &lt;group&gt; - owner only: control Word Scramble Slow Mode / Automatic Mode in any group (&lt;group&gt; = ID, @username or allgroups)
 /starttournament - tournament host, bot owner or Bot Admins: start the lobby early
-/stoptournament - tournament host, bot owner or Bot Admins: cancel a lobby and refund everyone
+/stoptournament - tournament host, bot owner or Bot Admins: cancel a lobby (or a paused tournament) and refund everyone
+/resumetournament - tournament host, bot owner or Bot Admins: continue a paused or stuck tournament from where it stopped (owner in DM: /resumetournament &lt;group id|@username&gt; or /resumetournament allgroups)
 /extendlobby &lt;2-9&gt;m - owner only: add minutes to the open tournament lobby in this group (e.g. /extendlobby 5m)
 /setpremium &lt;stars&gt; &lt;duration&gt; - owner only: set the premium price and length (e.g. /setpremium 99 7d; no args shows current)
 /giftpremium &lt;username|ID&gt; - owner only: give someone 7 days of Premium (or reply to their message); works in DM too
+/setdollarpack &lt;1-5&gt; &lt;dollars&gt; &lt;stars&gt; - owner only: edit one /buydollar pack (no args lists the current packs)
 /seepremiumplayers - owner only: every current premium player with time remaining
 /starbalance - owner only: the bot's current Telegram Stars balance
 /withdraw - owner only: Stars balance + how to withdraw it via @BotFather
@@ -6704,6 +6736,17 @@ TOURNAMENT_MAX_ROUNDS = 20
 TOURNAMENT_DIFFICULTIES = ("easy", "easy3", "easy4", "easy5", "easy6", "medium", "hard", "off")
 TOURNAMENT_START_RETRY_SECONDS = 8
 TOURNAMENT_START_MAX_ATTEMPTS = 30
+# A round/idle gap that overran by no more than this at startup is caught up as
+# before; beyond it the tournament is PAUSED (stakes kept) instead of burning a round.
+TOURNAMENT_RESUME_GRACE_SECONDS = 90
+# A paused tournament that nobody resumes is refunded and finalized after this long.
+TOURNAMENT_PAUSED_MAX_SECONDS = 24 * 3600
+TOURNAMENT_PAUSE_CHECK_SECONDS = 600
+TOURNAMENT_PAUSE_CHECK_JOB_NAME = "tournament_pause_check"
+TOURNAMENT_PAUSED_BLOCK_TEXT = (
+    "🏟️ A tournament is paused in this group because of a technical issue - entry fees are safe. "
+    "The host or an admin can send /resumetournament to continue it (or /stoptournament to cancel and refund)."
+)
 TOURNAMENT_USAGE = (
     "Usage: /settournament <fee> <difficulty> <rounds>rounds\n"
     "Example: /settournament 2000 Medium 3rounds\n"
@@ -6905,8 +6948,12 @@ async def _open_tournament_lobby(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text("🛠️ Word Scramble is currently under maintenance. Please try again later.")
         return
 
-    if await asyncio.to_thread(db.tournament_get_open_for_chat, chat.id):
-        await update.message.reply_text("🏟️ A tournament is already running (or open for joining) in this group.")
+    _open_t = await asyncio.to_thread(db.tournament_get_open_for_chat, chat.id)
+    if _open_t:
+        if _open_t["status"] == "paused":
+            await update.message.reply_text(TOURNAMENT_PAUSED_BLOCK_TEXT)
+        else:
+            await update.message.reply_text("🏟️ A tournament is already running (or open for joining) in this group.")
         return
     if await asyncio.to_thread(db.scramble_get_round, chat.id):
         await update.message.reply_text(
@@ -7019,13 +7066,20 @@ async def extendlobby_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def stoptournament_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     t = await asyncio.to_thread(db.tournament_get_open_for_chat, chat.id)
-    if not t or t["status"] != "lobby":
-        await update.message.reply_text(
-            "🏟️ There's no tournament lobby to cancel here (a tournament that has already started can't be cancelled)."
-        )
+    if not t or t["status"] == "active":
+        text = "🏟️ There's no tournament lobby to cancel here (a tournament that has already started can't be cancelled)."
+        if t:
+            text += " If it has stopped responding, try /resumetournament."
+        await update.message.reply_text(text)
         return
     if not await _tournament_may_manage(update.effective_user.id, t):
         await update.message.reply_text("❌ Only the tournament host, the bot owner, or Bot Admins can cancel it.")
+        return
+    if t["status"] == "paused":
+        # Paused tournaments can be cancelled: everyone is refunded in full.
+        await _tournament_abort_and_announce(
+            context, t["id"], chat.id, "Tournament cancelled."
+        )
         return
     await _tournament_abort_and_announce(
         context, t["id"], chat.id, "Tournament cancelled.", delete=True
@@ -7146,10 +7200,8 @@ async def _tournament_start_round(context, tid, attempt=1):
         # The group never saw the word: roll the round back and retry shortly.
         await asyncio.to_thread(db.tournament_unset_round, tid, round_no)
         if attempt >= TOURNAMENT_START_MAX_ATTEMPTS:
-            logger.error(f"tournament {tid}: giving up after {attempt} failed round sends - refunding")
-            await _tournament_abort_and_announce(
-                context, tid, chat_id, "Tournament cancelled - I couldn't reach this chat."
-            )
+            logger.error(f"tournament {tid}: giving up after {attempt} failed round sends - pausing (stakes kept)")
+            await _tournament_pause_and_notify(context, tid)
             return
         logger.warning(f"tournament {tid}: round {round_no} not delivered; retrying in {TOURNAMENT_START_RETRY_SECONDS}s")
         _schedule_tournament_job(
@@ -7228,6 +7280,11 @@ async def tournament_handle_guess(update: Update, context: ContextTypes.DEFAULT_
     if not await asyncio.to_thread(db.tournament_is_staked_player, t["id"], user.id):
         return False
 
+    # Messages redelivered after an outage were typed BEFORE this round (or its
+    # resumed restart) began - they must not steal the word or score points.
+    if _tournament_message_is_stale(message, t):
+        return True
+
     guess_clean = re.sub(r"[^\w\s]", "", message.text.lower()).strip()
     if not guess_clean:
         return True
@@ -7296,16 +7353,159 @@ async def _tournament_finish(context, tid):
     await safe_send(context.bot, chat_id, text="\n".join(lines), parse_mode="HTML")
 
 
+def _tournament_message_is_stale(message, t) -> bool:
+    """True if the Telegram message was sent before the live round's
+    round_started_at. Telegram dates are UTC-aware; the DB stores naive LOCAL
+    datetime.now() strings, so both are normalised to aware UTC first."""
+    try:
+        # Telegram's message.date only has whole-second resolution, so compare
+        # against the round start floored to the second (a legit fast guess in
+        # the same second as the round start must never be treated as stale).
+        started = datetime.fromisoformat(t["round_started_at"]).replace(microsecond=0).astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        return False
+    sent = getattr(message, "date", None)
+    if sent is None:
+        return False
+    if sent.tzinfo is None:
+        sent = sent.replace(tzinfo=timezone.utc)
+    return sent < started
+
+
+def _tournament_resume_position(t):
+    """(round_number_to_continue_from, total_rounds, finishing)."""
+    total = t["total_rounds"]
+    if t["current_word"]:
+        return t["current_round"], total, False
+    if t["current_round"] >= total:
+        return total, total, True
+    return t["current_round"] + 1, total, False
+
+
+def _tournament_paused_job_name(tid):
+    return f"tournament_pausednotice_{tid}"
+
+
+def _group_title_sync(chat_id):
+    try:
+        d = db.get_group_full_details(chat_id)
+        return d[1] if d and d[1] else None
+    except Exception:
+        return None
+
+
+async def _tournament_send_paused_notices(context, t):
+    """ONE notice in the group + best-effort DMs to the host and the owner."""
+    rn, total, finishing = _tournament_resume_position(t)
+    where = f"Round {rn}/{total}" if not finishing else "the final results"
+    try:
+        await safe_send(
+            context.bot, t["chat_id"],
+            text=(
+                "⏸️ <b>Tournament paused</b> because of a technical issue.\n\n"
+                f"All entry fees are safe. The host or an admin can send /resumetournament "
+                f"to continue from {where}."
+            ),
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.info(f"tournament {t['id']}: paused notice to group not delivered: {e}")
+
+    title = await asyncio.to_thread(_group_title_sync, t["chat_id"])
+    in_group = f" in {title}" if title else ""
+    dm = (
+        f"⏸️ The tournament{in_group} is paused because of a technical issue. "
+        f"Entry fees are safe. Send /resumetournament in that group to continue from {where}."
+    )
+    for uid in {t["host_id"], OWNER_ID}:
+        try:
+            await context.bot.send_message(chat_id=uid, text=dm)
+        except Exception:
+            pass
+
+
+async def _tournament_pause_and_notify(context, tid):
+    """active -> paused (stakes, word, round and scores untouched) + notices.
+    Returns True if this call paused it."""
+    paused = await asyncio.to_thread(db.tournament_pause, tid)
+    _cancel_tournament_jobs(context.job_queue, tid)
+    if not paused:
+        return False
+    t = await asyncio.to_thread(db.tournament_get, tid)
+    if t:
+        await _tournament_send_paused_notices(context, t)
+    return True
+
+
+async def tournament_paused_notice_callback(context: ContextTypes.DEFAULT_TYPE):
+    tid = (context.job.data or {}).get("tid")
+    if tid is None:
+        return
+    t = await asyncio.to_thread(db.tournament_get, tid)
+    if t and t["status"] == "paused":
+        await _tournament_send_paused_notices(context, t)
+
+
+async def tournament_pause_check_callback(context: ContextTypes.DEFAULT_TYPE):
+    """Safety net: a tournament paused for longer than TOURNAMENT_PAUSED_MAX_SECONDS
+    is refunded in full and finalized, so money is never held forever."""
+    try:
+        open_ts = await asyncio.to_thread(db.tournament_get_all_open)
+    except Exception as e:
+        logger.error(f"tournament pause check: couldn't list tournaments: {e}")
+        return
+    now = datetime.now()
+    for t in open_ts:
+        if t["status"] != "paused" or not t.get("paused_at"):
+            continue
+        try:
+            age = (now - datetime.fromisoformat(t["paused_at"])).total_seconds()
+        except (TypeError, ValueError):
+            continue
+        if age < TOURNAMENT_PAUSED_MAX_SECONDS:
+            continue
+        try:
+            await _tournament_abort_and_announce(
+                context, t["id"], t["chat_id"],
+                f"Tournament cancelled - it stayed paused for over "
+                f"{_format_duration_words(TOURNAMENT_PAUSED_MAX_SECONDS)}.",
+                dm_players=True, group_title=await asyncio.to_thread(_group_title_sync, t["chat_id"]),
+            )
+        except Exception as e:
+            logger.error(f"tournament {t['id']}: auto-refund of stale paused tournament failed: {e}")
+
+
+def schedule_tournament_pause_check(job_queue):
+    """Repeating, restart-safe (re-registered on every boot)."""
+    if job_queue is None:
+        return
+    for job in job_queue.get_jobs_by_name(TOURNAMENT_PAUSE_CHECK_JOB_NAME):
+        job.schedule_removal()
+    job_queue.run_repeating(
+        tournament_pause_check_callback,
+        interval=TOURNAMENT_PAUSE_CHECK_SECONDS,
+        first=5,
+        name=TOURNAMENT_PAUSE_CHECK_JOB_NAME,
+    )
+
+
 def restore_stale_tournaments(job_queue):
     """On startup, re-arm every open tournament: reschedule the remaining lobby
-    time or round timer, or fire the catch-up almost immediately if it already
-    elapsed (mirrors restore_stale_scramble_rounds)."""
+    time or round timer, or fire the catch-up almost immediately if it only
+    just elapsed. If a live round (or the gap between rounds) overran by MORE
+    than TOURNAMENT_RESUME_GRACE_SECONDS - i.e. the bot was down/unreachable -
+    the tournament is PAUSED instead (word, round, scores and stakes kept) and
+    one notice is posted; /resumetournament continues it. Already-paused
+    tournaments are left alone (the pause-check job refunds them if abandoned)."""
     if job_queue is None:
         return
     now = datetime.now()
 
     for t in db.tournament_get_all_open():
         tid, chat_id = t["id"], t["chat_id"]
+
+        if t["status"] == "paused":
+            continue
 
         if t["status"] == "lobby":
             try:
@@ -7321,15 +7521,223 @@ def restore_stale_tournaments(job_queue):
                 remaining = TOURNAMENT_ROUND_SECONDS - (now - datetime.fromisoformat(t["round_started_at"])).total_seconds()
             except (TypeError, ValueError):
                 remaining = 0
+            if -remaining > TOURNAMENT_RESUME_GRACE_SECONDS:
+                if db.tournament_pause(tid):
+                    _schedule_tournament_job(
+                        job_queue, tournament_paused_notice_callback, _tournament_paused_job_name(tid),
+                        2, chat_id, {"tid": tid},
+                    )
+                continue
             _schedule_tournament_job(
                 job_queue, tournament_round_timeout_callback, _tournament_round_job_name(tid),
                 max(remaining, 1), chat_id, {"tid": tid},
             )
         else:
+            try:
+                idle = (now - datetime.fromisoformat(t["idle_since"])).total_seconds()
+            except (TypeError, ValueError):
+                idle = 0  # unknown (older row) - keep the old catch-up behaviour
+            if idle > TOURNAMENT_RESUME_GRACE_SECONDS:
+                if db.tournament_pause(tid):
+                    _schedule_tournament_job(
+                        job_queue, tournament_paused_notice_callback, _tournament_paused_job_name(tid),
+                        2, chat_id, {"tid": tid},
+                    )
+                continue
             _schedule_tournament_job(
                 job_queue, tournament_advance_callback, _tournament_advance_job_name(tid),
                 1, chat_id, {"tid": tid, "attempt": 1},
             )
+
+
+async def _tournament_repause(context, tid):
+    """Put a tournament back to 'paused' after a failed resume - silently, so
+    it can always be resumed again."""
+    await asyncio.to_thread(db.tournament_pause, tid)
+    _cancel_tournament_jobs(context.job_queue, tid)
+
+
+async def _tournament_resume_one(context, t):
+    """Tries to resume one open tournament. Returns (code, data):
+      'resumed' -> data = tournament dict     'healthy' -> data = tournament dict
+      'none'    -> data = text                'failed'  -> data = text
+    The state change is one atomic DB call (db.tournament_resume)."""
+    tid, chat_id, jq = t["id"], t["chat_id"], context.job_queue
+
+    if t["status"] == "lobby":
+        return "none", "The tournament is still in its lobby - there's nothing to resume yet."
+
+    if t["status"] == "active":
+        job_name = _tournament_round_job_name(tid) if t["current_word"] else _tournament_advance_job_name(tid)
+        if jq is not None and jq.get_jobs_by_name(job_name):
+            return "healthy", t  # a timer is armed: it's running normally
+
+    now = datetime.now()
+    stale_round_cutoff = (now - timedelta(seconds=TOURNAMENT_ROUND_SECONDS + TOURNAMENT_RESUME_GRACE_SECONDS)).isoformat()
+    idle_cutoff = (now - timedelta(seconds=TOURNAMENT_RESUME_GRACE_SECONDS)).isoformat()
+    state = await asyncio.to_thread(db.tournament_resume, tid, stale_round_cutoff, idle_cutoff)
+    if not state:
+        fresh = await asyncio.to_thread(db.tournament_get, tid)
+        if not fresh or fresh["status"] not in ("active", "paused"):
+            return "none", "That tournament has already finished - there's nothing to resume."
+        return "healthy", fresh
+
+    _cancel_tournament_jobs(jq, tid, lobby=False)
+    rn, total, finishing = _tournament_resume_position(state)
+    players = await asyncio.to_thread(db.tournament_get_players, tid)
+    where = f"Round {rn}/{total}" if not finishing else "the final results"
+    try:
+        sent = await safe_send(
+            context.bot, chat_id,
+            text=(
+                f"▶️ <b>Tournament resumed</b> - continuing from {where}\n\n"
+                + tournament_standings_text([(p[1], p[2]) for p in players])
+            ),
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.error(f"tournament {tid}: resume status post failed: {e}")
+        sent = None
+    if sent is None:
+        await _tournament_repause(context, tid)
+        return "failed", "I couldn't post in that group."
+
+    try:
+        if state["current_word"]:
+            scrambled = state["current_scrambled"] or scramble_letters(state["current_word"])
+            try:
+                sent = await safe_send(
+                    context.bot, chat_id,
+                    text=(
+                        f"🏟️ <b>Round {state['current_round']}/{total} (resumed)</b>\n\n"
+                        f"Unscramble this word:\n\n"
+                        f"<b>{esc(scrambled)}</b>\n\n"
+                        f"First correct answer in {TOURNAMENT_ROUND_SECONDS} seconds scores 💎{TOURNAMENT_POINTS_PER_WIN}."
+                    ),
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                logger.error(f"tournament {tid}: resumed word send failed: {e}")
+                sent = None
+            if sent is None:
+                await _tournament_repause(context, tid)
+                return "failed", "I couldn't re-send the round's word."
+            _schedule_tournament_job(
+                jq, tournament_round_timeout_callback, _tournament_round_job_name(tid),
+                TOURNAMENT_ROUND_SECONDS, chat_id, {"tid": tid},
+            )
+        elif state["current_round"] >= total:
+            await _tournament_finish(context, tid)
+        else:
+            await _tournament_start_round(context, tid)
+    except Exception as e:
+        logger.error(f"tournament {tid}: resume failed: {e}")
+        await _tournament_repause(context, tid)
+        return "failed", "something went wrong while continuing it."
+    return "resumed", state
+
+
+def _tournament_running_text(t) -> str:
+    rn, total, finishing = _tournament_resume_position(t)
+    if finishing:
+        return "▶️ The tournament is already running - it's wrapping up."
+    return f"▶️ The tournament is already running - Round {rn}/{total}."
+
+
+async def resumetournament_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    user = update.effective_user
+    args = context.args or []
+
+    # ---- DM: owner only -------------------------------------------------
+    if chat.type == ChatType.PRIVATE:
+        if not is_owner(user.id):
+            await update.message.reply_text(
+                "🏟️ Run /resumetournament inside the group whose tournament you want to continue."
+            )
+            return
+        if not args:
+            await update.message.reply_text(
+                "Usage: /resumetournament <group id|@username>  or  /resumetournament allgroups\n"
+                "(or run /resumetournament inside the group itself)"
+            )
+            return
+
+        if args[0].lower() == "allgroups":
+            targets = []
+            for t in await asyncio.to_thread(db.tournament_get_all_open):
+                if t["status"] != "lobby":
+                    targets.append(t)
+            lines, resumed, failed, healthy = [], 0, 0, 0
+            for t in targets:
+                title = await asyncio.to_thread(_group_title_sync, t["chat_id"]) or str(t["chat_id"])
+                try:
+                    code, data = await _tournament_resume_one(context, t)
+                except Exception as e:
+                    logger.error(f"resume allgroups: tournament {t['id']} failed: {e}")
+                    code, data = "failed", "unexpected error"
+                if code == "resumed":
+                    resumed += 1
+                    lines.append(f"✅ {title}: resumed")
+                elif code in ("healthy", "none"):
+                    healthy += 1
+                else:
+                    failed += 1
+                    lines.append(f"❌ {title}: {data}")
+                await asyncio.sleep(0.05)
+            if not targets or (not resumed and not failed):
+                await update.message.reply_text("🏟️ No paused or stuck tournaments right now.")
+                return
+            summary = f"🏟️ Resume summary: {resumed} resumed, {failed} failed, {healthy} already running.\n\n" + "\n".join(lines)
+            await update.message.reply_text(summary[:4000])
+            return
+
+        resolved = await resolve_group_arg(args[0])
+        if not resolved:
+            await update.message.reply_text("❌ I couldn't find a group I'm currently in that matches that.")
+            return
+        chat_id, title = resolved
+        t = await asyncio.to_thread(db.tournament_get_open_for_chat, chat_id)
+        if not t:
+            await update.message.reply_text(f"🏟️ There's no paused or running tournament in {title}.")
+            return
+        code, data = await _tournament_resume_one(context, t)
+        if code == "resumed":
+            await update.message.reply_text(f"✅ Resumed the tournament in {title}.")
+        elif code == "healthy":
+            await update.message.reply_text(f"{title}: " + _tournament_running_text(data).replace("▶️ ", ""))
+        elif code == "none":
+            await update.message.reply_text(f"{title}: {data}")
+        else:
+            await update.message.reply_text(f"❌ {title}: couldn't resume - {data} It's still paused; try again shortly.")
+        return
+
+    # ---- inside a group -------------------------------------------------
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+
+    t = await asyncio.to_thread(db.tournament_get_open_for_chat, chat.id)
+    if not t:
+        await update.message.reply_text(
+            "🏟️ There's no paused or running tournament in this group to resume (or it already finished)."
+        )
+        return
+    if not await _tournament_may_manage(user.id, t):
+        await update.message.reply_text(
+            "❌ Only the tournament host, the bot owner, or Bot Admins can resume it."
+        )
+        return
+
+    code, data = await _tournament_resume_one(context, t)
+    if code == "healthy":
+        await update.message.reply_text(_tournament_running_text(data))
+    elif code == "none":
+        await update.message.reply_text(f"🏟️ {data}")
+    elif code == "failed":
+        await update.message.reply_text(
+            f"⚠️ Couldn't resume the tournament: {data} It's still paused - try /resumetournament again in a moment."
+        )
+    # 'resumed': the group has just received the status post and the word.
 
 
 # =======================================================================
@@ -7372,6 +7780,26 @@ def is_premium(user_id) -> bool:
         return True
     expiry = db.premium_get_expiry(user_id)
     return bool(expiry and expiry > datetime.now())
+
+
+PREMIUM_ONLY_TEXT = "⭐ This is a premium feature — use /buypremium to buy premium."
+
+
+def premium_only(func):
+    """Reusable gate for premium-only commands: the owner and any active
+    premium user pass through; everyone else gets PREMIUM_ONLY_TEXT.
+    Usage:  @premium_only  above any `async def x_command(update, context)`."""
+    @functools.wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        user = update.effective_user
+        if not user or not await asyncio.to_thread(is_premium, user.id):
+            if update.callback_query:
+                await update.callback_query.answer(PREMIUM_ONLY_TEXT, show_alert=True)
+            elif update.effective_message:
+                await update.effective_message.reply_text(PREMIUM_ONLY_TEXT)
+            return
+        return await func(update, context, *args, **kwargs)
+    return wrapper
 
 
 def _format_remaining(seconds) -> str:
@@ -7460,9 +7888,31 @@ async def buypremium_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
+def _payload_prefix(payload) -> str:
+    return str(payload or "").split(":", 1)[0]
+
+
 async def premium_precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Telegram waits ~10s for this answer, so it must always answer."""
+    """Pre-checkout dispatcher: routes by invoice payload prefix ('premium:' or
+    'dollar:'). Telegram waits ~10s for the answer, so it must always answer."""
     query = update.pre_checkout_query
+    prefix = _payload_prefix(query.invoice_payload)
+    try:
+        if prefix == PREMIUM_PAYLOAD_PREFIX:
+            await _premium_precheckout(query)
+        elif prefix == DOLLAR_PAYLOAD_PREFIX:
+            await _dollar_precheckout(query)
+        else:
+            await query.answer(ok=False, error_message="This payment isn't recognised. Please try again from the command you used.")
+    except Exception as e:
+        logger.error(f"pre_checkout dispatch failed: {e}", exc_info=True)
+        try:
+            await query.answer(ok=False, error_message="Something went wrong. Please try again in a moment.")
+        except Exception:
+            pass
+
+
+async def _premium_precheckout(query):
     try:
         parsed = _parse_premium_payload(query.invoice_payload)
         if parsed is None or query.currency != "XTR":
@@ -7485,6 +7935,18 @@ async def premium_precheckout_callback(update: Update, context: ContextTypes.DEF
 
 
 async def premium_successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Successful-payment dispatcher: routes by invoice payload prefix."""
+    payload = update.message.successful_payment.invoice_payload
+    prefix = _payload_prefix(payload)
+    if prefix == PREMIUM_PAYLOAD_PREFIX:
+        await _premium_successful_payment(update, context)
+    elif prefix == DOLLAR_PAYLOAD_PREFIX:
+        await _dollar_successful_payment(update, context)
+    else:
+        logger.warning(f"successful_payment with unrecognised payload {payload!r}")
+
+
+async def _premium_successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     payment = message.successful_payment
     parsed = _parse_premium_payload(payment.invoice_payload)
@@ -7526,6 +7988,773 @@ async def premium_successful_payment_callback(update: Update, context: ContextTy
         f"🎉 Premium activated! Your Word Game and Word Scramble {DOLLAR} rewards are now doubled.\n"
         f"⏳ Time remaining: {_format_remaining(remaining)}"
     )
+
+
+# =======================================================================
+# /buydollar - buy 💵 Word Scramble coins with Telegram Stars (premium only)
+# =======================================================================
+
+DOLLAR_PAYLOAD_PREFIX = "dollar"
+DOLLAR_PACKS_CONFIG_KEY = "dollar_packs"
+DEFAULT_DOLLAR_PACKS = [(100, 10), (1000, 95), (5000, 450), (10000, 850), (100000, 7500)]
+DOLLAR_PACK_MAX_COINS = 1_000_000_000
+
+
+def get_dollar_packs():
+    """Live list of (coins, stars) - exactly 5 packs, always read fresh from
+    config (never cached, never hardcoded elsewhere). Falls back to the
+    defaults if the stored value is missing or malformed. Sync (DB call)."""
+    raw = db.get_config(DOLLAR_PACKS_CONFIG_KEY)
+    try:
+        data = json.loads(raw) if raw else None
+        packs = [(int(c), int(st)) for c, st in data]
+        if len(packs) == len(DEFAULT_DOLLAR_PACKS) and all(c >= 1 and st >= 1 for c, st in packs):
+            return packs
+    except (TypeError, ValueError):
+        pass
+    return list(DEFAULT_DOLLAR_PACKS)
+
+
+def _dollar_pack_label(coins, stars) -> str:
+    return f"{DOLLAR}{coins} for {stars} ⭐"
+
+
+def _parse_dollar_payload(payload):
+    """'dollar:<user_id>:<pack_index>:<coins>:<stars>' -> (uid, idx, coins, stars) or None."""
+    try:
+        prefix, uid, idx, coins, stars = str(payload).split(":")
+        if prefix != DOLLAR_PAYLOAD_PREFIX:
+            return None
+        uid, idx, coins, stars = int(uid), int(idx), int(coins), int(stars)
+        if coins < 1 or stars < 1:
+            return None
+        return uid, idx, coins, stars
+    except (ValueError, TypeError):
+        return None
+
+
+def _buydollar_keyboard(user_id, packs):
+    # callback_data carries the buyer's id AND the pack they saw (idx, coins,
+    # stars): only they can press it, and a pack edited by the owner after the
+    # menu was shown can't silently charge a different price.
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(_dollar_pack_label(c, st), callback_data=f"bd:{user_id}:{i}:{c}:{st}")]
+        for i, (c, st) in enumerate(packs)
+    ])
+
+
+@premium_only
+async def buydollar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    packs = await asyncio.to_thread(get_dollar_packs)
+    await update.message.reply_text(
+        f"{DOLLAR} <b>Buy Word Scramble coins</b>\n\n"
+        f"Pick a pack - I'll send the Telegram Stars invoice to your DM. "
+        f"Coins go straight to your Word Scramble balance.",
+        parse_mode="HTML",
+        reply_markup=_buydollar_keyboard(user.id, packs),
+    )
+
+
+async def buydollar_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    try:
+        _prefix, owner_id, idx, coins, stars = query.data.split(":")
+        owner_id, idx, coins, stars = int(owner_id), int(idx), int(coins), int(stars)
+    except (ValueError, TypeError):
+        await query.answer("This menu is out of date. Run /buydollar again.", show_alert=True)
+        return
+
+    if user.id != owner_id:
+        await query.answer("This menu isn't yours - run /buydollar for your own.", show_alert=True)
+        return
+
+    # Re-check premium at the moment of tapping.
+    if not await asyncio.to_thread(is_premium, user.id):
+        await query.answer(PREMIUM_ONLY_TEXT, show_alert=True)
+        return
+
+    packs = await asyncio.to_thread(get_dollar_packs)
+    if not (0 <= idx < len(packs)) or packs[idx] != (coins, stars):
+        await query.answer("The packs have changed - please run /buydollar again.", show_alert=True)
+        return
+
+    try:
+        await context.bot.send_invoice(
+            chat_id=user.id,
+            title=f"{DOLLAR}{coins} Word Scramble coins"[:32],
+            description=f"{coins} {DOLLAR} added to your Word Scramble balance. Premium does not double purchased coins.",
+            payload=f"{DOLLAR_PAYLOAD_PREFIX}:{user.id}:{idx}:{coins}:{stars}",
+            provider_token="",  # must be empty for Telegram Stars
+            currency="XTR",
+            prices=[LabeledPrice(label=f"{DOLLAR}{coins}"[:32], amount=int(stars))],  # raw star count, no x100
+        )
+    except Forbidden:
+        await query.answer(
+            "⚠️ Please start a private chat with me first (open my DM and press Start), then tap again.",
+            show_alert=True,
+        )
+        return
+    except Exception as e:
+        logger.error(f"Failed to send dollar invoice to {user.id}: {e}")
+        await query.answer("⚠️ Couldn't create the invoice right now. Please try again in a moment.", show_alert=True)
+        return
+
+    await query.answer("📩 Invoice sent to your DM.")
+
+
+async def _dollar_precheckout(query):
+    """Validates a 'dollar:' invoice. Deliberately does NOT check premium: an
+    invoice that was already issued must always be payable."""
+    parsed = _parse_dollar_payload(query.invoice_payload)
+    if parsed is None or query.currency != "XTR":
+        await query.answer(ok=False, error_message="This payment isn't recognised. Please run /buydollar again.")
+        return
+    uid, _idx, _coins, stars = parsed
+    if query.from_user.id != uid:
+        await query.answer(ok=False, error_message="This invoice belongs to a different account.")
+        return
+    if query.total_amount != stars:
+        await query.answer(ok=False, error_message="This invoice is out of date. Please run /buydollar again.")
+        return
+    await query.answer(ok=True)
+
+
+async def _dollar_successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    payment = message.successful_payment
+    parsed = _parse_dollar_payload(payment.invoice_payload)
+    if parsed is None:
+        logger.warning(f"successful_payment with unrecognised dollar payload {payment.invoice_payload!r}")
+        return
+
+    payer = message.from_user
+    _uid, _idx, coins, _stars = parsed
+    charge_id = payment.telegram_payment_charge_id
+
+    # Coins are ALWAYS delivered once paid - premium status is intentionally
+    # not re-checked here, and the amount is never doubled.
+    try:
+        new_balance = await asyncio.to_thread(
+            db.dollar_purchase_credit, charge_id, payer.id, payer.first_name, coins, payment.total_amount
+        )
+    except Exception as e:
+        logger.error(f"Failed to record dollar purchase {charge_id}: {e}", exc_info=True)
+        try:
+            await context.bot.send_message(
+                chat_id=OWNER_ID,
+                text=(
+                    f"🚨 A /buydollar Stars payment went through but failed to credit.\n"
+                    f"User: {payer.id}\nCoins owed: {coins}\nStars: {payment.total_amount}\n"
+                    f"Charge ID: {charge_id}\nError: {e}"
+                ),
+            )
+        except Exception:
+            pass
+        await message.reply_text(
+            "⚠️ Your payment went through, but I hit an error adding your coins. "
+            "The owner has been notified and will sort it out."
+        )
+        return
+
+    if new_balance is None:
+        return  # duplicate delivery of an already-applied charge
+
+    await message.reply_text(
+        f"✅ Payment received! {DOLLAR}{coins} added to your Word Scramble balance.\n"
+        f"New balance: {DOLLAR}{new_balance}"
+    )
+
+
+@owner_only
+async def setdollarpack_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args or []
+    packs = await asyncio.to_thread(get_dollar_packs)
+
+    def _listing():
+        return "\n".join(f"{i}. {_dollar_pack_label(c, st)}" for i, (c, st) in enumerate(packs, start=1))
+
+    usage = "Usage: /setdollarpack <1-5> <dollars> <stars>  (e.g. /setdollarpack 2 1500 130)"
+    if not args:
+        await update.message.reply_text(f"{DOLLAR} Current /buydollar packs:\n\n{_listing()}\n\n{usage}")
+        return
+    if len(args) != 3:
+        await update.message.reply_text(usage)
+        return
+    try:
+        slot = int(args[0])
+        coins = int(args[1].replace(",", ""))
+        stars = int(args[2].replace(",", ""))
+    except ValueError:
+        await update.message.reply_text(f"❌ All three values must be whole numbers.\n{usage}")
+        return
+    if not (1 <= slot <= len(packs)):
+        await update.message.reply_text(f"❌ The pack number must be between 1 and {len(packs)}.\n{usage}")
+        return
+    if not (1 <= coins <= DOLLAR_PACK_MAX_COINS) or stars < 1:
+        await update.message.reply_text(f"❌ Dollars and stars must be positive (dollars up to {DOLLAR_PACK_MAX_COINS:,}).")
+        return
+
+    packs[slot - 1] = (coins, stars)
+    await asyncio.to_thread(db.set_config, DOLLAR_PACKS_CONFIG_KEY, json.dumps(packs))
+    await update.message.reply_text(
+        f"✅ Pack {slot} is now {_dollar_pack_label(coins, stars)}. Takes effect immediately.\n\n{_listing()}"
+    )
+
+
+# =======================================================================
+# /transfer, /request, /deleterequestprompt (Word Scramble global balance)
+# =======================================================================
+
+MIN_TRANSFER_AMOUNT = 5
+# Stay far below the balance column's 32-bit INTEGER ceiling (~2.1 billion).
+MAX_TRANSFER_AMOUNT = 1_000_000_000
+TRANSFER_CONFIRM_CONFIG_KEY = "transfer_confirm_threshold"
+DEFAULT_TRANSFER_CONFIRM_THRESHOLD = 1000
+TRANSFER_CONFIRM_SECONDS = 60
+
+REQUEST_COOLDOWN_SECONDS = 30
+REQUEST_MAX_PENDING = 3
+REQUEST_EXPIRE_SECONDS = 10 * 60
+REQUEST_PROMPT_DELETE_DEFAULT_SECONDS = 30
+
+TRANSFER_USAGE = (
+    f"Usage: /transfer <@username|id> <amount>\n"
+    f"or reply to someone's message with /transfer <amount>\n"
+    f"Minimum {MIN_TRANSFER_AMOUNT}."
+)
+REQUEST_USAGE = (
+    f"Usage: /request <@username|id> <amount>\n"
+    f"or reply to someone's message with /request <amount>\n"
+    f"Minimum {MIN_TRANSFER_AMOUNT}."
+)
+
+_pending_transfers = {}  # token -> confirmation state (in memory: expires in 60s anyway)
+
+
+def get_transfer_confirm_threshold() -> int:
+    """Live threshold (sync - DB call). Amounts at or above it need a Confirm tap."""
+    raw = db.get_config(TRANSFER_CONFIRM_CONFIG_KEY, str(DEFAULT_TRANSFER_CONFIRM_THRESHOLD))
+    try:
+        v = int(raw)
+        return v if v >= 1 else DEFAULT_TRANSFER_CONFIRM_THRESHOLD
+    except (TypeError, ValueError):
+        return DEFAULT_TRANSFER_CONFIRM_THRESHOLD
+
+
+def _mention(user_id, name) -> str:
+    return f'<a href="tg://user?id={user_id}">{esc_name(name)}</a>'
+
+
+def _parse_money_amount(text):
+    """'250' or '1,000' -> int; None if it isn't a whole positive number."""
+    text = (text or "").strip()
+    if not re.fullmatch(r"\d{1,3}(,\d{3})+|\d+", text):
+        return None
+    value = int(text.replace(",", ""))
+    return value if value > 0 else None
+
+
+async def _parse_money_command(update: Update, context: ContextTypes.DEFAULT_TYPE, usage: str):
+    """Shared parsing for /transfer and /request. Returns (target_id, target_name,
+    amount) or None (an error message has already been sent). Rules: amount is a
+    whole number >= MIN_TRANSFER_AMOUNT; the target is an existing player (a row
+    in users), not the sender, not a bot. Two args = explicit target (a reply is
+    ignored); one arg + a reply = the replied-to user (forum-topic 'replies' are
+    ignored, exactly like /start does)."""
+    message = update.message
+    sender = update.effective_user
+    args = context.args or []
+    reply_msg = message.reply_to_message
+    if reply_msg is not None and (reply_msg.from_user is None or getattr(reply_msg, "forum_topic_created", None)):
+        reply_msg = None
+
+    if len(args) == 2:
+        target_arg, amount_arg = args
+    elif len(args) == 1 and reply_msg is not None:
+        target_arg, amount_arg = None, args[0]
+    else:
+        await message.reply_text(usage)
+        return None
+
+    amount = _parse_money_amount(amount_arg)
+    if amount is None:
+        await message.reply_text(f"❌ The amount must be a whole positive number (e.g. 250 or 1,000).\n\n{usage}")
+        return None
+    if amount < MIN_TRANSFER_AMOUNT:
+        await message.reply_text(f"❌ The minimum amount is {DOLLAR}{MIN_TRANSFER_AMOUNT}.")
+        return None
+    if amount > MAX_TRANSFER_AMOUNT:
+        await message.reply_text(f"❌ The maximum amount is {DOLLAR}{MAX_TRANSFER_AMOUNT:,}.")
+        return None
+
+    if target_arg is None:
+        if reply_msg.from_user.is_bot:
+            await message.reply_text("❌ You can't do that with a bot.")
+            return None
+        row = await asyncio.to_thread(db.get_user_by_id, reply_msg.from_user.id)
+        if not row:
+            await message.reply_text("❌ That person isn't a player yet - they need to open me and press /start first.")
+            return None
+    elif re.fullmatch(r"\d+", target_arg):
+        row = await asyncio.to_thread(db.get_user_by_id, int(target_arg))
+        if not row:
+            await message.reply_text("❌ I don't know a player with that ID.")
+            return None
+    else:
+        row = await asyncio.to_thread(db.get_user_by_username, target_arg.lstrip("@"))
+        if not row:
+            await message.reply_text(f"❌ I don't know a player called {esc(target_arg)}.")
+            return None
+
+    target_id, target_name = row[0], row[1] or str(row[0])
+    if target_id == sender.id:
+        await message.reply_text("❌ You can't do that with yourself.")
+        return None
+    return target_id, target_name, amount
+
+
+# ---------------------------- /transfer ---------------------------------
+
+async def _do_transfer(chat_id, sender_id, sender_name, target_id, target_name, amount):
+    """Runs the transfer. Returns (ok, text)."""
+    try:
+        code, a, _b = await asyncio.to_thread(
+            db.transfer_execute, sender_id, sender_name, target_id, target_name, amount, chat_id
+        )
+    except Exception as e:
+        logger.error(f"transfer {sender_id}->{target_id} {amount} failed: {e}", exc_info=True)
+        return False, "⚠️ Something went wrong and nothing was moved. Please try again."
+    if code == "insufficient":
+        return False, f"❌ Not enough balance - you have {DOLLAR}{a} and tried to send {DOLLAR}{amount}."
+    return True, f"✅ {_mention(sender_id, sender_name)} sent {DOLLAR}{amount} to {_mention(target_id, target_name)}"
+
+
+@premium_only
+async def transfer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    parsed = await _parse_money_command(update, context, TRANSFER_USAGE)
+    if not parsed:
+        return
+    target_id, target_name, amount = parsed
+    sender = update.effective_user
+    chat = update.effective_chat
+
+    threshold = await asyncio.to_thread(get_transfer_confirm_threshold)
+    if amount >= threshold:
+        token = os.urandom(4).hex()
+        _pending_transfers[token] = {
+            "sender_id": sender.id, "sender_name": sender.first_name,
+            "target_id": target_id, "target_name": target_name,
+            "amount": amount, "chat_id": chat.id,
+            "deadline": asyncio.get_running_loop().time() + TRANSFER_CONFIRM_SECONDS,
+        }
+        sent = await update.message.reply_html(
+            f"⚠️ Confirm: send {DOLLAR}{amount} to {_mention(target_id, target_name)}?\n"
+            f"This can't be undone. Expires in {TRANSFER_CONFIRM_SECONDS} seconds.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("Confirm ✅", callback_data=f"tf:y:{token}"),
+                InlineKeyboardButton("Cancel ❌", callback_data=f"tf:n:{token}"),
+            ]]),
+        )
+        state = _pending_transfers.get(token)
+        if state is not None:
+            state["message_id"] = sent.message_id
+        if context.job_queue is not None:
+            context.job_queue.run_once(
+                transfer_confirm_expire_callback, TRANSFER_CONFIRM_SECONDS + 1,
+                chat_id=chat.id, name=f"transfer_confirm_{token}", data={"token": token},
+            )
+        return
+
+    ok, text = await _do_transfer(chat.id, sender.id, sender.first_name, target_id, target_name, amount)
+    await update.message.reply_html(text)
+
+
+async def transfer_confirm_expire_callback(context: ContextTypes.DEFAULT_TYPE):
+    token = (context.job.data or {}).get("token")
+    state = _pending_transfers.pop(token, None)
+    if not state or not state.get("message_id"):
+        return
+    try:
+        await context.bot.edit_message_text(
+            chat_id=state["chat_id"], message_id=state["message_id"],
+            text="⌛ Transfer confirmation expired - no money was moved.",
+        )
+    except Exception:
+        pass
+
+
+async def transfer_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    try:
+        _p, action, token = query.data.split(":")
+    except ValueError:
+        await query.answer()
+        return
+
+    state = _pending_transfers.get(token)
+    if state is None or asyncio.get_running_loop().time() > state["deadline"]:
+        _pending_transfers.pop(token, None)
+        await query.answer("⌛ This confirmation expired - run /transfer again.", show_alert=True)
+        try:
+            await query.edit_message_text("⌛ Transfer confirmation expired - no money was moved.")
+        except Exception:
+            pass
+        return
+    if user.id != state["sender_id"]:
+        await query.answer("Only the person who started this transfer can use these buttons.", show_alert=True)
+        return
+
+    # Claim the confirmation BEFORE any await: a double-tap can never run twice.
+    _pending_transfers.pop(token, None)
+    if context.job_queue is not None:
+        for job in context.job_queue.get_jobs_by_name(f"transfer_confirm_{token}"):
+            job.schedule_removal()
+
+    if action == "n":
+        await query.answer("Cancelled.")
+        try:
+            await query.edit_message_text("❌ Transfer cancelled - no money was moved.")
+        except Exception:
+            pass
+        return
+
+    # Confirm: premium and balance are re-checked right now.
+    if not await asyncio.to_thread(is_premium, user.id):
+        await query.answer(PREMIUM_ONLY_TEXT, show_alert=True)
+        try:
+            await query.edit_message_text("❌ Transfer cancelled - premium is required. No money was moved.")
+        except Exception:
+            pass
+        return
+
+    await query.answer()
+    ok, text = await _do_transfer(
+        state["chat_id"], state["sender_id"], state["sender_name"],
+        state["target_id"], state["target_name"], state["amount"],
+    )
+    try:
+        await query.edit_message_text(text, parse_mode="HTML")
+    except Exception:
+        await safe_send(context.bot, state["chat_id"], text=text, parse_mode="HTML")
+
+
+# ---------------------------- /request ----------------------------------
+
+def _request_job_name(rid):
+    return f"money_request_expire_{rid}"
+
+
+def _request_prompt_text(row) -> str:
+    return (
+        f"{_mention(row['target_id'], row['target_name'])}\n"
+        f"{DOLLAR}{row['amount']} — give it to {_mention(row['requester_id'], row['requester_name'])}?"
+    )
+
+
+def _request_outcome_text(row, kind) -> str:
+    target = _mention(row["target_id"], row["target_name"])
+    requester = _mention(row["requester_id"], row["requester_name"])
+    if kind == "paid":
+        return f"✅ {target} gave {DOLLAR}{row['amount']} to {requester}"
+    if kind == "declined":
+        return f"❌ {target} declined"
+    return f"⌛ Request expired - {target} didn't answer {requester}'s request for {DOLLAR}{row['amount']}."
+
+
+def _request_prompt_keyboard(rid):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("Yes ✅", callback_data=f"rq:y:{rid}"),
+        InlineKeyboardButton("No ❌", callback_data=f"rq:n:{rid}"),
+    ]])
+
+
+async def schedule_message_deletion(job_queue, chat_id, message_id, delay_seconds):
+    """Deletes one specific message after `delay_seconds`. The deadline is
+    persisted (scheduled_deletions) and re-armed on boot by
+    restore_scheduled_deletions, so a restart never leaves it behind."""
+    if job_queue is None:
+        return
+    delete_at = datetime.now() + timedelta(seconds=delay_seconds)
+    try:
+        await asyncio.to_thread(db.scheduled_deletion_add, chat_id, message_id, delete_at.isoformat())
+    except Exception as e:
+        logger.error(f"could not persist deletion of {chat_id}/{message_id}: {e}")
+    _arm_message_deletion(job_queue, chat_id, message_id, delay_seconds)
+
+
+def _arm_message_deletion(job_queue, chat_id, message_id, delay_seconds):
+    if job_queue is None:
+        return
+    name = f"scheduled_delete_{chat_id}_{message_id}"
+    for job in job_queue.get_jobs_by_name(name):
+        job.schedule_removal()
+    job_queue.run_once(
+        scheduled_delete_callback, max(delay_seconds, 1),
+        chat_id=chat_id, name=name, data={"chat_id": chat_id, "message_id": message_id},
+    )
+
+
+async def scheduled_delete_callback(context: ContextTypes.DEFAULT_TYPE):
+    data = context.job.data or {}
+    chat_id, message_id = data.get("chat_id"), data.get("message_id")
+    if chat_id is None or message_id is None:
+        return
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except (TimedOut, NetworkError):
+        _arm_message_deletion(context.job_queue, chat_id, message_id, 60)  # transient: keep the row, retry
+        return
+    except Exception:
+        pass  # already gone / too old / no permission - nothing more to do
+    try:
+        await asyncio.to_thread(db.scheduled_deletion_remove, chat_id, message_id)
+    except Exception as e:
+        logger.error(f"could not clear deletion row {chat_id}/{message_id}: {e}")
+
+
+def restore_scheduled_deletions(job_queue):
+    """On boot: re-arm every persisted message deletion (overdue ones fire ~1s
+    after start)."""
+    if job_queue is None:
+        return
+    now = datetime.now()
+    for chat_id, message_id, delete_at in db.scheduled_deletion_get_all():
+        try:
+            remaining = (datetime.fromisoformat(delete_at) - now).total_seconds()
+        except (TypeError, ValueError):
+            remaining = 0
+        _arm_message_deletion(job_queue, chat_id, message_id, remaining)
+
+
+async def _finish_request_prompt(context, row, kind, fallback_message_id=None):
+    """Edits the prompt to show the outcome (buttons removed), then schedules its
+    deletion according to the group's /deleterequestprompt setting. Prompts
+    delivered to a DM (positive chat id) are never deleted."""
+    chat_id = row["chat_id"]
+    message_id = row["message_id"] or fallback_message_id
+    if chat_id is None or message_id is None:
+        return
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id, message_id=message_id,
+            text=_request_outcome_text(row, kind), parse_mode="HTML", reply_markup=None,
+        )
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            logger.info(f"request {row['id']}: couldn't edit prompt: {e}")
+    except Exception as e:
+        logger.info(f"request {row['id']}: couldn't edit prompt: {e}")
+
+    if chat_id < 0:
+        try:
+            delay = await asyncio.to_thread(
+                db.request_prompt_delete_get, chat_id, REQUEST_PROMPT_DELETE_DEFAULT_SECONDS
+            )
+        except Exception:
+            delay = REQUEST_PROMPT_DELETE_DEFAULT_SECONDS
+        if delay and delay > 0:
+            await schedule_message_deletion(context.job_queue, chat_id, message_id, delay)
+
+
+def _schedule_request_expiry(job_queue, rid, seconds):
+    if job_queue is None:
+        return
+    name = _request_job_name(rid)
+    for job in job_queue.get_jobs_by_name(name):
+        job.schedule_removal()
+    job_queue.run_once(request_expire_callback, max(seconds, 1), name=name, data={"rid": rid})
+
+
+def _cancel_request_expiry(job_queue, rid):
+    if job_queue is None:
+        return
+    for job in job_queue.get_jobs_by_name(_request_job_name(rid)):
+        job.schedule_removal()
+
+
+async def request_expire_callback(context: ContextTypes.DEFAULT_TYPE):
+    rid = (context.job.data or {}).get("rid")
+    if rid is None:
+        return
+    row = await asyncio.to_thread(db.request_expire, rid)
+    if not row:
+        return  # already paid / declined / expired
+    await _finish_request_prompt(context, row, "expired")
+
+
+def restore_money_requests(job_queue):
+    """On boot: re-arm the 10-minute expiry of every pending request (overdue
+    ones expire ~1s after start, their prompts get edited then)."""
+    if job_queue is None:
+        return
+    now = datetime.now()
+    for row in db.request_get_pending():
+        try:
+            remaining = REQUEST_EXPIRE_SECONDS - (now - datetime.fromisoformat(row["created_at"])).total_seconds()
+        except (TypeError, ValueError):
+            remaining = 0
+        _schedule_request_expiry(job_queue, row["id"], remaining)
+
+
+@premium_only
+async def request_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    parsed = await _parse_money_command(update, context, REQUEST_USAGE)
+    if not parsed:
+        return
+    target_id, target_name, amount = parsed
+    requester = update.effective_user
+    chat = update.effective_chat
+    in_dm = chat.type == ChatType.PRIVATE
+    prompt_chat_id = target_id if in_dm else chat.id  # DM: deliver to the target's DM
+
+    status, value, swept = await asyncio.to_thread(
+        db.request_create, prompt_chat_id, requester.id, requester.first_name, target_id, target_name,
+        amount, REQUEST_COOLDOWN_SECONDS, REQUEST_MAX_PENDING, REQUEST_EXPIRE_SECONDS,
+    )
+    for old in swept:  # overdue ones that just got expired: update their prompts
+        _cancel_request_expiry(context.job_queue, old["id"])
+        await _finish_request_prompt(context, old, "expired")
+
+    if status == "cooldown":
+        await update.message.reply_text(f"⏳ Slow down - you can send another request in {value} seconds.")
+        return
+    if status == "pair":
+        await update.message.reply_text("❌ You already have a pending request to that person. Wait for their answer (it expires in 10 minutes).")
+        return
+    if status == "max":
+        await update.message.reply_text(f"❌ You already have {REQUEST_MAX_PENDING} pending requests. Wait for some to be answered or expire.")
+        return
+
+    rid = value
+    row = await asyncio.to_thread(db.request_get, rid)
+    try:
+        sent = await safe_send(
+            context.bot, prompt_chat_id,
+            text=_request_prompt_text(row), parse_mode="HTML",
+            reply_markup=_request_prompt_keyboard(rid),
+        )
+    except Forbidden:
+        sent = None
+        if in_dm:
+            await asyncio.to_thread(db.request_expire, rid)
+            await update.message.reply_text(
+                "⚠️ I couldn't deliver that request - they haven't started a private chat with me, so I can't message them."
+            )
+            return
+    except Exception as e:
+        logger.error(f"request {rid}: prompt send failed: {e}")
+        sent = None
+
+    if sent is None:
+        await asyncio.to_thread(db.request_expire, rid)  # frees the slot; no money moved
+        await update.message.reply_text("⚠️ I couldn't send that request right now. Please try again in a moment.")
+        return
+
+    await asyncio.to_thread(db.request_set_message, rid, prompt_chat_id, sent.message_id)
+    _schedule_request_expiry(context.job_queue, rid, REQUEST_EXPIRE_SECONDS)
+    if in_dm:
+        await update.message.reply_text("📨 Request delivered to their DM.")
+
+
+async def request_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    try:
+        _p, action, rid = query.data.split(":")
+        rid = int(rid)
+    except ValueError:
+        await query.answer()
+        return
+
+    fallback_mid = query.message.message_id if query.message else None
+
+    row = await asyncio.to_thread(db.request_get, rid)
+    if not row:
+        await query.answer("This request no longer exists.", show_alert=True)
+        return
+    if user.id != row["target_id"]:
+        await query.answer("This request isn't for you.", show_alert=True)
+        return
+
+    if action == "y":
+        try:
+            code, row2, extra = await asyncio.to_thread(db.request_pay, rid, user.id, REQUEST_EXPIRE_SECONDS)
+        except Exception as e:
+            logger.error(f"request {rid}: payment failed: {e}", exc_info=True)
+            await query.answer("⚠️ Something went wrong and nothing was moved. Please try again.", show_alert=True)
+            return
+        if code == "insufficient":
+            await query.answer(
+                f"You don't have enough {DOLLAR} - your balance is {DOLLAR}{extra}. "
+                f"The request stays open until it expires.",
+                show_alert=True,
+            )
+            return
+        if code == "paid":
+            _cancel_request_expiry(context.job_queue, rid)
+            await query.answer("✅ Sent!")
+            await _finish_request_prompt(context, row2, "paid", fallback_mid)
+            return
+    else:
+        code, row2 = await asyncio.to_thread(db.request_decline, rid, user.id, REQUEST_EXPIRE_SECONDS)
+        if code == "declined":
+            _cancel_request_expiry(context.job_queue, rid)
+            await query.answer("Declined.")
+            await _finish_request_prompt(context, row2, "declined", fallback_mid)
+            return
+
+    if code == "expired":
+        _cancel_request_expiry(context.job_queue, rid)
+        await query.answer("⌛ This request has expired.", show_alert=True)
+        await _finish_request_prompt(context, row2, "expired", fallback_mid)
+    elif code == "closed":
+        await query.answer("This request was already answered.", show_alert=True)
+    else:
+        await query.answer("This request isn't for you.", show_alert=True)
+
+
+# ------------------------ /deleterequestprompt --------------------------
+
+def _request_prompt_delete_status(seconds) -> str:
+    return "off (prompts are never deleted)" if not seconds else f"on - deleted {_format_duration_words(seconds)} after the answer"
+
+
+async def deleterequestprompt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if chat.type == ChatType.PRIVATE:
+        await update.message.reply_text("🗑️ Run /deleterequestprompt inside the group you want to apply it to.")
+        return
+    if not (is_owner(update.effective_user.id) or await is_chat_admin(update, context)):
+        await update.message.reply_text("❌ Only group admins (or the bot owner) can use /deleterequestprompt.")
+        return
+
+    usage = (
+        "Usage:\n/deleterequestprompt off\n/deleterequestprompt on\n"
+        "/deleterequestprompt on <1-9>s  or  on <1-9>m\n(no arguments shows the current setting)"
+    )
+    args = [a.lower() for a in (context.args or [])]
+    if not args:
+        current = await asyncio.to_thread(
+            db.request_prompt_delete_get, chat.id, REQUEST_PROMPT_DELETE_DEFAULT_SECONDS
+        )
+        await update.message.reply_text(f"🗑️ Request prompts here: {_request_prompt_delete_status(current)}.\n\n{usage}")
+        return
+
+    if args == ["off"]:
+        seconds = 0
+    elif args == ["on"]:
+        seconds = REQUEST_PROMPT_DELETE_DEFAULT_SECONDS
+    elif len(args) == 2 and args[0] == "on" and re.fullmatch(r"[1-9][sm]", args[1]):
+        seconds = int(args[1][0]) * (60 if args[1][1] == "m" else 1)
+    else:
+        await update.message.reply_text(usage)
+        return
+
+    await asyncio.to_thread(db.request_prompt_delete_set, chat.id, seconds)
+    await update.message.reply_text(f"✅ Request prompts here: {_request_prompt_delete_status(seconds)}.")
 
 
 async def premiumstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7972,10 +9201,16 @@ def main():
     app.add_handler(CommandHandler("join", join_command))
     app.add_handler(CommandHandler("starttournament", starttournament_command))
     app.add_handler(CommandHandler("stoptournament", stoptournament_command))
+    app.add_handler(CommandHandler("resumetournament", resumetournament_command))
     app.add_handler(CommandHandler("extendlobby", extendlobby_command))
     app.add_handler(CommandHandler("giftpremium", giftpremium_command))
     app.add_handler(CommandHandler("buypremium", buypremium_command))
     app.add_handler(CommandHandler("premiumstatus", premiumstatus_command))
+    app.add_handler(CommandHandler("buydollar", buydollar_command))
+    app.add_handler(CommandHandler("setdollarpack", setdollarpack_command))
+    app.add_handler(CommandHandler("transfer", transfer_command))
+    app.add_handler(CommandHandler("request", request_command))
+    app.add_handler(CommandHandler("deleterequestprompt", deleterequestprompt_command))
     app.add_handler(CommandHandler("setpremium", setpremium_command))
     app.add_handler(CommandHandler("seepremiumplayers", seepremiumplayers_command))
     app.add_handler(CommandHandler("starbalance", starbalance_command))
@@ -7984,6 +9219,9 @@ def main():
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, premium_successful_payment_callback))
     # Specific callback patterns must be registered BEFORE the catch-all button handler.
     app.add_handler(CallbackQueryHandler(buypremium_button, pattern=r"^buypremium$"))
+    app.add_handler(CallbackQueryHandler(buydollar_button, pattern=r"^bd:\d+:\d+:\d+:\d+$"))
+    app.add_handler(CallbackQueryHandler(transfer_button, pattern=r"^tf:[yn]:[0-9a-f]+$"))
+    app.add_handler(CallbackQueryHandler(request_button, pattern=r"^rq:[yn]:\d+$"))
     app.add_handler(CallbackQueryHandler(premium_players_page_button, pattern=r"^spp:\d+$"))
     app.add_handler(CommandHandler("profile", profile_command))
     app.add_handler(CommandHandler("inviteandearn", inviteandearn_command))
@@ -8013,9 +9251,12 @@ def main():
         restore_stale_slowmode_waits(app.job_queue)
         restore_stale_word_games(app.job_queue)
         restore_autodelete_jobs(app.job_queue)
+        restore_scheduled_deletions(app.job_queue)
+        restore_money_requests(app.job_queue)
         restore_stale_invite_rewards(app.job_queue)
         schedule_premium_reminder_job(app.job_queue)
         restore_stale_tournaments(app.job_queue)
+        schedule_tournament_pause_check(app.job_queue)
 
         if db.get_config("scramble_mode_enabled", "0") == "1":
             try:
