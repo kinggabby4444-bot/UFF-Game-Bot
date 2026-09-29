@@ -1671,7 +1671,8 @@ async def scrambleallcommands_command(update: Update, context: ContextTypes.DEFA
 /profile - view your own profile (balance, level, rank)
 /buypremium - premium doubles your 💵 Word Scramble and Word Game rewards (paid with Telegram Stars)
 /premiumstatus - see whether premium is active and how much time is left
-/bbb &lt;fee&gt; &lt;difficulty&gt; &lt;rounds&gt;rounds - host a Word Scramble tournament in a group (e.g. /bbb 2000 Medium 3rounds); everyone pays the entry fee from their Word Scramble balance and the winner takes the pot
+/settournament &lt;fee&gt; &lt;difficulty&gt; &lt;rounds&gt;rounds - host a Word Scramble tournament in a group (e.g. /settournament 2000 Medium 3rounds); everyone pays the entry fee from their Word Scramble balance and the winner takes the pot
+/tournament - quick-start a tournament instantly: same as /settournament 5 easy 20rounds
 /join - join the tournament lobby that's open in this group
 
 <b>🛡️ Group Admin Commands</b>
@@ -1692,7 +1693,7 @@ async def scrambleallcommands_command(update: Update, context: ContextTypes.DEFA
 /controlgroup automaticmode on|off &lt;group&gt; | slowmode on &lt;time&gt;|off &lt;group&gt; - owner only: remotely control Slow Mode / Automatic Mode in any group (&lt;group&gt; = ID, @username or allgroups)
 /bbbstart - tournament host, bot owner or Bot Admins: start the lobby early
 /bbbcancel - tournament host, bot owner or Bot Admins: cancel a lobby and refund everyone
-/tournamentban &lt;username|ID&gt; - owner/Bot Admins: ban a player (or reply to them) from tournaments only; also accepts a group username/ID to ban that group from running /bbb
+/tournamentban &lt;username|ID&gt; - owner/Bot Admins: ban a player (or reply to them) from tournaments only; also accepts a group username/ID to ban that group from running tournaments
 /tournamentunban &lt;username|ID&gt; - owner/Bot Admins: undo a tournament ban (player or group)
 /setpremium &lt;stars&gt; &lt;duration&gt; - owner only: set the premium price and length (no args shows current)
 /seepremiumplayers - owner only: every current premium player with time remaining
@@ -2896,7 +2897,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 💵 Balance: <b>{target_player[2]}</b>
 ⭐ Level: <b>{target_player[3]}</b>
 🏅 Rank: <b>{target_player[4]}</b>
-""")
+
+Tap a button below to continue your adventure!
+""", reply_markup=main_menu())
         return
 
     player = await asyncio.to_thread(db.get_user, user.id)
@@ -5697,8 +5700,8 @@ async def tournamentban_command(update: Update, context: ContextTypes.DEFAULT_TY
     usage = (
         "Usage: /tournamentban <username|ID>  (or reply to a user's message)\n"
         "/tournamentban <group username|group ID>\n\n"
-        "Bans a player from /bbb and /join (they can still play the normal games), "
-        "or bans a group from running /bbb."
+        "Bans a player from /settournament, /tournament and /join (they can still play the normal games), "
+        "or bans a group from running tournaments."
     )
     target = await _resolve_tournament_ban_target(update, usage)
     if target is None:
@@ -6436,7 +6439,8 @@ async def allcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 /claimdailyreward - claim today's daily reward
 /buypremium - premium doubles your 💵 rewards in Word Game and Word Scramble (paid with Telegram Stars)
 /premiumstatus - see whether premium is active and how much time is left
-/bbb &lt;fee&gt; &lt;difficulty&gt; &lt;rounds&gt;rounds - host a Word Scramble tournament in a group (e.g. /bbb 2000 Medium 3rounds); everyone pays the entry fee from their Word Scramble balance and the winner takes the pot
+/settournament &lt;fee&gt; &lt;difficulty&gt; &lt;rounds&gt;rounds - host a Word Scramble tournament in a group (e.g. /settournament 2000 Medium 3rounds); everyone pays the entry fee from their Word Scramble balance and the winner takes the pot
+/tournament - quick-start a tournament instantly: same as /settournament 5 easy 20rounds
 /join - join the tournament lobby that's open in this group
 
 <b>🎮 Group Commands</b>
@@ -6463,7 +6467,7 @@ async def allcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 /unbanuser &lt;ID&gt; - unban a user
 /bangroup &lt;ID&gt; - ban a group (bot leaves immediately)
 /unbangroup &lt;ID&gt; - unban a group
-/tournamentban &lt;username|ID&gt; - ban a player (or reply to them) from tournaments only; also accepts a group username/ID to ban that group from running /bbb
+/tournamentban &lt;username|ID&gt; - ban a player (or reply to them) from tournaments only; also accepts a group username/ID to ban that group from running tournaments
 /tournamentunban &lt;username|ID&gt; - undo a tournament ban (player or group)
 /controlgroup automaticmode on|off &lt;group&gt; | slowmode on &lt;time&gt;|off &lt;group&gt; - owner only: control Word Scramble Slow Mode / Automatic Mode in any group (&lt;group&gt; = ID, @username or allgroups)
 /bbbstart - tournament host, bot owner or Bot Admins: start the lobby early
@@ -6679,13 +6683,16 @@ async def claimeddailyreward_command(update: Update, context: ContextTypes.DEFAU
 
 
 # =======================================================================
-# WORD SCRAMBLE TOURNAMENT (/bbb)
+# WORD SCRAMBLE TOURNAMENT (/settournament, /tournament)
 # =======================================================================
 
 TOURNAMENT_LOBBY_SECONDS = 120
 TOURNAMENT_ROUND_SECONDS = 60
 TOURNAMENT_POINTS_PER_WIN = 5
-TOURNAMENT_MIN_FEE = 100
+TOURNAMENT_MIN_FEE = 5
+TOURNAMENT_QUICK_FEE = 5
+TOURNAMENT_QUICK_DIFFICULTY = "easy"
+TOURNAMENT_QUICK_ROUNDS = 20
 TOURNAMENT_MAX_FEE = 100000
 TOURNAMENT_MIN_ROUNDS = 1
 TOURNAMENT_MAX_ROUNDS = 20
@@ -6693,8 +6700,10 @@ TOURNAMENT_DIFFICULTIES = ("easy", "easy3", "easy4", "easy5", "easy6", "medium",
 TOURNAMENT_START_RETRY_SECONDS = 8
 TOURNAMENT_START_MAX_ATTEMPTS = 30
 TOURNAMENT_USAGE = (
-    "Usage: /bbb <fee> <difficulty> <rounds>rounds\n"
-    "Example: /bbb 2000 Medium 3rounds\n\n"
+    "Usage: /settournament <fee> <difficulty> <rounds>rounds\n"
+    "Example: /settournament 2000 Medium 3rounds\n"
+    "Too lazy to type it all? /tournament starts one instantly "
+    f"({TOURNAMENT_QUICK_FEE} fee, {TOURNAMENT_QUICK_DIFFICULTY}, {TOURNAMENT_QUICK_ROUNDS} rounds).\n\n"
     f"Fee: {TOURNAMENT_MIN_FEE:,}-{TOURNAMENT_MAX_FEE:,} • Rounds: {TOURNAMENT_MIN_ROUNDS}-{TOURNAMENT_MAX_ROUNDS}\n"
     "Difficulty: easy, easy3-easy6, medium, hard, off"
 )
@@ -6830,17 +6839,33 @@ def _parse_bbb_args(args):
     return fee, difficulty, rounds, None
 
 
-async def bbb_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    user = update.effective_user
-
-    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+async def settournament_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         await update.message.reply_text("🏟️ Tournaments can only be started inside a group.")
         return
 
     fee, difficulty, rounds, error = _parse_bbb_args(context.args)
     if error:
         await update.message.reply_text(error)
+        return
+
+    await _open_tournament_lobby(update, context, fee, difficulty, rounds)
+
+
+async def tournament_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Lazy-typer shortcut: identical to /settournament 5 easy 20rounds."""
+    await _open_tournament_lobby(
+        update, context,
+        TOURNAMENT_QUICK_FEE, TOURNAMENT_QUICK_DIFFICULTY, TOURNAMENT_QUICK_ROUNDS,
+    )
+
+
+async def _open_tournament_lobby(update: Update, context: ContextTypes.DEFAULT_TYPE, fee, difficulty, rounds):
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await update.message.reply_text("🏟️ Tournaments can only be started inside a group.")
         return
 
     if await asyncio.to_thread(db.is_tournament_banned, "group", chat.id):
@@ -7817,7 +7842,8 @@ def main():
     # --- Invite & Earn -------------------------------------------------
     app.add_handler(CommandHandler("invitereward", invitereward_command))
     app.add_handler(CommandHandler("claim", claim_command))
-    app.add_handler(CommandHandler("bbb", bbb_command))
+    app.add_handler(CommandHandler("settournament", settournament_command))
+    app.add_handler(CommandHandler("tournament", tournament_command))
     app.add_handler(CommandHandler("join", join_command))
     app.add_handler(CommandHandler("bbbstart", bbbstart_command))
     app.add_handler(CommandHandler("bbbcancel", bbbcancel_command))
