@@ -1227,11 +1227,10 @@ async def approve_application(context, application_id, actor_id):
         await context.bot.send_message(
             chat_id=applicant_id,
             text=(
-                "✅ Congratulations!\n\n"
-                "We have received your advertisement."
-                " To proceed, go ahead "
-                "and pay using the instructions below, then send your payment "
-                "proof (screenshot, photo, or PDF) right here in this chat."
+                "⏳ Advertisement Pending Payment\n\n"
+                "We have received your advertisement, but it will not go live until payment is completed.\n\n"
+                "To proceed, pay using the instructions below, then send your payment proof "
+                "(screenshot, photo, or PDF) right here in this chat."
             ),
         )
         await send_payment_instructions(context, application_id, applicant_id, price, currency)
@@ -2233,6 +2232,103 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"📣 Broadcast sent to {sent} recipient(s). {failed} failed to deliver.")
 
 
+MESSAGEAPPLICANT_USAGE = (
+    "Usage: /messageapplicant <username|Allapplicants> <message text>\n"
+    "Example: /messageapplicant @john Hello!\n"
+    "Example: /messageapplicant Allapplicants Hello everyone!"
+)
+
+
+@owner_or_admin_only
+async def messageapplicant_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("This command only works in a private chat with me.")
+        return
+
+    # Parse from the raw text so the message is sent verbatim (newlines kept).
+    parts = (update.message.text or "").split(None, 2)
+    if len(parts) < 3 or not parts[2].strip():
+        await update.message.reply_text(MESSAGEAPPLICANT_USAGE)
+        return
+
+    target = parts[1].strip()
+    message_text = parts[2]
+
+    if target.lower() == "allapplicants":
+        recipient_ids = await asyncio.to_thread(db.get_all_distinct_applicant_ids)
+        if not recipient_ids:
+            await update.message.reply_text("No applicants found.")
+            return
+        sent = 0
+        failed = 0
+        for uid in recipient_ids:
+            try:
+                await context.bot.send_message(chat_id=uid, text=message_text)
+                sent += 1
+            except Exception:
+                failed += 1
+            await asyncio.sleep(0.05)
+        await update.message.reply_text(
+            f"📣 Message sent to {sent} applicant(s). {failed} failed to deliver."
+        )
+        return
+
+    applicant_id = await asyncio.to_thread(db.get_applicant_id_by_username, target)
+    if applicant_id is None:
+        await update.message.reply_text(
+            f"❌ No applicant found with username {target}.\n\n{MESSAGEAPPLICANT_USAGE}"
+        )
+        return
+    try:
+        await context.bot.send_message(chat_id=applicant_id, text=message_text)
+        await update.message.reply_text(f"✅ Message sent to {target}.")
+    except Exception as e:
+        logger.error(f"/messageapplicant failed for {applicant_id}: {e}")
+        await update.message.reply_text(f"⚠️ Couldn't deliver the message to {target}.")
+
+
+MIRROR_TEXT_LIMIT = 3000
+
+
+async def mirror_applicant_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Copies every private message an applicant sends to this bot over to the
+    owner, headed by the sender's name as a tappable link plus their user ID.
+    Runs non-blocking alongside the normal handlers and swallows its own
+    errors, so it can never interfere with the submission flow or commands."""
+    try:
+        message = update.effective_message
+        user = update.effective_user
+        chat = update.effective_chat
+        if not message or not user or not chat or chat.type != ChatType.PRIVATE or user.is_bot:
+            return
+        if await asyncio.to_thread(is_owner_or_admin, user.id):
+            return  # the owner/admins talking to their own bot isn't an applicant message
+
+        name = user.full_name or "Unknown"
+        header = (
+            "📩 <b>Message from an applicant</b>\n"
+            f'👤 <a href="tg://user?id={user.id}">{esc(name)}</a>'
+            + (f" (@{esc(user.username)})" if user.username else "")
+            + f"\n🆔 <code>{user.id}</code>"
+        )
+
+        if message.text and len(message.text) <= MIRROR_TEXT_LIMIT:
+            await context.bot.send_message(
+                chat_id=OWNER_ID,
+                text=f"{header}\n\n{esc(message.text)}",
+                parse_mode="HTML",
+            )
+            return
+
+        # Long text or media (photo, document, voice, sticker, ...): header, then an exact copy.
+        await context.bot.send_message(chat_id=OWNER_ID, text=header, parse_mode="HTML")
+        await context.bot.copy_message(
+            chat_id=OWNER_ID, from_chat_id=chat.id, message_id=message.message_id
+        )
+    except Exception as e:
+        logger.warning(f"mirror_applicant_message failed: {e}")
+
+
 STATUS_EMOJI = {
     "active": "🟢", "scheduled": "🟡", "expiring_soon": "🟠",
     "expired": "🔴", "paused": "⏸", "cancelled": "❌",
@@ -2746,6 +2842,7 @@ async def allcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 /payments - payments waiting for verification (owner/admin)
 /searchads &lt;query&gt; - search by user/business/link/ID (owner)
 /broadcast &lt;everyone|approved|pending|rejected&gt; &lt;message&gt;
+/messageapplicant &lt;username|Allapplicants&gt; &lt;message&gt;
 /approveall - approve every currently pending application (owner)
 /rejectall [reason] - reject every currently pending application (owner)
 
@@ -2897,6 +2994,17 @@ def main():
 
     app.add_error_handler(error_handler)
 
+    # Mirror every applicant message to the owner. group=-1 + block=False: runs
+    # alongside (never instead of) the normal handlers below.
+    app.add_handler(
+        MessageHandler(
+            filters.ChatType.PRIVATE & filters.UpdateType.MESSAGE & ~filters.SUCCESSFUL_PAYMENT,
+            mirror_applicant_message,
+            block=False,
+        ),
+        group=-1,
+    )
+
     app.add_handler(submit_conversation)
 
     app.add_handler(CommandHandler("setrates", setrates_command))
@@ -2909,6 +3017,7 @@ def main():
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("searchads", searchads_command))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
+    app.add_handler(CommandHandler("messageapplicant", messageapplicant_command))
     app.add_handler(CommandHandler("approveall", approveall_command))
     app.add_handler(CommandHandler("rejectall", rejectall_command))
     app.add_handler(CommandHandler("changecontactsupport", changecontactsupport_command))

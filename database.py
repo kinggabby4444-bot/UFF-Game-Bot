@@ -429,6 +429,77 @@ def create_tables():
         """)
 
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_invite_rewards_chat ON invite_rewards (chat_id, status)")
+
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS tournament_bans (
+            id BIGSERIAL PRIMARY KEY,
+            target_type TEXT,
+            target_id BIGINT NOT NULL,
+            banned_by BIGINT,
+            banned_at TEXT
+        )
+        """)
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tournament_bans_target "
+            "ON tournament_bans (target_type, target_id)"
+        )
+
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS tournaments (
+            id BIGSERIAL PRIMARY KEY,
+            chat_id BIGINT NOT NULL,
+            host_id BIGINT NOT NULL,
+            fee INTEGER NOT NULL,
+            difficulty TEXT,
+            total_rounds INTEGER NOT NULL,
+            current_round INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'lobby',
+            current_word TEXT,
+            current_scrambled TEXT,
+            round_started_at TEXT,
+            created_at TEXT
+        )
+        """)
+        cursor.execute("ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS lobby_message_id BIGINT")
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS tournament_players (
+            id BIGSERIAL PRIMARY KEY,
+            tournament_id BIGINT NOT NULL,
+            user_id BIGINT NOT NULL,
+            name TEXT,
+            score INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'staked'
+        )
+        """)
+        # Hard guarantees behind the app-level checks: one open tournament per
+        # chat, and one row per player per tournament.
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tournaments_one_open_per_chat "
+            "ON tournaments (chat_id) WHERE status IN ('lobby', 'active')"
+        )
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tournament_players_unique "
+            "ON tournament_players (tournament_id, user_id)"
+        )
+
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS premium_users (
+            user_id BIGINT PRIMARY KEY,
+            expires_at TEXT,
+            last_renewal_prompt_at TEXT
+        )
+        """)
+        # One row per Stars charge, so a redelivered successful_payment update
+        # can never grant premium twice.
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS premium_payments (
+            charge_id TEXT PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            stars INTEGER,
+            duration_seconds INTEGER,
+            paid_at TEXT
+        )
+        """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_invite_rewards_inviter ON invite_rewards (inviter_id, status)")
 
         conn.commit()
@@ -1571,6 +1642,618 @@ def is_group_banned(chat_id):
         cursor = conn.cursor()
         cursor.execute("SELECT 1 FROM banned_groups WHERE chat_id=%s", (chat_id,))
         return cursor.fetchone() is not None
+    finally:
+        conn.close()
+
+
+def tournament_ban(target_type, target_id, banned_by):
+    """target_type is 'user' or 'group'. Idempotent (re-banning refreshes the row)."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO tournament_bans (target_type, target_id, banned_by, banned_at)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (target_type, target_id) DO UPDATE SET
+                banned_by=EXCLUDED.banned_by, banned_at=EXCLUDED.banned_at
+        """, (target_type, target_id, banned_by, datetime.now().isoformat()))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def tournament_unban(target_type, target_id):
+    """Returns True if a ban row was actually removed."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "DELETE FROM tournament_bans WHERE target_type=%s AND target_id=%s",
+            (target_type, target_id),
+        )
+        removed = cursor.rowcount > 0
+        conn.commit()
+        return removed
+    finally:
+        conn.close()
+
+
+def is_tournament_banned(target_type, target_id):
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT 1 FROM tournament_bans WHERE target_type=%s AND target_id=%s",
+            (target_type, target_id),
+        )
+        return cursor.fetchone() is not None
+    finally:
+        conn.close()
+
+
+# =======================================================================
+# WORD SCRAMBLE TOURNAMENT
+# Every money movement is done in the SAME transaction as the status change
+# that guards it (WHERE status='staked'), so a crash or double-fire can never
+# double-pay, double-refund, or take a stake without recording it.
+# =======================================================================
+
+_TOURNAMENT_COLS = (
+    "id, chat_id, host_id, fee, difficulty, total_rounds, current_round, status, "
+    "current_word, current_scrambled, round_started_at, created_at, lobby_message_id"
+)
+_TOURNAMENT_KEYS = [c.strip() for c in _TOURNAMENT_COLS.split(",")]
+
+
+def _tournament_row(row):
+    return dict(zip(_TOURNAMENT_KEYS, row)) if row else None
+
+
+def _tx_deduct(cursor, user_id, name, amount):
+    """Atomic conditional deduct inside an open transaction: balance >= amount
+    is checked and subtracted in ONE statement. Returns new balance or None."""
+    cursor.execute("""
+        UPDATE scramble_global_stats
+        SET earned = earned - %s, name = %s
+        WHERE user_id = %s AND earned >= %s
+        RETURNING earned
+    """, (amount, name, user_id, amount))
+    row = cursor.fetchone()
+    return row[0] if row else None
+
+
+def _tx_credit(cursor, user_id, name, amount):
+    """Additive credit inside an open transaction - identical SQL semantics to
+    scramble_adjust_global_earned, but sharing the caller's transaction."""
+    cursor.execute("""
+        INSERT INTO scramble_global_stats (user_id, name, wins, earned)
+        VALUES (%s, %s, 0, GREATEST(0, %s))
+        ON CONFLICT (user_id) DO UPDATE SET
+            earned = GREATEST(0, scramble_global_stats.earned + %s),
+            name = EXCLUDED.name
+        RETURNING earned
+    """, (user_id, name, amount, amount))
+    return cursor.fetchone()[0]
+
+
+def scramble_conditional_deduct(user_id, name, amount):
+    """Atomically deducts `amount` from the Word Scramble global balance only
+    if the balance covers it. Returns the new balance, or None if insufficient
+    (never deducts partially, never goes negative)."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        new_balance = _tx_deduct(cursor, user_id, name, amount)
+        conn.commit()
+        return new_balance
+    finally:
+        conn.close()
+
+
+def tournament_create(chat_id, host_id, host_name, fee, difficulty, total_rounds):
+    """Returns ('ok', tournament_id, host_new_balance) | ('exists', None, None)
+    | ('insufficient', None, None). Deduct + tournament row + host player row
+    are one transaction."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        try:
+            new_balance = _tx_deduct(cursor, host_id, host_name, fee)
+            if new_balance is None:
+                conn.rollback()
+                return "insufficient", None, None
+
+            cursor.execute("""
+                INSERT INTO tournaments (chat_id, host_id, fee, difficulty, total_rounds,
+                                         current_round, status, created_at)
+                SELECT %s, %s, %s, %s, %s, 0, 'lobby', %s
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM tournaments WHERE chat_id=%s AND status IN ('lobby', 'active')
+                )
+                RETURNING id
+            """, (chat_id, host_id, fee, difficulty, total_rounds, datetime.now().isoformat(), chat_id))
+            row = cursor.fetchone()
+            if not row:
+                conn.rollback()
+                return "exists", None, None
+            tid = row[0]
+
+            cursor.execute("""
+                INSERT INTO tournament_players (tournament_id, user_id, name, score, status)
+                VALUES (%s, %s, %s, 0, 'staked')
+            """, (tid, host_id, host_name))
+            conn.commit()
+            return "ok", tid, new_balance
+        except Exception as e:
+            conn.rollback()
+            if getattr(e, "pgcode", None) == "23505":  # racing create hit the unique index
+                return "exists", None, None
+            raise
+    finally:
+        conn.close()
+
+
+def tournament_join(tournament_id, user_id, name):
+    """Returns ('ok', new_balance) | ('closed', None) | ('already', None)
+    | ('insufficient', None)."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT status, fee FROM tournaments WHERE id=%s FOR UPDATE", (tournament_id,))
+            row = cursor.fetchone()
+            if not row or row[0] != "lobby":
+                conn.rollback()
+                return "closed", None
+            fee = row[1]
+
+            cursor.execute(
+                "SELECT 1 FROM tournament_players WHERE tournament_id=%s AND user_id=%s",
+                (tournament_id, user_id),
+            )
+            if cursor.fetchone():
+                conn.rollback()
+                return "already", None
+
+            new_balance = _tx_deduct(cursor, user_id, name, fee)
+            if new_balance is None:
+                conn.rollback()
+                return "insufficient", None
+
+            cursor.execute("""
+                INSERT INTO tournament_players (tournament_id, user_id, name, score, status)
+                VALUES (%s, %s, %s, 0, 'staked')
+            """, (tournament_id, user_id, name))
+            conn.commit()
+            return "ok", new_balance
+        except Exception as e:
+            conn.rollback()
+            if getattr(e, "pgcode", None) == "23505":
+                return "already", None
+            raise
+    finally:
+        conn.close()
+
+
+def tournament_get(tournament_id):
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT {_TOURNAMENT_COLS} FROM tournaments WHERE id=%s", (tournament_id,))
+        return _tournament_row(cursor.fetchone())
+    finally:
+        conn.close()
+
+
+def tournament_get_open_for_chat(chat_id):
+    """The chat's lobby/active tournament (at most one), or None."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"SELECT {_TOURNAMENT_COLS} FROM tournaments "
+            f"WHERE chat_id=%s AND status IN ('lobby', 'active')",
+            (chat_id,),
+        )
+        return _tournament_row(cursor.fetchone())
+    finally:
+        conn.close()
+
+
+def tournament_get_all_open():
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"SELECT {_TOURNAMENT_COLS} FROM tournaments WHERE status IN ('lobby', 'active')"
+        )
+        return [_tournament_row(r) for r in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+def tournament_get_players(tournament_id):
+    """Join order. Rows: (user_id, name, score, status)."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT user_id, name, score, status FROM tournament_players
+            WHERE tournament_id=%s ORDER BY id ASC
+        """, (tournament_id,))
+        return cursor.fetchall()
+    finally:
+        conn.close()
+
+
+def tournament_is_staked_player(tournament_id, user_id):
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT 1 FROM tournament_players
+            WHERE tournament_id=%s AND user_id=%s AND status='staked'
+        """, (tournament_id, user_id))
+        return cursor.fetchone() is not None
+    finally:
+        conn.close()
+
+
+def tournament_set_lobby_message(tournament_id, message_id):
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE tournaments SET lobby_message_id=%s WHERE id=%s", (message_id, tournament_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def tournament_activate(tournament_id):
+    """lobby -> active, exactly once (so /bbbstart and the 120s job can never
+    both start it). current_round counts rounds STARTED, so it begins at 0
+    and becomes 1 when round 1's word is set."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE tournaments SET status='active', current_round=0
+            WHERE id=%s AND status='lobby' RETURNING id
+        """, (tournament_id,))
+        ok = cursor.fetchone() is not None
+        conn.commit()
+        return ok
+    finally:
+        conn.close()
+
+
+def tournament_set_round(tournament_id, word, scrambled):
+    """Starts the next round. Returns the new round number, or None if the
+    tournament isn't active or a round is already live."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE tournaments
+            SET current_round = current_round + 1, current_word=%s, current_scrambled=%s,
+                round_started_at=%s
+            WHERE id=%s AND status='active' AND current_word IS NULL
+            RETURNING current_round
+        """, (word, scrambled, datetime.now().isoformat(), tournament_id))
+        row = cursor.fetchone()
+        conn.commit()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def tournament_unset_round(tournament_id, round_number):
+    """Rolls back a round whose word message never reached the group."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE tournaments
+            SET current_word=NULL, current_scrambled=NULL, round_started_at=NULL,
+                current_round = current_round - 1
+            WHERE id=%s AND status='active' AND current_round=%s AND current_word IS NOT NULL
+        """, (tournament_id, round_number))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def tournament_claim_round(tournament_id, scorer_id=None, points=0):
+    """Atomically closes the live round - only ONE caller (a correct guess or
+    the timeout job) can ever win this. If scorer_id is given, that player's
+    score is bumped in the same transaction (and only if they're a staked
+    player; otherwise nothing changes and None is returned).
+    Returns {word, round_no, total_rounds, score} or None."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            WITH old AS (
+                SELECT id, current_word FROM tournaments
+                WHERE id=%s AND status='active' AND current_word IS NOT NULL
+                FOR UPDATE
+            )
+            UPDATE tournaments t
+            SET current_word=NULL, current_scrambled=NULL, round_started_at=NULL
+            FROM old WHERE t.id = old.id
+            RETURNING old.current_word, t.current_round, t.total_rounds
+        """, (tournament_id,))
+        row = cursor.fetchone()
+        if not row:
+            conn.rollback()
+            return None
+        result = {"word": row[0], "round_no": row[1], "total_rounds": row[2], "score": None}
+
+        if scorer_id is not None:
+            cursor.execute("""
+                UPDATE tournament_players SET score = score + %s
+                WHERE tournament_id=%s AND user_id=%s AND status='staked'
+                RETURNING score
+            """, (points, tournament_id, scorer_id))
+            srow = cursor.fetchone()
+            if not srow:
+                conn.rollback()
+                return None
+            result["score"] = srow[0]
+
+        conn.commit()
+        return result
+    finally:
+        conn.close()
+
+
+def tournament_settle(tournament_id):
+    """Ends an ACTIVE tournament and pays out / refunds, all in one transaction.
+    Idempotent: a second call finds status='finished' and returns None.
+    Returns {case: 'single'|'tie'|'refund', fee, pot, chat_id,
+             standings: [(uid, name, score)] (score desc),
+             winners: [(uid, name, payout, new_balance)],
+             refunds: [(uid, name, fee, new_balance)]} or None."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT status, fee, chat_id FROM tournaments WHERE id=%s FOR UPDATE",
+                (tournament_id,),
+            )
+            trow = cursor.fetchone()
+            if not trow or trow[0] != "active":
+                conn.rollback()
+                return None
+            _status, fee, chat_id = trow
+
+            cursor.execute("""
+                SELECT user_id, name, score FROM tournament_players
+                WHERE tournament_id=%s AND status='staked' ORDER BY id ASC
+            """, (tournament_id,))
+            players = cursor.fetchall()
+            if not players:
+                cursor.execute("UPDATE tournaments SET status='finished', current_word=NULL WHERE id=%s", (tournament_id,))
+                conn.commit()
+                return {"case": "refund", "fee": fee, "pot": 0, "chat_id": chat_id,
+                        "standings": [], "winners": [], "refunds": []}
+
+            pot = fee * len(players)
+            top = max(p[2] for p in players)
+            standings = sorted(((p[0], p[1], p[2]) for p in players), key=lambda x: -x[2])
+            winners, refunds = [], []
+
+            def _mark(uid, new_status):
+                cursor.execute("""
+                    UPDATE tournament_players SET status=%s
+                    WHERE tournament_id=%s AND user_id=%s AND status='staked'
+                """, (new_status, tournament_id, uid))
+                return cursor.rowcount == 1
+
+            if top <= 0:
+                case = "refund"
+                for uid, name, _score in players:
+                    if _mark(uid, "refunded"):
+                        refunds.append((uid, name, fee, _tx_credit(cursor, uid, name, fee)))
+            else:
+                top_players = [p for p in players if p[2] == top]  # already in join order
+                case = "single" if len(top_players) == 1 else "tie"
+                share, remainder = divmod(pot, len(top_players))
+                for i, (uid, name, _score) in enumerate(top_players):
+                    payout = share + (remainder if i == 0 else 0)  # remainder -> earliest joiner
+                    if _mark(uid, "won"):
+                        winners.append((uid, name, payout, _tx_credit(cursor, uid, name, payout)))
+                for uid, name, score in players:
+                    if score != top:
+                        _mark(uid, "lost")
+
+            cursor.execute(
+                "UPDATE tournaments SET status='finished', current_word=NULL, current_scrambled=NULL "
+                "WHERE id=%s",
+                (tournament_id,),
+            )
+            conn.commit()
+            return {"case": case, "fee": fee, "pot": pot, "chat_id": chat_id,
+                    "standings": standings, "winners": winners, "refunds": refunds}
+        except Exception:
+            conn.rollback()
+            raise
+    finally:
+        conn.close()
+
+
+def tournament_abort(tournament_id, delete=False):
+    """Refunds every still-'staked' player and finalizes a lobby/active
+    tournament (status 'finished', or the rows deleted when delete=True).
+    One transaction, guarded per player by WHERE status='staked'.
+    Returns {chat_id, fee, refunds: [(uid, name, fee, new_balance)]} or None
+    if there was nothing open to abort."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT status, fee, chat_id FROM tournaments WHERE id=%s FOR UPDATE",
+                (tournament_id,),
+            )
+            trow = cursor.fetchone()
+            if not trow or trow[0] not in ("lobby", "active"):
+                conn.rollback()
+                return None
+            _status, fee, chat_id = trow
+
+            cursor.execute("""
+                SELECT user_id, name FROM tournament_players
+                WHERE tournament_id=%s AND status='staked' ORDER BY id ASC
+            """, (tournament_id,))
+            refunds = []
+            for uid, name in cursor.fetchall():
+                cursor.execute("""
+                    UPDATE tournament_players SET status='refunded'
+                    WHERE tournament_id=%s AND user_id=%s AND status='staked'
+                """, (tournament_id, uid))
+                if cursor.rowcount == 1:
+                    refunds.append((uid, name, fee, _tx_credit(cursor, uid, name, fee)))
+
+            if delete:
+                cursor.execute("DELETE FROM tournament_players WHERE tournament_id=%s", (tournament_id,))
+                cursor.execute("DELETE FROM tournaments WHERE id=%s", (tournament_id,))
+            else:
+                cursor.execute(
+                    "UPDATE tournaments SET status='finished', current_word=NULL, current_scrambled=NULL "
+                    "WHERE id=%s",
+                    (tournament_id,),
+                )
+            conn.commit()
+            return {"chat_id": chat_id, "fee": fee, "refunds": refunds}
+        except Exception:
+            conn.rollback()
+            raise
+    finally:
+        conn.close()
+
+
+def premium_get_expiry(user_id):
+    """Returns the premium expiry as a datetime, or None if there's no row."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT expires_at FROM premium_users WHERE user_id=%s", (user_id,))
+        row = cursor.fetchone()
+        if not row or not row[0]:
+            return None
+        try:
+            return datetime.fromisoformat(row[0])
+        except (TypeError, ValueError):
+            return None
+    finally:
+        conn.close()
+
+
+def premium_grant_from_payment(charge_id, user_id, stars, duration_seconds):
+    """Idempotent: records the charge and extends premium in ONE transaction.
+    Extends from the current expiry if still active, else from now.
+    Returns the new expiry (datetime), or None if this charge was already applied."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        now = datetime.now()
+        cursor.execute("""
+            INSERT INTO premium_payments (charge_id, user_id, stars, duration_seconds, paid_at)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (charge_id) DO NOTHING
+        """, (charge_id, user_id, stars, duration_seconds, now.isoformat()))
+        if cursor.rowcount == 0:
+            conn.rollback()
+            return None
+
+        cursor.execute("SELECT expires_at FROM premium_users WHERE user_id=%s FOR UPDATE", (user_id,))
+        row = cursor.fetchone()
+        base = now
+        if row and row[0]:
+            try:
+                current = datetime.fromisoformat(row[0])
+                if current > now:
+                    base = current
+            except (TypeError, ValueError):
+                pass
+        new_expiry = base + timedelta(seconds=duration_seconds)
+
+        cursor.execute("""
+            INSERT INTO premium_users (user_id, expires_at, last_renewal_prompt_at)
+            VALUES (%s, %s, NULL)
+            ON CONFLICT (user_id) DO UPDATE SET
+                expires_at=EXCLUDED.expires_at, last_renewal_prompt_at=NULL
+        """, (user_id, new_expiry.isoformat()))
+        conn.commit()
+        return new_expiry
+    finally:
+        conn.close()
+
+
+def premium_count_active():
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT COUNT(*) FROM premium_users WHERE expires_at::timestamp > %s::timestamp",
+            (datetime.now().isoformat(),),
+        )
+        return cursor.fetchone()[0]
+    finally:
+        conn.close()
+
+
+def premium_list_active(offset, limit):
+    """Live (non-expired) premium users, soonest-to-expire first.
+    Rows: (user_id, name, expires_at_iso)."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT p.user_id, u.name, p.expires_at
+            FROM premium_users p LEFT JOIN users u ON u.id = p.user_id
+            WHERE p.expires_at::timestamp > %s::timestamp
+            ORDER BY p.expires_at::timestamp ASC
+            OFFSET %s LIMIT %s
+        """, (datetime.now().isoformat(), offset, limit))
+        return cursor.fetchall()
+    finally:
+        conn.close()
+
+
+def premium_get_expiring_unprompted(within_seconds):
+    """Active premium users expiring within the window who haven't been
+    prompted for this expiry window yet. Rows: (user_id, expires_at_iso)."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        now = datetime.now()
+        cursor.execute("""
+            SELECT user_id, expires_at FROM premium_users
+            WHERE expires_at::timestamp > %s::timestamp
+              AND expires_at::timestamp <= %s::timestamp
+              AND last_renewal_prompt_at IS NULL
+        """, (now.isoformat(), (now + timedelta(seconds=within_seconds)).isoformat()))
+        return cursor.fetchall()
+    finally:
+        conn.close()
+
+
+def premium_mark_prompted(user_id):
+    """Returns True only for the call that actually flipped it (at-most-once)."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE premium_users SET last_renewal_prompt_at=%s "
+            "WHERE user_id=%s AND last_renewal_prompt_at IS NULL",
+            (datetime.now().isoformat(), user_id),
+        )
+        changed = cursor.rowcount > 0
+        conn.commit()
+        return changed
     finally:
         conn.close()
 

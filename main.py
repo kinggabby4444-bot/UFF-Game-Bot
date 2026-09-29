@@ -17,7 +17,7 @@ try:
 except ImportError:
     pass
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReactionTypeEmoji, LinkPreviewOptions
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReactionTypeEmoji, LinkPreviewOptions, LabeledPrice
 from telegram.constants import ChatType
 from telegram.error import Forbidden, BadRequest, TimedOut, NetworkError
 from telegram.ext import (
@@ -29,6 +29,7 @@ from telegram.ext import (
     TypeHandler,
     ContextTypes,
     ApplicationHandlerStop,
+    PreCheckoutQueryHandler,
     filters,
 )
 
@@ -944,6 +945,72 @@ async def scramble_timeout_callback(context: ContextTypes.DEFAULT_TYPE):
     await _scramble_auto_continue(context, chat_id, won=False)
 
 
+SCRAMBLE_SEND_RETRY_SECONDS = 8
+SCRAMBLE_SEND_RETRY_MAX_ATTEMPTS = 30
+
+
+def _scramble_send_retry_job_name(chat_id):
+    return f"scramble_send_retry_{chat_id}"
+
+
+def schedule_scramble_send_retry(job_queue, chat_id, kind, attempt=1):
+    """Short retry after a round's word message failed to send, so the chat
+    isn't left stuck for a whole 2-minute cycle. kind: 'auto' (Automatic
+    Mode) or 'global' (owner's /scramblemode)."""
+    if job_queue is None:
+        return
+    for job in job_queue.get_jobs_by_name(_scramble_send_retry_job_name(chat_id)):
+        job.schedule_removal()
+    job_queue.run_once(
+        scramble_send_retry_callback,
+        SCRAMBLE_SEND_RETRY_SECONDS,
+        chat_id=chat_id,
+        name=_scramble_send_retry_job_name(chat_id),
+        data={"kind": kind, "attempt": attempt},
+    )
+
+
+async def scramble_send_retry_callback(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = context.job.chat_id
+    data = context.job.data or {}
+    kind = data.get("kind", "auto")
+    attempt = data.get("attempt", 1)
+
+    if kind == "auto":
+        _, auto_enabled, _ = await asyncio.to_thread(db.scramble_get_auto_mode, chat_id)
+        if not auto_enabled:
+            return
+    else:
+        if await asyncio.to_thread(db.get_config, "scramble_mode_enabled", "0") != "1":
+            return
+
+    def _again():
+        if attempt >= SCRAMBLE_SEND_RETRY_MAX_ATTEMPTS:
+            logger.error(f"scramble send retry: giving up on chat {chat_id} after {attempt} attempts")
+            return
+        schedule_scramble_send_retry(context.job_queue, chat_id, kind, attempt + 1)
+
+    try:
+        chat = await context.bot.get_chat(chat_id)
+    except Exception:
+        _again()
+        return
+
+    try:
+        result = await start_scramble_round(context, chat)
+    except Exception as e:
+        logger.error(f"scramble send retry failed for chat {chat_id}: {e}")
+        return
+
+    if result == "send_failed":
+        logger.warning(f"scramble send retry: still can't reach chat {chat_id} (attempt {attempt})")
+        _again()
+    elif result == "tournament" and kind == "auto":
+        _again()
+    elif result is True and kind == "global":
+        await asyncio.to_thread(db.scramble_reset_manual_streak, chat_id)
+
+
 async def _scramble_auto_continue(context: ContextTypes.DEFAULT_TYPE, chat_id, won: bool, chat_obj=None):
     _, auto_enabled, _ = await asyncio.to_thread(db.scramble_get_auto_mode, chat_id)
     if not auto_enabled:
@@ -970,13 +1037,22 @@ async def _scramble_auto_continue(context: ContextTypes.DEFAULT_TYPE, chat_id, w
         except Exception:
             return
 
-    await start_scramble_round(context, chat)
+    result = await start_scramble_round(context, chat)
+    if result == "send_failed":
+        logger.warning(f"Automatic Mode: couldn't send next round to {chat_id}; retrying in {SCRAMBLE_SEND_RETRY_SECONDS}s")
+        schedule_scramble_send_retry(context.job_queue, chat_id, "auto")
+    elif result == "tournament":
+        # A tournament took over this chat - keep polling until it's over.
+        schedule_scramble_send_retry(context.job_queue, chat_id, "auto")
 
 
 async def start_scramble_round(context: ContextTypes.DEFAULT_TYPE, chat):
     maintenance = await asyncio.to_thread(db.get_config, "scramble_maintenance_mode", "0")
     if maintenance == "1":
         return "maintenance"
+
+    if chat.type != ChatType.PRIVATE and await asyncio.to_thread(db.tournament_get_open_for_chat, chat.id):
+        return "tournament"
 
     if await asyncio.to_thread(db.scramble_get_round, chat.id):
         return False
@@ -991,17 +1067,32 @@ async def start_scramble_round(context: ContextTypes.DEFAULT_TYPE, chat):
     if chat.type != ChatType.PRIVATE:
         await asyncio.to_thread(db.scramble_register_group, chat.id, chat.title or str(chat.id))
 
-    await safe_send(
-        context.bot,
-        chat.id,
-        text=(
-            f"🎮 <b>WORD SCRAMBLE</b> 🎮\n\n"
-            f"Unscramble this word:\n\n"
-            f"<b>{esc(scrambled)}</b>\n\n"
-            f"First to type the correct word in the next 2 minutes wins {DOLLAR}{get_scramble_reward()}"
-        ),
-        parse_mode="HTML",
-    )
+    try:
+        sent = await safe_send(
+            context.bot,
+            chat.id,
+            text=(
+                f"🎮 <b>WORD SCRAMBLE</b> 🎮\n\n"
+                f"Unscramble this word:\n\n"
+                f"<b>{esc(scrambled)}</b>\n\n"
+                f"First to type the correct word in the next 2 minutes wins {DOLLAR}{get_scramble_reward()}"
+            ),
+            parse_mode="HTML",
+        )
+    except Exception:
+        # Non-transient send error (e.g. bot removed / forbidden): never leave
+        # a phantom active round behind. Roll back, then let the caller's
+        # existing error handling see the exception exactly as before.
+        await asyncio.to_thread(db.scramble_claim_round, chat.id)
+        raise
+
+    if sent is None:
+        # The group never received the word - roll the round back so the DB
+        # (and the timeout job) don't believe a round is live.
+        await asyncio.to_thread(db.scramble_claim_round, chat.id)
+        logger.error(f"start_scramble_round: word message not delivered to {chat.id}; round rolled back")
+        return "send_failed"
+
     schedule_scramble_timeout(context, chat.id)
     return True
 
@@ -1024,6 +1115,12 @@ async def wordscramble_command(update: Update, context: ContextTypes.DEFAULT_TYP
                 "then just run this command again!"
             )
             return
+
+    if await asyncio.to_thread(db.tournament_get_open_for_chat, chat.id):
+        await update.message.reply_text(
+            "🏟️ A tournament is in progress here - Word Scramble rounds are paused until it ends."
+        )
+        return
 
     user = update.effective_user
     await asyncio.to_thread(db.scramble_increment_played, user.id, chat.id, user.first_name)
@@ -1049,6 +1146,14 @@ async def wordscramble_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(
             "🛠️ Word Scramble is currently under maintenance. Please try again later."
         )
+    elif result == "send_failed":
+        await update.message.reply_text(
+            "⚠️ Couldn't reach the chat right now — try /wordscramble again in a moment."
+        )
+    elif result == "tournament":
+        await update.message.reply_text(
+            "🏟️ A tournament is in progress here - Word Scramble rounds are paused until it ends."
+        )
 
 
 async def _scramble_handle_win(context: ContextTypes.DEFAULT_TYPE, chat, user, message, guessed_word_case):
@@ -1061,11 +1166,16 @@ async def _scramble_handle_win(context: ContextTypes.DEFAULT_TYPE, chat, user, m
     await safe_react(context.bot, chat.id, message.message_id, "🎉")
 
     reward = get_scramble_reward()
+    winner_is_premium = await asyncio.to_thread(is_premium, user.id)
+    if winner_is_premium:
+        reward *= 2
 
     await asyncio.to_thread(db.scramble_reset_all_streaks_in_chat, chat.id, user.id)
     new_streak = await asyncio.to_thread(db.scramble_record_win, user.id, chat.id, user.first_name, reward)
 
     bonus = SCRAMBLE_STREAK_MILESTONES.get(new_streak)
+    if bonus and winner_is_premium:
+        bonus *= 2
     total = reward
     if bonus:
         await asyncio.to_thread(db.scramble_add_bonus, user.id, chat.id, user.first_name, bonus)
@@ -1157,6 +1267,7 @@ async def scramble_private_text(update: Update, context: ContextTypes.DEFAULT_TY
 
 def scramble_help_text() -> str:
     reward = get_scramble_reward()
+    _premium_price, _premium_dur = get_premium_settings()
     return f"""
 🔤 <b>Word Scramble - How to Play</b>
 
@@ -1182,6 +1293,8 @@ Your streak resets if someone else wins a round before you do.
 /scrambletopgroups - the most active groups
 
 💡 Word Scramble's rewards and rankings are completely separate from the Word Game's - winning one never affects your stats in the other.
+
+⭐ <b>Premium</b>: /buypremium ({_premium_price} ⭐ for {_format_duration_words(_premium_dur)}) doubles your {DOLLAR} rewards here (streak bonuses too). Check /premiumstatus.
 """
 
 
@@ -1295,6 +1408,20 @@ async def scramblestopgame_command(update: Update, context: ContextTypes.DEFAULT
         return
 
     chat = update.effective_chat
+
+    open_tournament = await asyncio.to_thread(db.tournament_get_open_for_chat, chat.id)
+    if open_tournament:
+        if not await asyncio.to_thread(is_bot_admin_or_owner, update.effective_user.id):
+            await update.message.reply_text(
+                "🏟️ A tournament is running here - only the bot owner or bot admins can stop it."
+            )
+            return
+        await _tournament_abort_and_announce(
+            context, open_tournament["id"], chat.id,
+            "Tournament stopped by an admin.",
+        )
+        return
+
     word = await asyncio.to_thread(db.scramble_claim_round, chat.id)
     cancel_scramble_timeout(context, chat.id)
 
@@ -1431,6 +1558,18 @@ async def scrambleforceend_command(update: Update, context: ContextTypes.DEFAULT
 async def scramblestopallgroups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await asyncio.to_thread(db.set_config, "scramble_maintenance_mode", "1")
 
+    tournaments_stopped = 0
+    for t in await asyncio.to_thread(db.tournament_get_all_open):
+        try:
+            res = await _tournament_abort_and_announce(
+                context, t["id"], t["chat_id"],
+                "Tournament stopped - Word Scramble was stopped everywhere.",
+            )
+            if res:
+                tournaments_stopped += 1
+        except Exception as e:
+            logger.error(f"stopallgroups: failed to abort tournament {t['id']}: {e}")
+
     chat_ids = await asyncio.to_thread(db.get_all_active_scramble_chats)
     stopped = 0
 
@@ -1450,7 +1589,9 @@ async def scramblestopallgroups_command(update: Update, context: ContextTypes.DE
             )
 
     await update.message.reply_text(
-        f"🛑 Word Scramble stopped in {stopped} group(s)/chat(s).\n\n"
+        f"🛑 Word Scramble stopped in {stopped} group(s)/chat(s)."
+        + (f" {tournaments_stopped} tournament(s) cancelled and refunded." if tournaments_stopped else "")
+        + "\n\n"
         f"New rounds (manual, Automatic Mode, Slow Mode, and /scramblemode) are now paused "
         f"everywhere. Use /scramblemaintenance off to resume."
     )
@@ -1528,6 +1669,10 @@ async def scrambleallcommands_command(update: Update, context: ContextTypes.DEFA
 /inviteandearn - add me to a 200+ member group and keep me there 72 hours for a Word Scramble reward
 /claim - manual fallback to claim the Invite &amp; Earn reward for a qualifying group that was never automatically tracked
 /profile - view your own profile (balance, level, rank)
+/buypremium - premium doubles your 💵 Word Scramble and Word Game rewards (paid with Telegram Stars)
+/premiumstatus - see whether premium is active and how much time is left
+/bbb &lt;fee&gt; &lt;difficulty&gt; &lt;rounds&gt;rounds - host a Word Scramble tournament in a group (e.g. /bbb 2000 Medium 3rounds); everyone pays the entry fee from their Word Scramble balance and the winner takes the pot
+/join - join the tournament lobby that's open in this group
 
 <b>🛡️ Group Admin Commands</b>
 /scramblestopgame - group admins (or the owner) can stop an active round instantly
@@ -1544,6 +1689,15 @@ async def scrambleallcommands_command(update: Update, context: ContextTypes.DEFA
 /scramblestopallgroups - force-end the active round in EVERY chat at once and pause new ones (until /scramblemaintenance off)
 /scramblemaintenance on|off - pause new Word Scramble rounds only (Word Game unaffected)
 /scramblemode &lt;time&gt;|off - my DM only: auto-start a round in EVERY group on a repeating interval
+/controlgroup automaticmode on|off &lt;group&gt; | slowmode on &lt;time&gt;|off &lt;group&gt; - owner only: remotely control Slow Mode / Automatic Mode in any group (&lt;group&gt; = ID, @username or allgroups)
+/bbbstart - tournament host, bot owner or Bot Admins: start the lobby early
+/bbbcancel - tournament host, bot owner or Bot Admins: cancel a lobby and refund everyone
+/tournamentban &lt;username|ID&gt; - owner/Bot Admins: ban a player (or reply to them) from tournaments only; also accepts a group username/ID to ban that group from running /bbb
+/tournamentunban &lt;username|ID&gt; - owner/Bot Admins: undo a tournament ban (player or group)
+/setpremium &lt;stars&gt; &lt;duration&gt; - owner only: set the premium price and length (no args shows current)
+/seepremiumplayers - owner only: every current premium player with time remaining
+/starbalance - owner only: the bot's current Telegram Stars balance
+/withdraw - owner only: Stars balance + how to withdraw it via @BotFather
 /scrambletopup &lt;@user or ID&gt; &lt;+/-amount&gt; - adjust a player's Word Scramble balance only
 /scrambletopupspecific &lt;@user or ID&gt; &lt;+/-amount&gt; &lt;group ID or @username&gt; - adjust a player's balance as if earned in that specific group (reflects in that group's "in this chat" total and Global)
 /scrambleusers - every player who's used the command or guessed a word, tappable for details
@@ -1607,7 +1761,42 @@ async def slowmode_next_round_callback(context: ContextTypes.DEFAULT_TYPE):
         return
 
     await asyncio.to_thread(db.scramble_clear_next_round_due, chat_id)
-    await start_scramble_round(context, chat)
+    result = await start_scramble_round(context, chat)
+    if result == "send_failed":
+        # Word never reached the group: retry shortly (same callback) instead
+        # of waiting a whole slowmode interval; due-time is kept near-term.
+        logger.warning(f"Slowmode: couldn't send round to {chat_id}; retrying in {SCRAMBLE_SEND_RETRY_SECONDS}s")
+        await schedule_slowmode_next_round(context.job_queue, chat_id, SCRAMBLE_SEND_RETRY_SECONDS)
+    elif result == "tournament":
+        # Slow Mode stays on; check again once the tournament has had time to run.
+        await schedule_slowmode_next_round(context.job_queue, chat_id, 60)
+
+
+async def apply_slowmode_off(job_queue, chat_id):
+    """Shared by /slowmode off and /controlgroup slowmode off."""
+    await asyncio.to_thread(db.set_scramble_slowmode, chat_id, 0, False)
+    cancel_slowmode_next_job(job_queue, chat_id)
+
+
+async def apply_slowmode_on(job_queue, chat_id, seconds):
+    """Shared by /slowmode on and /controlgroup slowmode on. Turning Slow Mode
+    on always turns Automatic Mode off in that chat (never both at once)."""
+    await asyncio.to_thread(db.set_scramble_slowmode, chat_id, seconds, True)
+    await asyncio.to_thread(db.scramble_set_auto_enabled, chat_id, False)
+
+    if not await asyncio.to_thread(db.scramble_get_round, chat_id):
+        await schedule_slowmode_next_round(job_queue, chat_id, seconds)
+
+
+async def apply_automode(chat_id, enabled: bool) -> bool:
+    """Shared by /scrambleautomaticmode and /controlgroup automaticmode.
+    Returns False (and changes nothing) if turning it ON while Slow Mode is on."""
+    if enabled:
+        slow = await asyncio.to_thread(db.get_scramble_slowmode, chat_id)
+        if slow and slow[1]:
+            return False
+    await asyncio.to_thread(db.scramble_set_auto_enabled, chat_id, enabled)
+    return True
 
 
 async def slowmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1621,6 +1810,12 @@ async def slowmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = update.effective_chat.id
 
+    if context.args and await asyncio.to_thread(db.tournament_get_open_for_chat, chat_id):
+        await update.message.reply_text(
+            "🏟️ A tournament is in progress here - Slow Mode can't be changed until it ends."
+        )
+        return
+
     if not context.args:
         current = await asyncio.to_thread(db.get_scramble_slowmode, chat_id)
         status = f"on, every {_format_duration_words(current[0])}" if current and current[1] else "off"
@@ -1632,8 +1827,7 @@ async def slowmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mode = context.args[0].lower()
 
     if mode == "off":
-        await asyncio.to_thread(db.set_scramble_slowmode, chat_id, 0, False)
-        cancel_slowmode_next_job(context.job_queue, chat_id)
+        await apply_slowmode_off(context.job_queue, chat_id)
         await update.message.reply_text("🐢 Slowmode turned off.")
         return
 
@@ -1646,11 +1840,7 @@ async def slowmode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Invalid duration. Use e.g. 2m, 5m, 1h.")
         return
 
-    await asyncio.to_thread(db.set_scramble_slowmode, chat_id, seconds, True)
-    await asyncio.to_thread(db.scramble_set_auto_enabled, chat_id, False)
-
-    if not await asyncio.to_thread(db.scramble_get_round, chat_id):
-        await schedule_slowmode_next_round(context.job_queue, chat_id, seconds)
+    await apply_slowmode_on(context.job_queue, chat_id, seconds)
 
     await update.message.reply_text(
         f"🐢 Slowmode on - manual starts are paused; a new Word Scramble round starts here "
@@ -1688,6 +1878,9 @@ async def scramblemode_tick_callback(context: ContextTypes.DEFAULT_TYPE):
             result = await start_scramble_round(context, fake_chat)
             if result is True:
                 await asyncio.to_thread(db.scramble_reset_manual_streak, chat_id)
+            elif result == "send_failed":
+                logger.warning(f"scramblemode tick: couldn't send round to {chat_id}; retrying shortly")
+                schedule_scramble_send_retry(context.job_queue, chat_id, "global")
         except Exception as e:
             logger.error(f"scramblemode tick failed for chat {chat_id}: {e}")
 
@@ -1856,6 +2049,12 @@ async def scrambleautomaticmode_command(update: Update, context: ContextTypes.DE
 
     chat_id = update.effective_chat.id
 
+    if context.args and await asyncio.to_thread(db.tournament_get_open_for_chat, chat_id):
+        await update.message.reply_text(
+            "🏟️ A tournament is in progress here - Automatic Mode can't be changed until it ends."
+        )
+        return
+
     if not context.args or context.args[0].lower() not in ("on", "off"):
         _, enabled, _ = await asyncio.to_thread(db.scramble_get_auto_mode, chat_id)
         await update.message.reply_text(
@@ -1865,14 +2064,13 @@ async def scrambleautomaticmode_command(update: Update, context: ContextTypes.DE
 
     mode = context.args[0].lower()
 
-    if mode == "on" and _slowmode_enabled(chat_id):
+    if not await apply_automode(chat_id, mode == "on"):
         await update.message.reply_text(
             "❌ Slow Mode is currently on in this chat - turn it off with /slowmode off "
             "before enabling Automatic Mode. The two must never run at the same time."
         )
         return
 
-    await asyncio.to_thread(db.scramble_set_auto_enabled, chat_id, mode == "on")
     await update.message.reply_text(f"🤖 Automatic Mode turned {mode}.")
 
 
@@ -2570,6 +2768,8 @@ def invite_how_to_text(amount) -> str:
         "using YOUR link, you get the reward, not them - Telegram just shows "
         "them the group picker, it doesn't matter whose finger does the "
         "tapping.\n\n"
+        f"3️⃣ OR, send the bot's username to a group admin to add me to his/her group. "
+        f"After 72 hours, use /claim in that group to claim your {DOLLAR}{amount} reward.\n\n"
         f"Either way, keep the group above 200 members and don't let me get "
         f"removed - after 72 straight hours, {DOLLAR}{amount} lands in your "
         f"Word Scramble balance automatically, no need to ask."
@@ -2675,6 +2875,29 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 🏅 Rank: <b>{target_player[4]}</b>
 """)
             return
+
+    # Reply-to-message: /start (no args) shows the replied-to person's profile.
+    reply_msg = update.message.reply_to_message
+    if (
+        reply_msg is not None
+        and reply_msg.from_user is not None
+        and not getattr(reply_msg, "forum_topic_created", None)  # forum topics auto-set a "reply" to the topic root
+    ):
+        replied_user = reply_msg.from_user
+        target_player = await asyncio.to_thread(db.get_user, replied_user.id)
+        if not target_player:
+            await update.message.reply_text("❌ No player found for that user.")
+            return
+        await update.message.reply_html(f"""
+👤 <b>Player Profile</b>
+
+👤 Name: {esc(target_player[1])}
+
+💵 Balance: <b>{target_player[2]}</b>
+⭐ Level: <b>{target_player[3]}</b>
+🏅 Rank: <b>{target_player[4]}</b>
+""")
+        return
 
     player = await asyncio.to_thread(db.get_user, user.id)
 
@@ -3022,6 +3245,14 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer(
                 "🛠️ Word Scramble is currently under maintenance.", show_alert=True
             )
+        elif result == "tournament":
+            await query.answer(
+                "🏟️ A tournament is in progress here - rounds are paused until it ends.", show_alert=True
+            )
+        elif result == "send_failed":
+            await query.answer(
+                "⚠️ Couldn't reach the chat right now — try again in a moment.", show_alert=True
+            )
         else:
             await asyncio.to_thread(db.scramble_reset_manual_streak, chat.id)
             await query.answer("🎮 Word Scramble started - check the chat!")
@@ -3214,6 +3445,14 @@ Tap a button below to continue your adventure!
         elif result == "maintenance":
             await query.answer(
                 "🛠️ Word Scramble is currently under maintenance.", show_alert=True
+            )
+        elif result == "tournament":
+            await query.answer(
+                "🏟️ A tournament is in progress here - rounds are paused until it ends.", show_alert=True
+            )
+        elif result == "send_failed":
+            await query.answer(
+                "⚠️ Couldn't reach the chat right now — try again in a moment.", show_alert=True
             )
         else:
             await asyncio.to_thread(db.scramble_reset_manual_streak, chat.id)
@@ -3953,8 +4192,11 @@ async def group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_react(context.bot, chat.id, message.message_id, "🎉")
 
         win_reward = get_reward("win")
-        await asyncio.to_thread(db.award_coins, winner.id, chat.id, winner.first_name, win_reward)
-        await asyncio.to_thread(db.award_coins, leader_id, chat.id, leader_name, win_reward)
+        # Premium doubles each person's own payout, computed independently.
+        winner_reward = win_reward * 2 if await asyncio.to_thread(is_premium, winner.id) else win_reward
+        leader_reward = win_reward * 2 if await asyncio.to_thread(is_premium, leader_id) else win_reward
+        await asyncio.to_thread(db.award_coins, winner.id, chat.id, winner.first_name, winner_reward)
+        await asyncio.to_thread(db.award_coins, leader_id, chat.id, leader_name, leader_reward)
 
         await asyncio.to_thread(db.increment_stat, "games_played", 1)
         await asyncio.to_thread(db.increment_stat, "words_solved", 1)
@@ -3974,8 +4216,8 @@ async def group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result_text = (
             f"🎉 {winner_medal}{winner_display} found the word!\n\n"
             f"📝 Word: {secret_word}\n\n"
-            f"{DOLLAR} {winner_medal}{winner_display} +{win_reward}\n"
-            f"🎤 {leader_medal}{leader_display} +{win_reward}\n"
+            f"{DOLLAR} {winner_medal}{winner_display} +{winner_reward}\n"
+            f"🎤 {leader_medal}{leader_display} +{leader_reward}\n"
         )
 
         if auto_lead:
@@ -4077,6 +4319,7 @@ async def autolead_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _premium_price, _premium_dur = await asyncio.to_thread(get_premium_settings)
     text = f"""
 📖 <b>How to Play</b>
 
@@ -4104,6 +4347,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 💡 <b>Auto-lead</b>: if it's on, winning a round automatically makes you the next leader. Turn it off anytime in my PM with /autolead.
 
 ⏰ If the leader doesn't tap See Word/Write Word in time, the round auto-ends and asks who wants to explain next.
+
+⭐ <b>Premium</b>: /buypremium ({_premium_price} ⭐ for {_format_duration_words(_premium_dur)}) doubles your {DOLLAR} rewards in Word Game and Word Scramble. Check /premiumstatus.
 """
     await update.message.reply_html(text)
 
@@ -4193,6 +4438,11 @@ async def pre_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
 
     if user is None:
+        return
+
+    # A completed Stars payment must ALWAYS reach its handler - money has
+    # already moved, so the ban/maintenance gates below must never swallow it.
+    if update.message is not None and update.message.successful_payment is not None:
         return
 
     user_banned = await asyncio.to_thread(db.is_user_banned, user.id)
@@ -4367,6 +4617,18 @@ async def on_bot_membership_change(update: Update, context: ContextTypes.DEFAULT
         failed_id = await asyncio.to_thread(db.fail_pending_invite_reward_for_chat, chat.id)
         if failed_id:
             cancel_invite_reward_job(context.job_queue, failed_id)
+
+        # Word Scramble tournament - never lose anyone's money if the bot is removed.
+        try:
+            open_tournament = await asyncio.to_thread(db.tournament_get_open_for_chat, chat.id)
+            if open_tournament:
+                await _tournament_abort_and_announce(
+                    context, open_tournament["id"], chat.id,
+                    "Tournament cancelled - I was removed from this group.",
+                    dm_players=True, group_title=chat.title,
+                )
+        except Exception as e:
+            logger.error(f"Failed to refund tournament in removed chat {chat.id}: {e}")
 
         await asyncio.to_thread(
             db.mark_group_left,
@@ -5277,6 +5539,212 @@ async def unbangroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(f"✅ Group <code>{target_id}</code> has been unbanned.", parse_mode="HTML")
 
 
+CONTROLGROUP_USAGE = (
+    "Usage:\n"
+    "/controlgroup automaticmode on|off <group>\n"
+    "/controlgroup slowmode on <time> <group>\n"
+    "/controlgroup slowmode off <group>\n\n"
+    "<group> = numeric chat ID, @username, or allgroups.\n"
+    "Example: /controlgroup slowmode on 2m allgroups"
+)
+
+
+@owner_only
+async def controlgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    if len(args) < 3:
+        await update.message.reply_text(CONTROLGROUP_USAGE)
+        return
+
+    feature = args[0].lower()
+    action = args[1].lower()
+
+    if feature in ("automaticmode", "automatic"):
+        feature = "automaticmode"
+        if action not in ("on", "off") or len(args) != 3:
+            await update.message.reply_text(CONTROLGROUP_USAGE)
+            return
+        target_arg = args[2]
+        seconds = None
+    elif feature == "slowmode":
+        if action == "on":
+            if len(args) != 4:
+                await update.message.reply_text(CONTROLGROUP_USAGE)
+                return
+            seconds = _parse_duration(args[2])
+            if seconds is None:
+                await update.message.reply_text("❌ Invalid duration. Use e.g. 2m, 5m, 1h.")
+                return
+            target_arg = args[3]
+        elif action == "off":
+            if len(args) != 3:
+                await update.message.reply_text(CONTROLGROUP_USAGE)
+                return
+            seconds = None
+            target_arg = args[2]
+        else:
+            await update.message.reply_text(CONTROLGROUP_USAGE)
+            return
+    else:
+        await update.message.reply_text(CONTROLGROUP_USAGE)
+        return
+
+    if target_arg.lower() == "allgroups":
+        targets = list(await asyncio.to_thread(db.get_current_groups))
+        is_all = True
+    else:
+        resolved = await resolve_group_arg(target_arg)
+        if not resolved:
+            await update.message.reply_html(
+                f"❌ No group found matching <code>{esc(target_arg)}</code> that I'm currently in."
+            )
+            return
+        targets = [resolved]
+        is_all = False
+
+    if not targets:
+        await update.message.reply_text("No groups to apply this to.")
+        return
+
+    changed, skipped, failed = 0, 0, 0
+    for chat_id, _title in targets:
+        try:
+            if feature == "automaticmode":
+                ok = await apply_automode(chat_id, action == "on")
+                if ok:
+                    changed += 1
+                else:
+                    skipped += 1
+            elif action == "on":
+                await apply_slowmode_on(context.job_queue, chat_id, seconds)
+                changed += 1
+            else:
+                await apply_slowmode_off(context.job_queue, chat_id)
+                changed += 1
+        except Exception as e:
+            logger.error(f"/controlgroup failed for chat {chat_id}: {e}")
+            failed += 1
+
+    label = "Automatic Mode" if feature == "automaticmode" else "Slow Mode"
+    state = action if action == "off" else (f"on ({_format_duration_words(seconds)})" if seconds else "on")
+
+    if not is_all:
+        _cid, title = targets[0]
+        if changed:
+            await update.message.reply_html(
+                f"✅ {label} turned {state} in <b>{esc(title)}</b> (<code>{_cid}</code>)."
+            )
+        elif skipped:
+            await update.message.reply_html(
+                f"⚠️ Not changed in <b>{esc(title)}</b>: Slow Mode is currently on there, so Automatic "
+                f"Mode can't be enabled. Turn Slow Mode off there first."
+            )
+        else:
+            await update.message.reply_text(f"❌ Couldn't update {label} in that group.")
+        return
+
+    lines = [
+        f"🎛️ <b>{label} → {state}</b>\n",
+        f"✅ Updated: {changed}",
+    ]
+    if skipped:
+        lines.append(f"⚠️ Skipped (Slow Mode is on there): {skipped}")
+    lines.append(f"❌ Failed: {failed}")
+    lines.append(f"👥 Total: {len(targets)}")
+    await update.message.reply_html("\n".join(lines))
+
+
+async def _resolve_tournament_ban_target(update: Update, usage: str):
+    """Returns (target_type, target_id, label) or None (an error was already sent).
+    Reply-to-message (no args) targets that user; otherwise the first arg is
+    a numeric ID (negative = group, positive = user) or an @username
+    (looked up as a player first, then as a group)."""
+    args = update.message.text.split()[1:]
+    reply_msg = update.message.reply_to_message
+
+    if not args:
+        if (
+            reply_msg is not None
+            and reply_msg.from_user is not None
+            and not getattr(reply_msg, "forum_topic_created", None)
+        ):
+            u = reply_msg.from_user
+            return "user", u.id, u.first_name or str(u.id)
+        await update.message.reply_text(usage)
+        return None
+
+    arg = args[0]
+    if re.fullmatch(r"-?\d+", arg):
+        tid = int(arg)
+        if tid < 0:
+            return "group", tid, str(tid)
+        return "user", tid, str(tid)
+
+    uname = arg.lstrip("@")
+    row = await asyncio.to_thread(db.get_user_by_username, uname)
+    if row:
+        return "user", row[0], row[1] or arg
+    g = await asyncio.to_thread(db.get_group_by_username, uname)
+    if g:
+        return "group", g[0], g[1] or arg
+
+    await update.message.reply_text(f"❌ No player or group found matching {arg}.")
+    return None
+
+
+@owner_or_admin_only
+async def tournamentban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usage = (
+        "Usage: /tournamentban <username|ID>  (or reply to a user's message)\n"
+        "/tournamentban <group username|group ID>\n\n"
+        "Bans a player from /bbb and /join (they can still play the normal games), "
+        "or bans a group from running /bbb."
+    )
+    target = await _resolve_tournament_ban_target(update, usage)
+    if target is None:
+        return
+    target_type, target_id, label = target
+
+    if target_type == "user" and is_owner(target_id):
+        await update.message.reply_text("❌ You can't tournament-ban the bot owner.")
+        return
+
+    await asyncio.to_thread(db.tournament_ban, target_type, target_id, update.effective_user.id)
+
+    if target_type == "user":
+        await update.message.reply_html(
+            f"🚫 <b>{esc(label)}</b> (<code>{target_id}</code>) is now banned from tournaments. "
+            f"They can still play Word Game and Word Scramble."
+        )
+    else:
+        await update.message.reply_html(
+            f"🚫 Group <b>{esc(label)}</b> (<code>{target_id}</code>) can no longer run tournaments."
+        )
+
+
+@owner_or_admin_only
+async def tournamentunban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usage = (
+        "Usage: /tournamentunban <username|ID>  (or reply to a user's message)\n"
+        "/tournamentunban <group username|group ID>"
+    )
+    target = await _resolve_tournament_ban_target(update, usage)
+    if target is None:
+        return
+    target_type, target_id, label = target
+
+    removed = await asyncio.to_thread(db.tournament_unban, target_type, target_id)
+    kind = "Player" if target_type == "user" else "Group"
+    if removed:
+        await update.message.reply_html(
+            f"✅ {kind} <b>{esc(label)}</b> (<code>{target_id}</code>) is no longer tournament-banned."
+        )
+    else:
+        await update.message.reply_html(
+            f"ℹ️ {kind} <b>{esc(label)}</b> (<code>{target_id}</code>) wasn't tournament-banned."
+        )
+
+
 @owner_only
 async def sendgroupmessage_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2:
@@ -5957,7 +6425,7 @@ async def allcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 📖 <b>All Bot Commands</b>
 
 <b>👥 Public Commands</b>
-/start - open the main menu
+/start - open the main menu (reply to someone's message with /start to see that player's profile)
 /help - how to play
 /leaderboard - this chat's leaderboard (with a Global switch)
 /chattop - top players in this chat
@@ -5966,6 +6434,10 @@ async def allcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 /topgroups - the 10 most active groups
 /ranks - the full rank/level ladder and what balance unlocks each one
 /claimdailyreward - claim today's daily reward
+/buypremium - premium doubles your 💵 rewards in Word Game and Word Scramble (paid with Telegram Stars)
+/premiumstatus - see whether premium is active and how much time is left
+/bbb &lt;fee&gt; &lt;difficulty&gt; &lt;rounds&gt;rounds - host a Word Scramble tournament in a group (e.g. /bbb 2000 Medium 3rounds); everyone pays the entry fee from their Word Scramble balance and the winner takes the pot
+/join - join the tournament lobby that's open in this group
 
 <b>🎮 Group Commands</b>
 /wordgame - start a round (admins only once a round is live)
@@ -5991,6 +6463,16 @@ async def allcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 /unbanuser &lt;ID&gt; - unban a user
 /bangroup &lt;ID&gt; - ban a group (bot leaves immediately)
 /unbangroup &lt;ID&gt; - unban a group
+/tournamentban &lt;username|ID&gt; - ban a player (or reply to them) from tournaments only; also accepts a group username/ID to ban that group from running /bbb
+/tournamentunban &lt;username|ID&gt; - undo a tournament ban (player or group)
+/controlgroup automaticmode on|off &lt;group&gt; | slowmode on &lt;time&gt;|off &lt;group&gt; - owner only: control Word Scramble Slow Mode / Automatic Mode in any group (&lt;group&gt; = ID, @username or allgroups)
+/bbbstart - tournament host, bot owner or Bot Admins: start the lobby early
+/bbbcancel - tournament host, bot owner or Bot Admins: cancel a lobby and refund everyone
+/setpremium &lt;stars&gt; &lt;duration&gt; - owner only: set the premium price and length (e.g. /setpremium 99 7d; no args shows current)
+/seepremiumplayers - owner only: every current premium player with time remaining
+/starbalance - owner only: the bot's current Telegram Stars balance
+/withdraw - owner only: Stars balance + how to withdraw it via @BotFather
+/messageapplicant &lt;username|Allapplicants&gt; &lt;message&gt; - lives in the ADS bot (@UFFAdsBot), not this one: DM one advertiser or every advertiser, as the ads bot
 /broadcast users|groups &lt;message&gt; - mass message everyone
 /maintenance on|off - lock the bot to owner/admins only
 /setreward win|cheat|daily &lt;amount&gt; - tune reward amounts
@@ -6196,6 +6678,983 @@ async def claimeddailyreward_command(update: Update, context: ContextTypes.DEFAU
     await update.message.reply_html("\n".join(lines))
 
 
+# =======================================================================
+# WORD SCRAMBLE TOURNAMENT (/bbb)
+# =======================================================================
+
+TOURNAMENT_LOBBY_SECONDS = 120
+TOURNAMENT_ROUND_SECONDS = 60
+TOURNAMENT_POINTS_PER_WIN = 5
+TOURNAMENT_MIN_FEE = 100
+TOURNAMENT_MAX_FEE = 100000
+TOURNAMENT_MIN_ROUNDS = 1
+TOURNAMENT_MAX_ROUNDS = 20
+TOURNAMENT_DIFFICULTIES = ("easy", "easy3", "easy4", "easy5", "easy6", "medium", "hard", "off")
+TOURNAMENT_START_RETRY_SECONDS = 8
+TOURNAMENT_START_MAX_ATTEMPTS = 30
+TOURNAMENT_USAGE = (
+    "Usage: /bbb <fee> <difficulty> <rounds>rounds\n"
+    "Example: /bbb 2000 Medium 3rounds\n\n"
+    f"Fee: {TOURNAMENT_MIN_FEE:,}-{TOURNAMENT_MAX_FEE:,} • Rounds: {TOURNAMENT_MIN_ROUNDS}-{TOURNAMENT_MAX_ROUNDS}\n"
+    "Difficulty: easy, easy3-easy6, medium, hard, off"
+)
+
+
+def _tournament_lobby_job_name(tid):
+    return f"tournament_lobby_{tid}"
+
+
+def _tournament_round_job_name(tid):
+    return f"tournament_round_{tid}"
+
+
+def _tournament_advance_job_name(tid):
+    return f"tournament_advance_{tid}"
+
+
+def _cancel_tournament_jobs(job_queue, tid, lobby=True, round_=True, advance=True):
+    if job_queue is None:
+        return
+    names = []
+    if lobby:
+        names.append(_tournament_lobby_job_name(tid))
+    if round_:
+        names.append(_tournament_round_job_name(tid))
+    if advance:
+        names.append(_tournament_advance_job_name(tid))
+    for name in names:
+        for job in job_queue.get_jobs_by_name(name):
+            job.schedule_removal()
+
+
+def _schedule_tournament_job(job_queue, callback, name, seconds, chat_id, data):
+    if job_queue is None:
+        return
+    for job in job_queue.get_jobs_by_name(name):
+        job.schedule_removal()
+    job_queue.run_once(callback, seconds, chat_id=chat_id, name=name, data=data)
+
+
+def tournament_random_word(chat_id, difficulty):
+    """Same machinery as scramble_random_word, but the difficulty is passed in
+    explicitly - the group's own difficulty setting is never read or changed.
+    Shares the chat's used-words tracking so words don't repeat."""
+    if not SCRAMBLE_WORDS:
+        return None
+    pool = _get_difficulty_pool("scramble", SCRAMBLE_WORDS, difficulty)
+    if not pool:
+        return None
+
+    used = db.scramble_get_used_words(chat_id)
+    choices = [w for w in pool if w not in used]
+    if not choices:
+        db.scramble_reset_used_words(chat_id)
+        choices = list(pool)
+
+    word = random.choice(choices)
+    db.scramble_mark_word_used(chat_id, word)
+    return word
+
+
+def tournament_lobby_text(t, players) -> str:
+    host = next((p for p in players if p[0] == t["host_id"]), players[0] if players else None)
+    host_name = esc_name(host[1]) if host else "?"
+    count = len(players)
+    lines = [
+        "🏟️ WORD SCRAMBLE TOURNAMENT 🏟️",
+        "",
+        f"Host: {host_name}",
+        f"Entry fee: {DOLLAR}{t['fee']}",
+        f"Difficulty: {esc((t['difficulty'] or 'off').capitalize())}",
+        f"Rounds: {t['total_rounds']}",
+        f"Prize pool: {DOLLAR}{t['fee'] * count}",
+        "",
+        f"Players ({count})",
+    ]
+    lines += [f"• {esc_name(p[1])}" for p in players]
+    lines += [
+        "",
+        f"Send /join to enter. {DOLLAR}{t['fee']} will be taken from your Word Scramble balance.",
+        "⏳ Lobby closes in 2 minutes.",
+    ]
+    return "\n".join(lines)
+
+
+def tournament_standings_text(rows) -> str:
+    """rows: iterable of (name, score) - sorted here, highest first."""
+    ordered = sorted(rows, key=lambda r: -r[1])
+    lines = ["Tournament 🏟️", ""]
+    lines += [f"{esc_name(name)} 💎 {score}" for name, score in ordered]
+    return "\n".join(lines)
+
+
+async def _tournament_post_lobby(context, tid):
+    t = await asyncio.to_thread(db.tournament_get, tid)
+    if not t or t["status"] != "lobby":
+        return
+    players = await asyncio.to_thread(db.tournament_get_players, tid)
+    text = tournament_lobby_text(t, players)
+
+    if t.get("lobby_message_id"):
+        try:
+            await context.bot.edit_message_text(
+                chat_id=t["chat_id"], message_id=t["lobby_message_id"], text=text, parse_mode="HTML"
+            )
+            return
+        except Exception:
+            pass  # message gone / not editable - repost below
+
+    sent = await safe_send(context.bot, t["chat_id"], text=text, parse_mode="HTML")
+    if sent:
+        await asyncio.to_thread(db.tournament_set_lobby_message, tid, sent.message_id)
+
+
+def _parse_bbb_args(args):
+    """Returns (fee, difficulty, rounds, error). Rounds token may be '3rounds',
+    '3 rounds' (two args) or just '3'."""
+    if len(args) < 3 or not re.fullmatch(r"\d+", args[0]):
+        return None, None, None, TOURNAMENT_USAGE
+    fee = int(args[0])
+    difficulty = args[1].lower()
+    m = re.fullmatch(r"(\d+)(rounds?)?", "".join(args[2:]).lower())
+    if not m:
+        return None, None, None, TOURNAMENT_USAGE
+    rounds = int(m.group(1))
+
+    if difficulty not in TOURNAMENT_DIFFICULTIES:
+        return None, None, None, "❌ Difficulty must be one of: easy, easy3, easy4, easy5, easy6, medium, hard, off."
+    if not (TOURNAMENT_MIN_FEE <= fee <= TOURNAMENT_MAX_FEE):
+        return None, None, None, f"❌ The entry fee must be between {TOURNAMENT_MIN_FEE:,} and {TOURNAMENT_MAX_FEE:,}."
+    if not (TOURNAMENT_MIN_ROUNDS <= rounds <= TOURNAMENT_MAX_ROUNDS):
+        return None, None, None, f"❌ Rounds must be between {TOURNAMENT_MIN_ROUNDS} and {TOURNAMENT_MAX_ROUNDS}."
+    return fee, difficulty, rounds, None
+
+
+async def bbb_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await update.message.reply_text("🏟️ Tournaments can only be started inside a group.")
+        return
+
+    fee, difficulty, rounds, error = _parse_bbb_args(context.args)
+    if error:
+        await update.message.reply_text(error)
+        return
+
+    if await asyncio.to_thread(db.is_tournament_banned, "group", chat.id):
+        await update.message.reply_text("🚫 This group isn't allowed to run tournaments.")
+        return
+    if await asyncio.to_thread(db.is_tournament_banned, "user", user.id):
+        await update.message.reply_text("🚫 You're banned from tournaments.")
+        return
+
+    if await asyncio.to_thread(db.get_config, "scramble_maintenance_mode", "0") == "1":
+        await update.message.reply_text("🛠️ Word Scramble is currently under maintenance. Please try again later.")
+        return
+
+    if await asyncio.to_thread(db.tournament_get_open_for_chat, chat.id):
+        await update.message.reply_text("🏟️ A tournament is already running (or open for joining) in this group.")
+        return
+    if await asyncio.to_thread(db.scramble_get_round, chat.id):
+        await update.message.reply_text(
+            "🎮 A Word Scramble round is in progress here - wait for it to end before starting a tournament."
+        )
+        return
+
+    status, tid, _balance = await asyncio.to_thread(
+        db.tournament_create, chat.id, user.id, user.first_name, fee, difficulty, rounds
+    )
+    if status == "insufficient":
+        await update.message.reply_text(
+            f"❌ Your Word Scramble balance is below the entry fee ({DOLLAR}{fee})."
+        )
+        return
+    if status == "exists":
+        await update.message.reply_text("🏟️ A tournament is already running (or open for joining) in this group.")
+        return
+
+    await _tournament_post_lobby(context, tid)
+    _schedule_tournament_job(
+        context.job_queue, tournament_lobby_close_callback,
+        _tournament_lobby_job_name(tid), TOURNAMENT_LOBBY_SECONDS, chat.id, {"tid": tid},
+    )
+
+
+async def join_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await update.message.reply_text("🏟️ /join only works inside a group with an open tournament.")
+        return
+
+    t = await asyncio.to_thread(db.tournament_get_open_for_chat, chat.id)
+    if not t or t["status"] != "lobby":
+        await update.message.reply_text("🏟️ There's no tournament open for joining in this group right now.")
+        return
+
+    if await asyncio.to_thread(db.is_tournament_banned, "user", user.id):
+        await update.message.reply_text("🚫 You're banned from tournaments.")
+        return
+
+    status, _balance = await asyncio.to_thread(db.tournament_join, t["id"], user.id, user.first_name)
+    if status == "closed":
+        await update.message.reply_text("🏟️ The lobby has just closed - too late to join.")
+    elif status == "already":
+        await update.message.reply_text("✅ You've already joined this tournament.")
+    elif status == "insufficient":
+        await update.message.reply_text(
+            f"❌ Your Word Scramble balance is below the entry fee ({DOLLAR}{t['fee']})."
+        )
+    else:
+        await safe_react(context.bot, chat.id, update.message.message_id, "👍")
+        await _tournament_post_lobby(context, t["id"])
+
+
+async def _tournament_may_manage(user_id, t) -> bool:
+    return user_id == t["host_id"] or await asyncio.to_thread(is_bot_admin_or_owner, user_id)
+
+
+async def bbbstart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    t = await asyncio.to_thread(db.tournament_get_open_for_chat, chat.id)
+    if not t or t["status"] != "lobby":
+        await update.message.reply_text("🏟️ There's no tournament lobby open in this group.")
+        return
+    if not await _tournament_may_manage(update.effective_user.id, t):
+        await update.message.reply_text("❌ Only the tournament host, the bot owner, or Bot Admins can start it early.")
+        return
+    await _tournament_start(context, t["id"])
+
+
+async def bbbcancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    t = await asyncio.to_thread(db.tournament_get_open_for_chat, chat.id)
+    if not t or t["status"] != "lobby":
+        await update.message.reply_text(
+            "🏟️ There's no tournament lobby to cancel here (a tournament that has already started can't be cancelled)."
+        )
+        return
+    if not await _tournament_may_manage(update.effective_user.id, t):
+        await update.message.reply_text("❌ Only the tournament host, the bot owner, or Bot Admins can cancel it.")
+        return
+    await _tournament_abort_and_announce(
+        context, t["id"], chat.id, "Tournament cancelled.", delete=True
+    )
+
+
+async def _tournament_abort_and_announce(context, tid, chat_id, headline, delete=False,
+                                         dm_players=False, group_title=None):
+    """Refund everyone still staked, finalize (or delete) the tournament, and
+    tell the chat. Idempotent - returns None if there was nothing open."""
+    res = await asyncio.to_thread(db.tournament_abort, tid, delete)
+    _cancel_tournament_jobs(context.job_queue, tid)
+    if not res:
+        return None
+
+    n = len(res["refunds"])
+    text = f"❌ {headline}\n\nAll {n} player(s) were refunded their {DOLLAR}{res['fee']} entry fee."
+    try:
+        await safe_send(context.bot, chat_id, text=text)
+    except Exception as e:
+        logger.info(f"tournament abort notice to {chat_id} not delivered: {e}")
+
+    if dm_players:
+        where = f" in {group_title}" if group_title else ""
+        for uid, _name, fee, _bal in res["refunds"]:
+            try:
+                await context.bot.send_message(
+                    chat_id=uid,
+                    text=f"↩️ The tournament{where} was cancelled - your {DOLLAR}{fee} entry fee has been refunded.",
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(0.05)
+    return res
+
+
+async def tournament_lobby_close_callback(context: ContextTypes.DEFAULT_TYPE):
+    tid = (context.job.data or {}).get("tid")
+    if tid is not None:
+        await _tournament_start(context, tid)
+
+
+async def _tournament_start(context, tid):
+    """Shared by the 120s lobby job and /bbbstart."""
+    t = await asyncio.to_thread(db.tournament_get, tid)
+    if not t or t["status"] != "lobby":
+        return
+    chat_id = t["chat_id"]
+    _cancel_tournament_jobs(context.job_queue, tid, round_=False, advance=False)
+
+    players = await asyncio.to_thread(db.tournament_get_players, tid)
+    if len(players) < 2:
+        res = await asyncio.to_thread(db.tournament_abort, tid, True)
+        if res:
+            await safe_send(
+                context.bot, chat_id,
+                text=f"😔 No one joined the tournament, so it's been cancelled. "
+                     f"{DOLLAR}{t['fee']} was refunded to the host.",
+            )
+        return
+
+    if not await asyncio.to_thread(db.tournament_activate, tid):
+        return  # someone else already started it
+
+    await safe_send(
+        context.bot, chat_id,
+        text=(
+            f"🏟️ <b>Tournament starting!</b>\n\n"
+            f"Players: {len(players)}\n"
+            f"Rounds: {t['total_rounds']}\n"
+            f"Difficulty: {esc((t['difficulty'] or 'off').capitalize())}\n"
+            f"Prize pool: {DOLLAR}{t['fee'] * len(players)}\n\n"
+            f"First correct answer each round scores 💎{TOURNAMENT_POINTS_PER_WIN}. Get ready!"
+        ),
+        parse_mode="HTML",
+    )
+    await _tournament_start_round(context, tid)
+
+
+async def _tournament_start_round(context, tid, attempt=1):
+    t = await asyncio.to_thread(db.tournament_get, tid)
+    if not t or t["status"] != "active" or t["current_word"]:
+        return
+    chat_id = t["chat_id"]
+
+    if t["current_round"] >= t["total_rounds"]:
+        await _tournament_finish(context, tid)
+        return
+
+    word = await asyncio.to_thread(tournament_random_word, chat_id, t["difficulty"])
+    if not word:
+        await _tournament_abort_and_announce(
+            context, tid, chat_id, "Tournament cancelled - the Word Scramble word list is empty."
+        )
+        return
+
+    scrambled = scramble_letters(word)
+    round_no = await asyncio.to_thread(db.tournament_set_round, tid, word, scrambled)
+    if round_no is None:
+        return
+
+    try:
+        sent = await safe_send(
+            context.bot, chat_id,
+            text=(
+                f"🏟️ <b>Round {round_no}/{t['total_rounds']}</b>\n\n"
+                f"Unscramble this word:\n\n"
+                f"<b>{esc(scrambled)}</b>\n\n"
+                f"First correct answer in {TOURNAMENT_ROUND_SECONDS} seconds scores 💎{TOURNAMENT_POINTS_PER_WIN}."
+            ),
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        logger.error(f"tournament {tid}: sending round {round_no} failed: {e}")
+        sent = None
+
+    if sent is None:
+        # The group never saw the word: roll the round back and retry shortly.
+        await asyncio.to_thread(db.tournament_unset_round, tid, round_no)
+        if attempt >= TOURNAMENT_START_MAX_ATTEMPTS:
+            logger.error(f"tournament {tid}: giving up after {attempt} failed round sends - refunding")
+            await _tournament_abort_and_announce(
+                context, tid, chat_id, "Tournament cancelled - I couldn't reach this chat."
+            )
+            return
+        logger.warning(f"tournament {tid}: round {round_no} not delivered; retrying in {TOURNAMENT_START_RETRY_SECONDS}s")
+        _schedule_tournament_job(
+            context.job_queue, tournament_advance_callback, _tournament_advance_job_name(tid),
+            TOURNAMENT_START_RETRY_SECONDS, chat_id, {"tid": tid, "attempt": attempt + 1},
+        )
+        return
+
+    _schedule_tournament_job(
+        context.job_queue, tournament_round_timeout_callback, _tournament_round_job_name(tid),
+        TOURNAMENT_ROUND_SECONDS, chat_id, {"tid": tid},
+    )
+
+
+async def tournament_advance_callback(context: ContextTypes.DEFAULT_TYPE):
+    """Moves an active tournament forward when no round is live: starts the
+    next round, or finishes it. Used for send retries and restart catch-up."""
+    data = context.job.data or {}
+    tid, attempt = data.get("tid"), data.get("attempt", 1)
+    if tid is None:
+        return
+    t = await asyncio.to_thread(db.tournament_get, tid)
+    if not t or t["status"] != "active" or t["current_word"]:
+        return
+    if t["current_round"] >= t["total_rounds"]:
+        await _tournament_finish(context, tid)
+    else:
+        await _tournament_start_round(context, tid, attempt)
+
+
+async def _tournament_after_round(context, tid, round_no, total_rounds):
+    if round_no >= total_rounds:
+        await _tournament_finish(context, tid)
+    else:
+        await _tournament_start_round(context, tid)  # no pause between rounds
+
+
+async def tournament_round_timeout_callback(context: ContextTypes.DEFAULT_TYPE):
+    tid = (context.job.data or {}).get("tid")
+    if tid is None:
+        return
+    t = await asyncio.to_thread(db.tournament_get, tid)
+    if not t:
+        return
+
+    claim = await asyncio.to_thread(db.tournament_claim_round, tid)
+    if not claim:
+        return  # a correct guess (or a stop) already closed this round
+
+    players = await asyncio.to_thread(db.tournament_get_players, tid)
+    await safe_send(
+        context.bot, t["chat_id"],
+        text=(
+            f"⏰ Time's up! Nobody got it - the word was <b>{esc(claim['word'])}</b>.\n\n"
+            + tournament_standings_text([(p[1], p[2]) for p in players])
+        ),
+        parse_mode="HTML",
+    )
+    await _tournament_after_round(context, tid, claim["round_no"], claim["total_rounds"])
+
+
+async def tournament_handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Returns True if this message was consumed by an active tournament round.
+    Non-tournament chats, non-joined players, and messages between rounds
+    return False and fall through untouched to the normal Word Scramble path."""
+    message = update.message
+    chat = update.effective_chat
+    user = update.effective_user
+    if not message or not message.text or not user:
+        return False
+
+    t = await asyncio.to_thread(db.tournament_get_open_for_chat, chat.id)
+    if not t or t["status"] != "active" or not t["current_word"]:
+        return False
+
+    if not await asyncio.to_thread(db.tournament_is_staked_player, t["id"], user.id):
+        return False
+
+    guess_clean = re.sub(r"[^\w\s]", "", message.text.lower()).strip()
+    if not guess_clean:
+        return True
+
+    word_lower = t["current_word"].lower()
+    if guess_clean != word_lower:
+        if is_close_guess(guess_clean, word_lower):
+            await safe_react(context.bot, chat.id, message.message_id, "👀")
+        return True
+
+    claim = await asyncio.to_thread(
+        db.tournament_claim_round, t["id"], user.id, TOURNAMENT_POINTS_PER_WIN
+    )
+    if not claim:
+        return True  # someone else won this round a moment earlier
+
+    _cancel_tournament_jobs(context.job_queue, t["id"], lobby=False, advance=False)
+    await safe_react(context.bot, chat.id, message.message_id, "🎉")
+
+    players = await asyncio.to_thread(db.tournament_get_players, t["id"])
+    await safe_send(
+        context.bot, chat.id,
+        text=(
+            f"🎉 <b>{esc_name(user.first_name)}</b> got it - <b>{esc(claim['word'])}</b>! "
+            f"+💎{TOURNAMENT_POINTS_PER_WIN}\n\n"
+            + tournament_standings_text([(p[1], p[2]) for p in players])
+        ),
+        parse_mode="HTML",
+    )
+    await _tournament_after_round(context, t["id"], claim["round_no"], claim["total_rounds"])
+    return True
+
+
+async def scramble_group_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Layered in front of scramble_group_text (group=1): an active tournament
+    gets first look at the message; everything else falls through unchanged."""
+    if await tournament_handle_guess(update, context):
+        return
+    await scramble_group_text(update, context)
+
+
+async def _tournament_finish(context, tid):
+    _cancel_tournament_jobs(context.job_queue, tid)
+    res = await asyncio.to_thread(db.tournament_settle, tid)
+    if not res:
+        return  # already settled
+
+    chat_id = res["chat_id"]
+    standings = tournament_standings_text([(name, score) for _uid, name, score in res["standings"]])
+    lines = ["🏆 <b>TOURNAMENT OVER</b> 🏆", "", standings, ""]
+
+    if res["case"] == "single":
+        uid, name, payout, balance = res["winners"][0]
+        lines.append(f"👑 Winner: <b>{esc_name(name)}</b> takes the whole pot - {DOLLAR}{payout}!")
+        lines.append(f"New balance: {DOLLAR}{balance}")
+    elif res["case"] == "tie":
+        lines.append("🤝 It's a tie! The pot is split:")
+        for uid, name, payout, balance in res["winners"]:
+            lines.append(f"• <b>{esc_name(name)}</b> - {DOLLAR}{payout} (new balance {DOLLAR}{balance})")
+    else:
+        lines.append(
+            f"😴 Nobody answered a single word, so there's no winner. "
+            f"Every player was refunded their {DOLLAR}{res['fee']} entry fee."
+        )
+
+    await safe_send(context.bot, chat_id, text="\n".join(lines), parse_mode="HTML")
+
+
+def restore_stale_tournaments(job_queue):
+    """On startup, re-arm every open tournament: reschedule the remaining lobby
+    time or round timer, or fire the catch-up almost immediately if it already
+    elapsed (mirrors restore_stale_scramble_rounds)."""
+    if job_queue is None:
+        return
+    now = datetime.now()
+
+    for t in db.tournament_get_all_open():
+        tid, chat_id = t["id"], t["chat_id"]
+
+        if t["status"] == "lobby":
+            try:
+                remaining = TOURNAMENT_LOBBY_SECONDS - (now - datetime.fromisoformat(t["created_at"])).total_seconds()
+            except (TypeError, ValueError):
+                remaining = 0
+            _schedule_tournament_job(
+                job_queue, tournament_lobby_close_callback, _tournament_lobby_job_name(tid),
+                max(remaining, 1), chat_id, {"tid": tid},
+            )
+        elif t["current_word"]:
+            try:
+                remaining = TOURNAMENT_ROUND_SECONDS - (now - datetime.fromisoformat(t["round_started_at"])).total_seconds()
+            except (TypeError, ValueError):
+                remaining = 0
+            _schedule_tournament_job(
+                job_queue, tournament_round_timeout_callback, _tournament_round_job_name(tid),
+                max(remaining, 1), chat_id, {"tid": tid},
+            )
+        else:
+            _schedule_tournament_job(
+                job_queue, tournament_advance_callback, _tournament_advance_job_name(tid),
+                1, chat_id, {"tid": tid, "attempt": 1},
+            )
+
+
+# =======================================================================
+# PREMIUM (Telegram Stars) + Stars management
+# =======================================================================
+
+DEFAULT_PREMIUM_PRICE_STARS = 99
+DEFAULT_PREMIUM_DURATION_SECONDS = 7 * 86400
+PREMIUM_PAYLOAD_PREFIX = "premium"
+PREMIUM_REMINDER_WINDOW_SECONDS = 24 * 3600
+PREMIUM_REMINDER_JOB_NAME = "premium_renewal_reminder"
+PREMIUM_PAGE_SIZE = 20
+
+
+def get_premium_settings():
+    """Live (price_in_stars, duration_seconds) - always read fresh from
+    config, never hardcoded. Defaults: 99 stars / 7 days when unset."""
+    raw_price = db.get_config("premium_price_stars", str(DEFAULT_PREMIUM_PRICE_STARS))
+    raw_dur = db.get_config("premium_duration_seconds", str(DEFAULT_PREMIUM_DURATION_SECONDS))
+    try:
+        price = int(raw_price)
+        if price < 1:
+            price = DEFAULT_PREMIUM_PRICE_STARS
+    except (TypeError, ValueError):
+        price = DEFAULT_PREMIUM_PRICE_STARS
+    try:
+        dur = int(raw_dur)
+        if dur < 60:
+            dur = DEFAULT_PREMIUM_DURATION_SECONDS
+    except (TypeError, ValueError):
+        dur = DEFAULT_PREMIUM_DURATION_SECONDS
+    return price, dur
+
+
+def is_premium(user_id) -> bool:
+    """Owner is always premium (free, permanent); everyone else needs a
+    premium_users row whose expires_at is in the future. Sync (DB call) -
+    call it via asyncio.to_thread from async handlers."""
+    if is_owner(user_id):
+        return True
+    expiry = db.premium_get_expiry(user_id)
+    return bool(expiry and expiry > datetime.now())
+
+
+def _format_remaining(seconds) -> str:
+    seconds = int(seconds)
+    if seconds < 60:
+        return "less than a minute"
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes and not days:
+        parts.append(f"{minutes}m")
+    return " ".join(parts) if parts else "less than a minute"
+
+
+def _parse_premium_payload(payload):
+    """'premium:<user_id>:<duration_seconds>:<stars>' -> (uid, secs, stars) or None."""
+    try:
+        prefix, uid, secs, stars = str(payload).split(":")
+        if prefix != PREMIUM_PAYLOAD_PREFIX:
+            return None
+        return int(uid), int(secs), int(stars)
+    except (ValueError, TypeError):
+        return None
+
+
+async def send_premium_invoice(context: ContextTypes.DEFAULT_TYPE, user_id):
+    """Sends the Stars invoice to the user's DM. Returns None on success or a
+    short error string to show the user."""
+    price, dur = await asyncio.to_thread(get_premium_settings)
+    title = f"Premium - {_format_duration_words(dur)}"[:32]
+    description = (
+        f"Doubles your {DOLLAR} rewards in Word Game and Word Scramble for "
+        f"{_format_duration_words(dur)}. Buying again while active extends it."
+    )
+    try:
+        await context.bot.send_invoice(
+            chat_id=user_id,
+            title=title,
+            description=description[:255],
+            payload=f"{PREMIUM_PAYLOAD_PREFIX}:{user_id}:{dur}:{price}",
+            provider_token="",  # must be empty for Telegram Stars
+            currency="XTR",
+            prices=[LabeledPrice(label=title, amount=int(price))],  # raw star count, no x100
+        )
+    except Forbidden:
+        return "⚠️ Please start a private chat with me first (open my DM and press Start), then try /buypremium again."
+    except Exception as e:
+        logger.error(f"Failed to send premium invoice to {user_id}: {e}")
+        return "⚠️ Couldn't create the invoice right now. Please try again in a moment."
+    return None
+
+
+async def buypremium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if is_owner(user.id):
+        await update.message.reply_text(
+            "👑 You're the bot owner - you always have Premium, free and permanent. Nothing to buy!"
+        )
+        return
+
+    err = await send_premium_invoice(context, user.id)
+    if err:
+        await update.message.reply_text(err)
+        return
+    if update.effective_chat.type != ChatType.PRIVATE:
+        await update.message.reply_text("📩 I've sent the Premium invoice to your DM.")
+
+
+async def buypremium_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    if is_owner(user.id):
+        await query.answer("👑 You always have Premium - nothing to buy!", show_alert=True)
+        return
+    await query.answer()
+    err = await send_premium_invoice(context, user.id)
+    if err:
+        try:
+            await context.bot.send_message(chat_id=user.id, text=err)
+        except Exception:
+            pass
+
+
+async def premium_precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Telegram waits ~10s for this answer, so it must always answer."""
+    query = update.pre_checkout_query
+    try:
+        parsed = _parse_premium_payload(query.invoice_payload)
+        if parsed is None or query.currency != "XTR":
+            await query.answer(ok=False, error_message="This payment isn't recognised. Please run /buypremium again.")
+            return
+        uid, _secs, stars = parsed
+        if query.from_user.id != uid:
+            await query.answer(ok=False, error_message="This invoice belongs to a different account.")
+            return
+        if query.total_amount != stars:
+            await query.answer(ok=False, error_message="This invoice is out of date. Please run /buypremium again.")
+            return
+        await query.answer(ok=True)
+    except Exception as e:
+        logger.error(f"premium pre_checkout failed: {e}", exc_info=True)
+        try:
+            await query.answer(ok=False, error_message="Something went wrong. Please try again in a moment.")
+        except Exception:
+            pass
+
+
+async def premium_successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    payment = message.successful_payment
+    parsed = _parse_premium_payload(payment.invoice_payload)
+    if parsed is None:
+        logger.warning(f"successful_payment with unrecognised payload {payment.invoice_payload!r}")
+        return
+
+    payer_id = message.from_user.id
+    _uid, secs, stars = parsed
+    charge_id = payment.telegram_payment_charge_id
+
+    try:
+        new_expiry = await asyncio.to_thread(
+            db.premium_grant_from_payment, charge_id, payer_id, payment.total_amount, secs
+        )
+    except Exception as e:
+        logger.error(f"Failed to record premium payment {charge_id}: {e}", exc_info=True)
+        try:
+            await context.bot.send_message(
+                chat_id=OWNER_ID,
+                text=(
+                    f"🚨 A premium Stars payment went through but failed to record.\n"
+                    f"User: {payer_id}\nStars: {payment.total_amount}\nCharge ID: {charge_id}\nError: {e}"
+                ),
+            )
+        except Exception:
+            pass
+        await message.reply_text(
+            "⚠️ Your payment went through, but I hit an error activating Premium. "
+            "The owner has been notified and will sort it out."
+        )
+        return
+
+    if new_expiry is None:
+        return  # duplicate delivery of an already-applied charge
+
+    remaining = (new_expiry - datetime.now()).total_seconds()
+    await message.reply_text(
+        f"🎉 Premium activated! Your Word Game and Word Scramble {DOLLAR} rewards are now doubled.\n"
+        f"⏳ Time remaining: {_format_remaining(remaining)}"
+    )
+
+
+async def premiumstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if is_owner(user.id):
+        await update.message.reply_text("👑 You're the bot owner - Premium is always on for you, free and permanent.")
+        return
+
+    expiry = await asyncio.to_thread(db.premium_get_expiry, user.id)
+    now = datetime.now()
+    if expiry and expiry > now:
+        await update.message.reply_text(
+            f"⭐ Premium is active - your {DOLLAR} rewards are doubled.\n"
+            f"⏳ Time remaining: {_format_remaining((expiry - now).total_seconds())}\n\n"
+            f"Use /buypremium to extend it."
+        )
+        return
+
+    price, dur = await asyncio.to_thread(get_premium_settings)
+    await update.message.reply_text(
+        f"You don't have Premium right now.\n\n"
+        f"⭐ /buypremium - {price} ⭐ for {_format_duration_words(dur)} of doubled {DOLLAR} rewards "
+        f"in Word Game and Word Scramble."
+    )
+
+
+@owner_only
+async def setpremium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        price, dur = await asyncio.to_thread(get_premium_settings)
+        await update.message.reply_text(
+            f"⭐ Current Premium: {price} ⭐ for {_format_duration_words(dur)}.\n\n"
+            f"Usage: /setpremium <stars> <duration>  (e.g. /setpremium 99 7d)\n"
+            f"Duration units: m, h, d."
+        )
+        return
+
+    if len(context.args) != 2:
+        await update.message.reply_text("Usage: /setpremium <stars> <duration>  (e.g. /setpremium 99 7d)")
+        return
+
+    try:
+        stars = int(context.args[0])
+    except ValueError:
+        stars = 0
+    if stars < 1:
+        await update.message.reply_text("❌ Stars must be a whole number of at least 1.")
+        return
+
+    seconds = _parse_duration(context.args[1])
+    if seconds is None:
+        await update.message.reply_text("❌ Invalid duration. Use e.g. 30m, 12h, 7d.")
+        return
+
+    await asyncio.to_thread(db.set_config, "premium_price_stars", str(stars))
+    await asyncio.to_thread(db.set_config, "premium_duration_seconds", str(seconds))
+    await update.message.reply_text(
+        f"✅ Premium is now {stars} ⭐ for {_format_duration_words(seconds)}. "
+        f"Existing subscribers keep the time they already paid for."
+    )
+
+
+def build_premium_players_page(page: int):
+    total = db.premium_count_active()
+    offset = page * PREMIUM_PAGE_SIZE
+    rows = db.premium_list_active(offset, PREMIUM_PAGE_SIZE) if total else []
+
+    total_pages = max(1, (total + PREMIUM_PAGE_SIZE - 1) // PREMIUM_PAGE_SIZE)
+    lines = [
+        f"⭐ <b>Premium Players</b> ({total} active) — Page {page + 1}/{total_pages}\n",
+        f"👑 <b>Bot owner</b> (<code>{OWNER_ID}</code>) — permanent, free Premium "
+        f"<i>(not stored in the list; not counted above)</i>\n",
+    ]
+    now = datetime.now()
+    if not rows:
+        lines.append("No paid premium players right now." if page == 0 else "No more entries.")
+    for i, (uid, name, expires_at) in enumerate(rows):
+        try:
+            left = _format_remaining((datetime.fromisoformat(expires_at) - now).total_seconds())
+        except (TypeError, ValueError):
+            left = "unknown"
+        lines.append(
+            f"{offset + i + 1}. {truncate_name(name or 'Unknown')} — "
+            f"ID: <code>{uid}</code> — ⏳ {left}"
+        )
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"spp:{page - 1}"))
+    if offset + PREMIUM_PAGE_SIZE < total:
+        nav_row.append(InlineKeyboardButton("➡️ Next", callback_data=f"spp:{page + 1}"))
+    return "\n".join(lines), (InlineKeyboardMarkup([nav_row]) if nav_row else None)
+
+
+@owner_only
+async def seepremiumplayers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text, keyboard = await asyncio.to_thread(build_premium_players_page, 0)
+    await update.message.reply_html(text, reply_markup=keyboard)
+
+
+async def premium_players_page_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_owner(query.from_user.id):
+        await query.answer("🚫 Owner only.", show_alert=True)
+        return
+    try:
+        page = max(0, int(query.data.split(":", 1)[1]))
+    except (ValueError, IndexError):
+        await query.answer()
+        return
+    text, keyboard = await asyncio.to_thread(build_premium_players_page, page)
+    await query.answer()
+    try:
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+    except BadRequest:
+        pass  # message unchanged
+
+
+async def get_star_balance(bot):
+    """The bot's current Telegram Stars balance via the real Bot API method
+    getMyStarBalance. Returns (stars, nanostars). Shared by /starbalance and
+    /withdraw."""
+    fn = getattr(bot, "get_my_star_balance", None)
+    if fn is not None:
+        result = await fn()
+        return int(result.amount), int(getattr(result, "nanostar_amount", 0) or 0)
+    api = getattr(bot, "do_api_request", None)
+    if api is None:
+        raise RuntimeError("This python-telegram-bot version can't call getMyStarBalance - please upgrade it.")
+    data = await api("getMyStarBalance")
+    return int(data.get("amount", 0)), int(data.get("nanostar_amount", 0) or 0)
+
+
+def _format_star_amount(stars, nano):
+    return f"{stars}" + (f" (+{nano} nanostars)" if nano else "")
+
+
+@owner_only
+async def starbalance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        stars, nano = await get_star_balance(context.bot)
+    except Exception as e:
+        logger.error(f"getMyStarBalance failed: {e}")
+        await update.message.reply_text(f"⚠️ Couldn't read the Stars balance right now: {e}")
+        return
+    await update.message.reply_text(f"⭐ Bot Stars balance: {_format_star_amount(stars, nano)}")
+
+
+@owner_only
+async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        stars, nano = await get_star_balance(context.bot)
+        balance_line = f"⭐ Current balance: <b>{_format_star_amount(stars, nano)}</b>"
+    except Exception as e:
+        logger.error(f"getMyStarBalance failed in /withdraw: {e}")
+        balance_line = "⚠️ Couldn't read the current balance right now."
+
+    await update.message.reply_html(
+        f"💸 <b>Withdraw Stars</b>\n\n"
+        f"{balance_line}\n\n"
+        f"Telegram doesn't expose Stars withdrawal through the Bot API, so I can't do it for you - "
+        f"it has to be done by you in @BotFather:\n\n"
+        f"1. Open @BotFather → /mybots → choose this bot.\n"
+        f"2. Go to Bot Settings → the Balance / Stars option.\n"
+        f"3. Tap Withdraw and confirm (Telegram asks for your own two-step verification).\n\n"
+        f"<i>Telegram sets its own minimum withdrawal amount and holding period before Stars can be "
+        f"withdrawn - BotFather shows the current rules, and they can change.</i>"
+    )
+
+
+async def premium_renewal_reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        rows = await asyncio.to_thread(db.premium_get_expiring_unprompted, PREMIUM_REMINDER_WINDOW_SECONDS)
+    except Exception as e:
+        logger.error(f"premium reminder scan failed: {e}")
+        return
+    if not rows:
+        return
+
+    price, dur = await asyncio.to_thread(get_premium_settings)
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"⭐ Renew ({price} ⭐ / {_format_duration_words(dur)})", callback_data="buypremium")
+    ]])
+
+    for uid, expires_at in rows:
+        try:
+            # At-most-once per expiry window: flip the flag first, so a failed
+            # send (e.g. user blocked the bot) never causes hourly repeats.
+            if not await asyncio.to_thread(db.premium_mark_prompted, uid):
+                continue
+            left = _format_remaining((datetime.fromisoformat(expires_at) - datetime.now()).total_seconds())
+            await context.bot.send_message(
+                chat_id=uid,
+                text=f"⭐ Your Premium expires in {left} - renew to keep your doubled {DOLLAR} rewards?",
+                reply_markup=keyboard,
+            )
+        except Exception as e:
+            logger.info(f"premium reminder to {uid} not delivered: {e}")
+        await asyncio.sleep(0.05)
+
+
+def schedule_premium_reminder_job(job_queue):
+    """Restart-safe: all state lives in the database, so re-registering the
+    repeating job on every boot is all that's needed."""
+    if job_queue is None:
+        return
+    if job_queue.get_jobs_by_name(PREMIUM_REMINDER_JOB_NAME):
+        return
+    job_queue.run_repeating(
+        premium_renewal_reminder_job,
+        interval=3600,
+        first=60,
+        name=PREMIUM_REMINDER_JOB_NAME,
+    )
+
+
 def main():
     print("GAME BOT: main() started", flush=True)
 
@@ -6320,6 +7779,9 @@ def main():
     app.add_handler(CommandHandler("unbanuser", unbanuser_command))
     app.add_handler(CommandHandler("bangroup", bangroup_command))
     app.add_handler(CommandHandler("unbangroup", unbangroup_command))
+    app.add_handler(CommandHandler("controlgroup", controlgroup_command))
+    app.add_handler(CommandHandler("tournamentban", tournamentban_command))
+    app.add_handler(CommandHandler("tournamentunban", tournamentunban_command))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(CommandHandler("sendgroupmessage", sendgroupmessage_command))
     app.add_handler(CommandHandler("maintenance", maintenance_command))
@@ -6355,6 +7817,21 @@ def main():
     # --- Invite & Earn -------------------------------------------------
     app.add_handler(CommandHandler("invitereward", invitereward_command))
     app.add_handler(CommandHandler("claim", claim_command))
+    app.add_handler(CommandHandler("bbb", bbb_command))
+    app.add_handler(CommandHandler("join", join_command))
+    app.add_handler(CommandHandler("bbbstart", bbbstart_command))
+    app.add_handler(CommandHandler("bbbcancel", bbbcancel_command))
+    app.add_handler(CommandHandler("buypremium", buypremium_command))
+    app.add_handler(CommandHandler("premiumstatus", premiumstatus_command))
+    app.add_handler(CommandHandler("setpremium", setpremium_command))
+    app.add_handler(CommandHandler("seepremiumplayers", seepremiumplayers_command))
+    app.add_handler(CommandHandler("starbalance", starbalance_command))
+    app.add_handler(CommandHandler("withdraw", withdraw_command))
+    app.add_handler(PreCheckoutQueryHandler(premium_precheckout_callback))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, premium_successful_payment_callback))
+    # Specific callback patterns must be registered BEFORE the catch-all button handler.
+    app.add_handler(CallbackQueryHandler(buypremium_button, pattern=r"^buypremium$"))
+    app.add_handler(CallbackQueryHandler(premium_players_page_button, pattern=r"^spp:\d+$"))
     app.add_handler(CommandHandler("profile", profile_command))
     app.add_handler(CommandHandler("inviteandearn", inviteandearn_command))
 
@@ -6375,7 +7852,7 @@ def main():
     ), group=1)
     app.add_handler(MessageHandler(
         filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND,
-        scramble_group_text,
+        scramble_group_router,
     ), group=1)
 
     if app.job_queue is not None:
@@ -6384,6 +7861,8 @@ def main():
         restore_stale_word_games(app.job_queue)
         restore_autodelete_jobs(app.job_queue)
         restore_stale_invite_rewards(app.job_queue)
+        schedule_premium_reminder_job(app.job_queue)
+        restore_stale_tournaments(app.job_queue)
 
         if db.get_config("scramble_mode_enabled", "0") == "1":
             try:

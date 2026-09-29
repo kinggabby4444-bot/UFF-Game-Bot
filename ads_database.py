@@ -627,6 +627,37 @@ def get_all_advertiser_ids(status=None):
         conn.close()
 
 
+def get_all_distinct_applicant_ids():
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT DISTINCT applicant_id FROM ad_applications WHERE applicant_id IS NOT NULL")
+        return [r[0] for r in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+def get_applicant_id_by_username(username):
+    """Exact (case-insensitive) match on applicant_username; returns the
+    applicant_id of the most recent matching application, or None."""
+    username = (username or "").strip().lstrip("@")
+    if not username:
+        return None
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT applicant_id FROM ad_applications "
+            "WHERE LOWER(applicant_username)=LOWER(%s) "
+            "ORDER BY submitted_at DESC LIMIT 1",
+            (username,),
+        )
+        row = cursor.fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
 def create_payment(application_id, file_id, file_kind):
     conn = connect()
     try:
