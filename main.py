@@ -1,5 +1,6 @@
 import os
 import ast
+import math
 import random
 import re
 import asyncio
@@ -1691,11 +1692,13 @@ async def scrambleallcommands_command(update: Update, context: ContextTypes.DEFA
 /scramblemaintenance on|off - pause new Word Scramble rounds only (Word Game unaffected)
 /scramblemode &lt;time&gt;|off - my DM only: auto-start a round in EVERY group on a repeating interval
 /controlgroup automaticmode on|off &lt;group&gt; | slowmode on &lt;time&gt;|off &lt;group&gt; - owner only: remotely control Slow Mode / Automatic Mode in any group (&lt;group&gt; = ID, @username or allgroups)
-/bbbstart - tournament host, bot owner or Bot Admins: start the lobby early
-/bbbcancel - tournament host, bot owner or Bot Admins: cancel a lobby and refund everyone
+/starttournament - tournament host, bot owner or Bot Admins: start the lobby early
+/stoptournament - tournament host, bot owner or Bot Admins: cancel a lobby and refund everyone
+/extendlobby &lt;2-9&gt;m - owner only: add minutes to the open tournament lobby in this group (e.g. /extendlobby 5m)
 /tournamentban &lt;username|ID&gt; - owner/Bot Admins: ban a player (or reply to them) from tournaments only; also accepts a group username/ID to ban that group from running tournaments
 /tournamentunban &lt;username|ID&gt; - owner/Bot Admins: undo a tournament ban (player or group)
 /setpremium &lt;stars&gt; &lt;duration&gt; - owner only: set the premium price and length (no args shows current)
+/giftpremium &lt;username|ID&gt; - owner only: give someone 7 days of Premium (or reply to their message); works in DM too
 /seepremiumplayers - owner only: every current premium player with time remaining
 /starbalance - owner only: the bot's current Telegram Stars balance
 /withdraw - owner only: Stars balance + how to withdraw it via @BotFather
@@ -6470,9 +6473,11 @@ async def allcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 /tournamentban &lt;username|ID&gt; - ban a player (or reply to them) from tournaments only; also accepts a group username/ID to ban that group from running tournaments
 /tournamentunban &lt;username|ID&gt; - undo a tournament ban (player or group)
 /controlgroup automaticmode on|off &lt;group&gt; | slowmode on &lt;time&gt;|off &lt;group&gt; - owner only: control Word Scramble Slow Mode / Automatic Mode in any group (&lt;group&gt; = ID, @username or allgroups)
-/bbbstart - tournament host, bot owner or Bot Admins: start the lobby early
-/bbbcancel - tournament host, bot owner or Bot Admins: cancel a lobby and refund everyone
+/starttournament - tournament host, bot owner or Bot Admins: start the lobby early
+/stoptournament - tournament host, bot owner or Bot Admins: cancel a lobby and refund everyone
+/extendlobby &lt;2-9&gt;m - owner only: add minutes to the open tournament lobby in this group (e.g. /extendlobby 5m)
 /setpremium &lt;stars&gt; &lt;duration&gt; - owner only: set the premium price and length (e.g. /setpremium 99 7d; no args shows current)
+/giftpremium &lt;username|ID&gt; - owner only: give someone 7 days of Premium (or reply to their message); works in DM too
 /seepremiumplayers - owner only: every current premium player with time remaining
 /starbalance - owner only: the bot's current Telegram Stars balance
 /withdraw - owner only: Stars balance + how to withdraw it via @BotFather
@@ -6765,26 +6770,34 @@ def tournament_random_word(chat_id, difficulty):
     return word
 
 
+def tournament_prize(fee, player_count) -> int:
+    """Advertised (and actually paid) prize: every entry fee plus one bonus
+    entry fee from the bot. Must match the pot formula in db.tournament_settle."""
+    return fee * (player_count + 1)
+
+
+def _tournament_lobby_remaining(t) -> float:
+    """Seconds until the lobby closes (base 120s + any /extendlobby time)."""
+    try:
+        elapsed = (datetime.now() - datetime.fromisoformat(t["created_at"])).total_seconds()
+    except (TypeError, ValueError):
+        elapsed = 0
+    return TOURNAMENT_LOBBY_SECONDS + (t.get("lobby_extra_seconds") or 0) - elapsed
+
+
 def tournament_lobby_text(t, players) -> str:
-    host = next((p for p in players if p[0] == t["host_id"]), players[0] if players else None)
-    host_name = esc_name(host[1]) if host else "?"
-    count = len(players)
+    minutes = max(1, math.ceil(_tournament_lobby_remaining(t) / 60))
+    unit = "minute" if minutes == 1 else "minutes"
     lines = [
-        "🏟️ WORD SCRAMBLE TOURNAMENT 🏟️",
+        "SCRAMBLE TOURNAMENT 🏟️",
         "",
-        f"Host: {host_name}",
-        f"Entry fee: {DOLLAR}{t['fee']}",
-        f"Difficulty: {esc((t['difficulty'] or 'off').capitalize())}",
+        f"Prize: {DOLLAR}{tournament_prize(t['fee'], len(players))}",
+        f"Mode: {esc((t['difficulty'] or 'off').capitalize())}",
         f"Rounds: {t['total_rounds']}",
-        f"Prize pool: {DOLLAR}{t['fee'] * count}",
+        f"Entry fee: {DOLLAR}{t['fee']}",
         "",
-        f"Players ({count})",
-    ]
-    lines += [f"• {esc_name(p[1])}" for p in players]
-    lines += [
-        "",
-        f"Send /join to enter. {DOLLAR}{t['fee']} will be taken from your Word Scramble balance.",
-        "⏳ Lobby closes in 2 minutes.",
+        "Send /join to enter.",
+        f"⏳ Lobby closes in {minutes} {unit}.",
     ]
     return "\n".join(lines)
 
@@ -6810,12 +6823,25 @@ async def _tournament_post_lobby(context, tid):
                 chat_id=t["chat_id"], message_id=t["lobby_message_id"], text=text, parse_mode="HTML"
             )
             return
+        except BadRequest as e:
+            if "not modified" in str(e).lower():
+                return
+            # message gone / not editable - repost below
         except Exception:
-            pass  # message gone / not editable - repost below
+            pass  # repost below
 
     sent = await safe_send(context.bot, t["chat_id"], text=text, parse_mode="HTML")
     if sent:
         await asyncio.to_thread(db.tournament_set_lobby_message, tid, sent.message_id)
+
+
+async def _tournament_announce_join(context, chat_id, user):
+    """'<Name> joined ✅' with the name as a tappable (blue) mention."""
+    await safe_send(
+        context.bot, chat_id,
+        text=f'<a href="tg://user?id={user.id}">{esc_name(user.first_name)}</a> joined ✅',
+        parse_mode="HTML",
+    )
 
 
 def _parse_bbb_args(args):
@@ -6901,6 +6927,7 @@ async def _open_tournament_lobby(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     await _tournament_post_lobby(context, tid)
+    await _tournament_announce_join(context, chat.id, user)
     _schedule_tournament_job(
         context.job_queue, tournament_lobby_close_callback,
         _tournament_lobby_job_name(tid), TOURNAMENT_LOBBY_SECONDS, chat.id, {"tid": tid},
@@ -6935,14 +6962,15 @@ async def join_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         await safe_react(context.bot, chat.id, update.message.message_id, "👍")
-        await _tournament_post_lobby(context, t["id"])
+        await _tournament_announce_join(context, chat.id, user)
+        await _tournament_post_lobby(context, t["id"])  # edits the first message: prize goes up by the new fee
 
 
 async def _tournament_may_manage(user_id, t) -> bool:
     return user_id == t["host_id"] or await asyncio.to_thread(is_bot_admin_or_owner, user_id)
 
 
-async def bbbstart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def starttournament_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     t = await asyncio.to_thread(db.tournament_get_open_for_chat, chat.id)
     if not t or t["status"] != "lobby":
@@ -6954,7 +6982,41 @@ async def bbbstart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _tournament_start(context, t["id"])
 
 
-async def bbbcancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+@owner_only
+async def extendlobby_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    usage = "Usage: /extendlobby <2-9>m  (minutes, e.g. /extendlobby 5m) - run it in the group whose lobby is open."
+
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await update.message.reply_text("🏟️ Run /extendlobby inside the group whose tournament lobby is open.")
+        return
+
+    m = re.fullmatch(r"([2-9])m?", (context.args[0].lower() if context.args else ""))
+    if len(context.args) != 1 or not m:
+        await update.message.reply_text(usage)
+        return
+    minutes = int(m.group(1))
+
+    t = await asyncio.to_thread(db.tournament_get_open_for_chat, chat.id)
+    if not t or t["status"] != "lobby":
+        await update.message.reply_text("🏟️ There's no tournament lobby open in this group.")
+        return
+
+    extra = await asyncio.to_thread(db.tournament_extend_lobby, t["id"], minutes * 60)
+    if extra is None:
+        await update.message.reply_text("🏟️ That lobby has just closed - too late to extend it.")
+        return
+
+    t["lobby_extra_seconds"] = extra
+    _schedule_tournament_job(
+        context.job_queue, tournament_lobby_close_callback,
+        _tournament_lobby_job_name(t["id"]), max(_tournament_lobby_remaining(t), 1), chat.id, {"tid": t["id"]},
+    )
+    await _tournament_post_lobby(context, t["id"])
+    await update.message.reply_text(f"⏳ Lobby extended by {minutes} minute(s).")
+
+
+async def stoptournament_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     t = await asyncio.to_thread(db.tournament_get_open_for_chat, chat.id)
     if not t or t["status"] != "lobby":
@@ -7007,7 +7069,7 @@ async def tournament_lobby_close_callback(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _tournament_start(context, tid):
-    """Shared by the 120s lobby job and /bbbstart."""
+    """Shared by the lobby-close job and /starttournament."""
     t = await asyncio.to_thread(db.tournament_get, tid)
     if not t or t["status"] != "lobby":
         return
@@ -7035,7 +7097,7 @@ async def _tournament_start(context, tid):
             f"Players: {len(players)}\n"
             f"Rounds: {t['total_rounds']}\n"
             f"Difficulty: {esc((t['difficulty'] or 'off').capitalize())}\n"
-            f"Prize pool: {DOLLAR}{t['fee'] * len(players)}\n\n"
+            f"Prize: {DOLLAR}{tournament_prize(t['fee'], len(players))}\n\n"
             f"First correct answer each round scores 💎{TOURNAMENT_POINTS_PER_WIN}. Get ready!"
         ),
         parse_mode="HTML",
@@ -7219,10 +7281,10 @@ async def _tournament_finish(context, tid):
 
     if res["case"] == "single":
         uid, name, payout, balance = res["winners"][0]
-        lines.append(f"👑 Winner: <b>{esc_name(name)}</b> takes the whole pot - {DOLLAR}{payout}!")
+        lines.append(f"👑 Winner: <b>{esc_name(name)}</b> takes the whole prize - {DOLLAR}{payout}!")
         lines.append(f"New balance: {DOLLAR}{balance}")
     elif res["case"] == "tie":
-        lines.append("🤝 It's a tie! The pot is split:")
+        lines.append("🤝 It's a tie! The prize is split:")
         for uid, name, payout, balance in res["winners"]:
             lines.append(f"• <b>{esc_name(name)}</b> - {DOLLAR}{payout} (new balance {DOLLAR}{balance})")
     else:
@@ -7247,7 +7309,7 @@ def restore_stale_tournaments(job_queue):
 
         if t["status"] == "lobby":
             try:
-                remaining = TOURNAMENT_LOBBY_SECONDS - (now - datetime.fromisoformat(t["created_at"])).total_seconds()
+                remaining = _tournament_lobby_remaining(t)
             except (TypeError, ValueError):
                 remaining = 0
             _schedule_tournament_job(
@@ -7634,6 +7696,69 @@ async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+GIFT_PREMIUM_SECONDS = 7 * 86400
+
+
+@owner_only
+async def giftpremium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    usage = (
+        "Usage: /giftpremium <username|ID>  (or reply to the person's message)\n"
+        "Gives them 7 days of Premium (added on top of any time they already have)."
+    )
+    reply_msg = update.message.reply_to_message
+
+    if context.args:
+        arg = context.args[0]
+        if re.fullmatch(r"\d+", arg):
+            target_id, target_name = int(arg), arg
+            row = await asyncio.to_thread(db.get_user_by_id, target_id)
+            if row:
+                target_name = row[1] or arg
+        else:
+            row = await asyncio.to_thread(db.get_user_by_username, arg.lstrip("@"))
+            if not row:
+                await update.message.reply_text(f"❌ No player found matching {arg}.")
+                return
+            target_id, target_name = row[0], row[1] or arg
+    elif (
+        reply_msg is not None
+        and reply_msg.from_user is not None
+        and not getattr(reply_msg, "forum_topic_created", None)
+    ):
+        target_id = reply_msg.from_user.id
+        target_name = reply_msg.from_user.first_name or str(target_id)
+        if reply_msg.from_user.is_bot:
+            await update.message.reply_text("❌ Bots can't have Premium.")
+            return
+    else:
+        await update.message.reply_text(usage)
+        return
+
+    if is_owner(target_id):
+        await update.message.reply_text("👑 The bot owner always has Premium - nothing to gift!")
+        return
+
+    new_expiry = await asyncio.to_thread(db.premium_grant_gift, target_id, GIFT_PREMIUM_SECONDS)
+    remaining = _format_remaining((new_expiry - datetime.now()).total_seconds())
+
+    await update.message.reply_html(
+        f"🎁 Gifted 7 days of Premium to "
+        f'<a href="tg://user?id={target_id}">{esc_name(target_name)}</a> (<code>{target_id}</code>).\n'
+        f"⏳ Their Premium now has {remaining} remaining."
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=target_id,
+            text=(
+                f"🎁 You've been gifted 7 days of Premium! Your {DOLLAR} rewards in Word Game and "
+                f"Word Scramble are now doubled.\n⏳ Time remaining: {remaining}"
+            ),
+        )
+    except Exception:
+        pass  # they may not have started the bot yet - the gift is still applied
+
+
 async def premium_renewal_reminder_job(context: ContextTypes.DEFAULT_TYPE):
     try:
         rows = await asyncio.to_thread(db.premium_get_expiring_unprompted, PREMIUM_REMINDER_WINDOW_SECONDS)
@@ -7845,8 +7970,10 @@ def main():
     app.add_handler(CommandHandler("settournament", settournament_command))
     app.add_handler(CommandHandler("tournament", tournament_command))
     app.add_handler(CommandHandler("join", join_command))
-    app.add_handler(CommandHandler("bbbstart", bbbstart_command))
-    app.add_handler(CommandHandler("bbbcancel", bbbcancel_command))
+    app.add_handler(CommandHandler("starttournament", starttournament_command))
+    app.add_handler(CommandHandler("stoptournament", stoptournament_command))
+    app.add_handler(CommandHandler("extendlobby", extendlobby_command))
+    app.add_handler(CommandHandler("giftpremium", giftpremium_command))
     app.add_handler(CommandHandler("buypremium", buypremium_command))
     app.add_handler(CommandHandler("premiumstatus", premiumstatus_command))
     app.add_handler(CommandHandler("setpremium", setpremium_command))

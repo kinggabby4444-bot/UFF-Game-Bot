@@ -461,6 +461,7 @@ def create_tables():
         )
         """)
         cursor.execute("ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS lobby_message_id BIGINT")
+        cursor.execute("ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS lobby_extra_seconds INTEGER DEFAULT 0")
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS tournament_players (
             id BIGSERIAL PRIMARY KEY,
@@ -1700,7 +1701,8 @@ def is_tournament_banned(target_type, target_id):
 
 _TOURNAMENT_COLS = (
     "id, chat_id, host_id, fee, difficulty, total_rounds, current_round, status, "
-    "current_word, current_scrambled, round_started_at, created_at, lobby_message_id"
+    "current_word, current_scrambled, round_started_at, created_at, lobby_message_id, "
+    "lobby_extra_seconds"
 )
 _TOURNAMENT_KEYS = [c.strip() for c in _TOURNAMENT_COLS.split(",")]
 
@@ -1909,6 +1911,25 @@ def tournament_set_lobby_message(tournament_id, message_id):
         conn.close()
 
 
+def tournament_extend_lobby(tournament_id, seconds):
+    """Adds `seconds` to a LOBBY's closing time (persisted, so a restart keeps
+    it). Returns the new total extra seconds, or None if it isn't a lobby."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE tournaments
+            SET lobby_extra_seconds = COALESCE(lobby_extra_seconds, 0) + %s
+            WHERE id=%s AND status='lobby'
+            RETURNING lobby_extra_seconds
+        """, (seconds, tournament_id))
+        row = cursor.fetchone()
+        conn.commit()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
 def tournament_activate(tournament_id):
     """lobby -> active, exactly once (so /bbbstart and the 120s job can never
     both start it). current_round counts rounds STARTED, so it begins at 0
@@ -2039,7 +2060,10 @@ def tournament_settle(tournament_id):
                 return {"case": "refund", "fee": fee, "pot": 0, "chat_id": chat_id,
                         "standings": [], "winners": [], "refunds": []}
 
-            pot = fee * len(players)
+            # Advertised prize = every entry fee PLUS one bonus entry fee added
+            # by the bot (fee x (players + 1)); the winner(s) are paid exactly
+            # what the lobby announced.
+            pot = fee * (len(players) + 1)
             top = max(p[2] for p in players)
             standings = sorted(((p[0], p[1], p[2]) for p in players), key=lambda x: -x[2])
             winners, refunds = [], []
@@ -2180,6 +2204,36 @@ def premium_grant_from_payment(charge_id, user_id, stars, duration_seconds):
                 pass
         new_expiry = base + timedelta(seconds=duration_seconds)
 
+        cursor.execute("""
+            INSERT INTO premium_users (user_id, expires_at, last_renewal_prompt_at)
+            VALUES (%s, %s, NULL)
+            ON CONFLICT (user_id) DO UPDATE SET
+                expires_at=EXCLUDED.expires_at, last_renewal_prompt_at=NULL
+        """, (user_id, new_expiry.isoformat()))
+        conn.commit()
+        return new_expiry
+    finally:
+        conn.close()
+
+
+def premium_grant_gift(user_id, duration_seconds):
+    """Owner gift: extends premium from the current expiry if still active,
+    else from now. No payment record. Returns the new expiry (datetime)."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        now = datetime.now()
+        cursor.execute("SELECT expires_at FROM premium_users WHERE user_id=%s FOR UPDATE", (user_id,))
+        row = cursor.fetchone()
+        base = now
+        if row and row[0]:
+            try:
+                current = datetime.fromisoformat(row[0])
+                if current > now:
+                    base = current
+            except (TypeError, ValueError):
+                pass
+        new_expiry = base + timedelta(seconds=duration_seconds)
         cursor.execute("""
             INSERT INTO premium_users (user_id, expires_at, last_renewal_prompt_at)
             VALUES (%s, %s, NULL)
