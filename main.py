@@ -1657,13 +1657,8 @@ async def reply_html_in_parts(message, text, limit=3800):
         await message.reply_html(part)
 
 
-async def scrambleallcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_bot_admin_or_owner(update.effective_user.id) and not await is_chat_creator(update, context):
-        await update.message.reply_text(
-            "🚫 This command is for the bot owner or this group's creator."
-        )
-        return
-    text = """
+def _scrambleallcommands_text() -> str:
+    return """
 📖 <b>All Word Scramble Commands</b>
 
 <b>👥 Player Commands</b>
@@ -1684,6 +1679,8 @@ async def scrambleallcommands_command(update: Update, context: ContextTypes.DEFA
 /settournament &lt;fee&gt; &lt;difficulty&gt; &lt;rounds&gt;rounds - host a Word Scramble tournament in a group (e.g. /settournament 2000 Medium 3rounds); everyone pays the entry fee from their Word Scramble balance and the winner takes the pot
 /tournament - quick-start a tournament instantly: same as /settournament 5 easy 20rounds
 /join - join the tournament lobby that's open in this group
+/searchcommand &lt;text&gt; - search the command list by name or description (only shows commands you're allowed to see)
+/fullhelp - a complete, paged guide to the bot: games, tournaments, premium, coins and more
 
 <b>🛡️ Group Admin Commands</b>
 /scramblestopgame - group admins (or the owner) can stop an active round instantly
@@ -1724,6 +1721,15 @@ async def scrambleallcommands_command(update: Update, context: ContextTypes.DEFA
 
 <i>Note: Word Scramble intentionally has no /scramblebanuser, /scramblebroadcast, /scrambleshare, or /scrambleadmins - banning, broadcasting, and bot-admin management are bot-wide systems shared with the Word Game, so /banuser, /broadcast, /share, and /addadmin already cover Word Scramble too. There's also no daily-reward feature specific to Word Scramble - the 🎁 Daily Reward always credits the Word Game balance, and every player's displayed Balance/Level/Rank on /start combines both games automatically. This list and /allcommands are visible to the bot owner, Bot Admins, and each group's own Telegram creator.</i>
 """
+
+
+async def scrambleallcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_bot_admin_or_owner(update.effective_user.id) and not await is_chat_creator(update, context):
+        await update.message.reply_text(
+            "🚫 This command is for the bot owner or this group's creator."
+        )
+        return
+    text = _scrambleallcommands_text()
     await reply_html_in_parts(update.message, text)
 
 
@@ -6447,13 +6453,8 @@ async def admins_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html("\n".join(lines))
 
 
-async def allcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_bot_admin_or_owner(update.effective_user.id) and not await is_chat_creator(update, context):
-        await update.message.reply_text(
-            "🚫 This command is for the bot owner or this group's creator."
-        )
-        return
-    text = f"""
+def _allcommands_text() -> str:
+    return f"""
 📖 <b>All Bot Commands</b>
 
 <b>👥 Public Commands</b>
@@ -6474,6 +6475,8 @@ async def allcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 /settournament &lt;fee&gt; &lt;difficulty&gt; &lt;rounds&gt;rounds - host a Word Scramble tournament in a group (e.g. /settournament 2000 Medium 3rounds); everyone pays the entry fee from their Word Scramble balance and the winner takes the pot
 /tournament - quick-start a tournament instantly: same as /settournament 5 easy 20rounds
 /join - join the tournament lobby that's open in this group
+/searchcommand &lt;text&gt; - search the command list by name or description (only shows commands you're allowed to see)
+/fullhelp - a complete, paged guide to the bot: games, tournaments, premium, coins and more
 
 <b>🎮 Group Commands</b>
 /wordgame - start a round (admins only once a round is live)
@@ -6546,6 +6549,15 @@ async def allcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 <i>Note: banuser/unbanuser/bangroup/unbangroup/broadcast/maintenance/addadmanager/changeadmanager/removeadmanager/admanager/adminmode/prompt/editprompt/groupadminmode can also be used by Bot Admins. /ad on|off, /botgroups, /addwords, /removewords, /shufflewords, and /gamedifficulty are owner-only. /autodelete's bare on/off form works for group admins too; its explicit-group and allgroups forms are owner-only. This list and /scrambleallcommands are visible to the bot owner, Bot Admins, and each group's own Telegram creator. Word Scramble has its own command list - see /scrambleallcommands (includes /scramblestopallgroups). The 🎁 Daily Reward always credits the Word Game balance, and every player's Balance/Level/Rank on /start combines their Word Game + Word Scramble balances automatically.</i>
 """
+
+
+async def allcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_bot_admin_or_owner(update.effective_user.id) and not await is_chat_creator(update, context):
+        await update.message.reply_text(
+            "🚫 This command is for the bot owner or this group's creator."
+        )
+        return
+    text = _allcommands_text()
     await reply_html_in_parts(update.message, text)
 
 
@@ -8757,6 +8769,306 @@ async def deleterequestprompt_command(update: Update, context: ContextTypes.DEFA
     await update.message.reply_text(f"✅ Request prompts here: {_request_prompt_delete_status(seconds)}.")
 
 
+# =======================================================================
+# /searchcommand and /fullhelp
+# =======================================================================
+
+SEARCHCOMMAND_MAX_RESULTS = 15
+SEARCHCOMMAND_USAGE = "Usage: /searchcommand <text>  (e.g. /searchcommand tournament)"
+
+
+def _command_entries():
+    """Every command line from /allcommands and /scrambleallcommands, read from
+    the SAME text those commands send (so it can never go stale). Each entry:
+    {name, names, desc, restricted}. `restricted` marks lines from the
+    'Group Admin' and 'Owner' sections."""
+    entries = []
+    for text in (_allcommands_text(), _scrambleallcommands_text()):
+        restricted = False
+        for raw in text.split("\n"):
+            line = raw.strip()
+            heading = re.fullmatch(r"<b>(.*)</b>", line)
+            if heading:
+                title = heading.group(1)
+                restricted = ("Owner" in title) or ("Group Admin" in title)
+                continue
+            if not line.startswith("/"):
+                continue
+            head, _sep, desc = line.partition(" - ")
+            names = [n.lower() for n in re.findall(r"/([A-Za-z0-9_]+)", html_lib.unescape(head))]
+            if not names:
+                continue
+            entries.append({
+                "name": names[0],
+                "names": names,
+                "desc": html_lib.unescape(desc).strip(),
+                "restricted": restricted,
+            })
+    return entries
+
+
+def search_commands(query: str, include_restricted: bool):
+    """Case-insensitive; every word must match the command name(s) or the
+    description. Restricted-section lines are only searched when
+    include_restricted is True. Deduplicated by command name (first wins).
+    Returns the full list of matching entries."""
+    words = [w.lower().lstrip("/") for w in (query or "").split()]
+    words = [w for w in words if w]
+    if not words:
+        return []
+    results, seen = [], set()
+    for e in _command_entries():
+        if e["restricted"] and not include_restricted:
+            continue
+        haystack = (" ".join(e["names"]) + " " + e["desc"]).lower()
+        if all(w in haystack for w in words):
+            if e["name"] in seen:
+                continue
+            seen.add(e["name"])
+            results.append(e)
+    return results
+
+
+async def searchcommand_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = " ".join(context.args or []).strip()
+    if not query.lstrip("/ "):
+        await update.message.reply_text(SEARCHCOMMAND_USAGE)
+        return
+
+    # Exactly the people /allcommands and /scrambleallcommands are shown to
+    # (owner, Bot Admins, this group's creator) may search the admin/owner sections.
+    uid = update.effective_user.id
+    include_restricted = bool(
+        await asyncio.to_thread(is_bot_admin_or_owner, uid) or await is_chat_creator(update, context)
+    )
+    results = await asyncio.to_thread(search_commands, query, include_restricted)
+
+    if not results:
+        await update.message.reply_html(
+            f"🔎 No commands match <b>{esc(query)}</b>. Try another word, or see /allcommands (or /fullhelp)."
+        )
+        return
+
+    shown = results[:SEARCHCOMMAND_MAX_RESULTS]
+    lines = [f"🔎 <b>{len(results)} result(s) for {esc(query)}</b>", ""]
+    for e in shown:
+        lines.append(f"/{e['name']} — {esc(e['desc'])}" if e["desc"] else f"/{e['name']}")
+    if len(results) > len(shown):
+        lines.append("")
+        lines.append(f"<i>+{len(results) - len(shown)} more - add another word to narrow it down.</i>")
+    await reply_html_in_parts(update.message, "\n".join(lines))
+
+
+# ------------------------------- /fullhelp -------------------------------
+
+FULLHELP_PAGES = (
+    ("g", "🎮 Word Game"),
+    ("s", "🔤 Word Scramble"),
+    ("t", "🏟️ Tournaments"),
+    ("p", "⭐ Premium & Coins"),
+    ("o", "📚 Other"),
+)
+
+
+def _invite_reward_amount_sync() -> int:
+    val = db.get_config("invite_reward_amount", str(DEFAULT_INVITE_REWARD_AMOUNT))
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return DEFAULT_INVITE_REWARD_AMOUNT
+
+
+def _fullhelp_game_page() -> str:
+    win, cheat = get_reward("win"), get_reward("cheat")
+    return (
+        f"🎮 <b>Word Game</b>\n\n"
+        f"A team game: one player explains a secret word without saying it, everyone else guesses.\n\n"
+        f"1️⃣ Someone runs /wordgame in a group (once a round is live, only group admins can restart it).\n"
+        f"2️⃣ Tap <b>I'll Explain</b> to become the leader.\n"
+        f"3️⃣ The leader taps <b>See Word</b> (a random word) or <b>Write Word</b> (send me your own word in DM).\n"
+        f"4️⃣ Give clues in the group. Saying the word yourself costs the leader {DOLLAR}1.\n"
+        f"5️⃣ Anyone can type the exact word to guess it. Close guesses get a 👀.\n\n"
+        f"💰 <b>Rewards</b>\n"
+        f"A correct guess pays both the guesser and the leader {DOLLAR}{win} each.\n"
+        f"Guessing before the leader has opened the word counts as cheating: {DOLLAR}{cheat}.\n\n"
+        f"🧰 <b>Helpful commands</b>\n"
+        f"/hint - the leader's clues so far (or just type <code>hint</code>)\n"
+        f"/stopvote - 3 votes stop a stuck round\n"
+        f"/stopgame - group admins can stop a round instantly\n"
+        f"/autolead (or /settings) - in my DM, choose whether winning a round makes you the next leader\n\n"
+        f"⏰ If the leader doesn't open the word in time, the round ends and I ask who wants to explain next.\n"
+        f"See /help for the short version."
+    )
+
+
+def _fullhelp_scramble_page() -> str:
+    reward = get_scramble_reward()
+    mins = SCRAMBLE_ROUND_SECONDS // 60
+    streak_lines = "\n".join(
+        f"{n} in a row: +{DOLLAR}{bonus}" for n, bonus in sorted(SCRAMBLE_STREAK_MILESTONES.items())
+    )
+    return (
+        f"🔤 <b>Word Scramble</b>\n\n"
+        f"1️⃣ Run /wordscramble (groups and my DM).\n"
+        f"2️⃣ I show a scrambled word - just type your guess as a normal message.\n"
+        f"3️⃣ The first correct answer within {mins} minute{'s' if mins != 1 else ''} wins {DOLLAR}{reward}.\n"
+        f"4️⃣ Close guess: 👀. Exactly right: 🎉.\n\n"
+        f"🔥 <b>Win streaks</b> - win back-to-back rounds in the same chat for a bonus:\n{streak_lines}\n"
+        f"Your streak resets when someone else wins a round.\n\n"
+        f"⚙️ <b>Group settings</b> (group admins)\n"
+        f"/scrambleautomaticmode on|off - a new round starts right after each one ends. It switches itself off "
+        f"after 3 rounds in a row nobody answers, and can't be turned on while Slow Mode is on.\n"
+        f"/slowmode on &lt;time&gt;|off - the next round starts exactly &lt;time&gt; after the last one ends "
+        f"(e.g. /slowmode on 2m). It turns Automatic Mode off.\n"
+        f"/scramblestopgame - stop the active round.\n\n"
+        f"📚 Words don't repeat until the whole pool has been used in that chat. Only one round runs per chat at a time.\n\n"
+        f"🏆 <b>Rankings</b>\n"
+        f"/scrambleleaderboard · /scrambletopplayers · /scrambletopgroups\n"
+        f"See /scramblehelp for the short version."
+    )
+
+
+def _fullhelp_tournament_page() -> str:
+    quick = f"{TOURNAMENT_QUICK_FEE} {TOURNAMENT_QUICK_DIFFICULTY} {TOURNAMENT_QUICK_ROUNDS}rounds"
+    return (
+        f"🏟️ <b>Tournaments</b>\n\n"
+        f"A Word Scramble contest inside a group. Everyone pays an entry fee from their Word Scramble balance "
+        f"and the best score takes the prize.\n\n"
+        f"🚀 <b>Starting</b>\n"
+        f"/settournament &lt;fee&gt; &lt;difficulty&gt; &lt;rounds&gt;rounds - e.g. /settournament 2000 Medium 3rounds\n"
+        f"/tournament - instant one: {quick}\n"
+        f"Fee {TOURNAMENT_MIN_FEE:,}-{TOURNAMENT_MAX_FEE:,}, rounds {TOURNAMENT_MIN_ROUNDS}-{TOURNAMENT_MAX_ROUNDS}. "
+        f"Difficulty: easy, easy3-easy6, medium, hard, off.\n"
+        f"The host pays the fee and joins automatically.\n\n"
+        f"🚪 <b>Lobby</b>\n"
+        f"Players send /join. The lobby stays open for {TOURNAMENT_LOBBY_SECONDS} seconds, then the tournament starts on its own. "
+        f"The host (or a bot admin) can send /starttournament to start early. With fewer than 2 players it is cancelled and refunded.\n\n"
+        f"🎯 <b>Playing</b>\n"
+        f"Each round has {TOURNAMENT_ROUND_SECONDS} seconds. The first correct answer scores 💎{TOURNAMENT_POINTS_PER_WIN}. "
+        f"Other Word Scramble rounds, Slow Mode and Automatic Mode wait in that group until the tournament ends.\n\n"
+        f"🏆 <b>Prize</b>\n"
+        f"Every entry fee plus one bonus entry fee from me: fee × (players + 1). The top score wins it all; a tie splits it; "
+        f"if nobody scores, everyone is refunded.\n\n"
+        f"🛠️ <b>If something goes wrong</b>\n"
+        f"/stoptournament - the host or a bot admin can cancel a lobby (or a paused tournament) and refund everyone.\n"
+        f"If I lose connection, the tournament pauses and entry fees stay safe. The host or a bot admin sends "
+        f"/resumetournament to continue from the same round. A tournament left paused for over "
+        f"{_format_duration_words(TOURNAMENT_PAUSED_MAX_SECONDS)} is refunded automatically."
+    )
+
+
+def _fullhelp_premium_page() -> str:
+    price, dur = get_premium_settings()
+    packs = get_dollar_packs()
+    pack_lines = "\n".join(_dollar_pack_label(c, st) for c, st in packs)
+    threshold = get_transfer_confirm_threshold()
+    return (
+        f"⭐ <b>Premium & Coins</b>\n\n"
+        f"⭐ <b>Premium</b>\n"
+        f"/buypremium - {price} ⭐ for {_format_duration_words(dur)} (paid with Telegram Stars; buying again while active extends it).\n"
+        f"/premiumstatus - see if it's active and how much time is left.\n"
+        f"It doubles the {DOLLAR} you earn from Word Game and Word Scramble wins (streak bonuses too). "
+        f"It does not double purchased coins, the daily reward or tournament prizes.\n\n"
+        f"{DOLLAR} <b>Buying coins</b> (Premium)\n"
+        f"/buydollar - pick a pack and I'll send the Stars invoice to your DM. Coins go to your Word Scramble balance.\n"
+        f"{pack_lines}\n\n"
+        f"🔁 <b>Sending coins</b> (Premium, Word Scramble balance)\n"
+        f"/transfer &lt;@username|id&gt; &lt;amount&gt; - or reply to their message with /transfer &lt;amount&gt;. "
+        f"Minimum {DOLLAR}{MIN_TRANSFER_AMOUNT}; amounts of {DOLLAR}{threshold} or more ask you to confirm first "
+        f"({TRANSFER_CONFIRM_SECONDS} seconds).\n"
+        f"/request &lt;@username|id&gt; &lt;amount&gt; - they get Yes/No buttons; nothing moves unless they press Yes. "
+        f"Requests expire after {REQUEST_EXPIRE_SECONDS // 60} minutes; you can have {REQUEST_MAX_PENDING} open at a time, "
+        f"one per person, with a {REQUEST_COOLDOWN_SECONDS}-second pause between requests.\n"
+        f"/deleterequestprompt off|on [&lt;1-9&gt;s|m] - group admins choose whether answered request prompts are deleted "
+        f"(default: on, after {REQUEST_PROMPT_DELETE_DEFAULT_SECONDS} seconds).\n"
+        f"The other person must already be a player (they've pressed /start)."
+    )
+
+
+def _fullhelp_other_page() -> str:
+    daily = db.get_config("reward_daily", db.DAILY_REWARD)
+    invite = _invite_reward_amount_sync()
+    return (
+        f"📚 <b>Everything else</b>\n\n"
+        f"{DOLLAR} <b>Invite & Earn</b> - /inviteandearn\n"
+        f"Add me to a group with {INVITE_REWARD_MIN_MEMBERS}+ members and keep me there for {INVITE_REWARD_HOURS} hours "
+        f"to earn {DOLLAR}{invite} in your Word Scramble balance (once per group, credited to whoever's link did the inviting). "
+        f"If I was added without your link, run /claim in that group after {INVITE_REWARD_HOURS} hours.\n\n"
+        f"🎁 <b>Daily reward</b> - /claimdailyreward\n"
+        f"Message me privately to claim {DOLLAR}{daily} once every 24 hours. It goes to your Word Game balance.\n\n"
+        f"🏆 <b>Leaderboards</b>\n"
+        f"/leaderboard, /chattop, /globaltop, /topplayers, /topgroups - Word Game and combined rankings\n"
+        f"/scrambleleaderboard, /scrambletopplayers, /scrambletopgroups - Word Scramble rankings\n\n"
+        f"👤 <b>Profile</b>\n"
+        f"/profile - your balance, level and rank. Reply to someone's message with /start to see their profile. "
+        f"Balance, level and rank combine your Word Game and Word Scramble earnings.\n"
+        f"/ranks - the full rank ladder and what each level needs.\n\n"
+        f"🔎 <b>Finding commands</b>\n"
+        f"/searchcommand &lt;text&gt; - search commands by name or description.\n"
+        f"/help and /scramblehelp - the short how-to-play guides.\n"
+        f"/fullhelp - this guide."
+    )
+
+
+_FULLHELP_BUILDERS = {
+    "g": _fullhelp_game_page,
+    "s": _fullhelp_scramble_page,
+    "t": _fullhelp_tournament_page,
+    "p": _fullhelp_premium_page,
+    "o": _fullhelp_other_page,
+}
+
+
+def build_fullhelp_page(page: str) -> str:
+    """Sync (reads live config) - call via asyncio.to_thread."""
+    return _FULLHELP_BUILDERS.get(page, _fullhelp_game_page)()
+
+
+def _fullhelp_keyboard(user_id, current):
+    def btn(key, label):
+        shown = f"• {label}" if key == current else label
+        return InlineKeyboardButton(shown, callback_data=f"fh:{user_id}:{key}")
+    labels = dict(FULLHELP_PAGES)
+    return InlineKeyboardMarkup([
+        [btn("g", labels["g"]), btn("s", labels["s"])],
+        [btn("t", labels["t"]), btn("p", labels["p"])],
+        [btn("o", labels["o"])],
+    ])
+
+
+async def fullhelp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    text = await asyncio.to_thread(build_fullhelp_page, "g")
+    await update.message.reply_html(
+        text,
+        reply_markup=_fullhelp_keyboard(user.id, "g"),
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+    )
+
+
+async def fullhelp_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    try:
+        _p, owner_id, page = query.data.split(":")
+        owner_id = int(owner_id)
+    except ValueError:
+        await query.answer()
+        return
+    if query.from_user.id != owner_id:
+        await query.answer("Run /fullhelp yourself to flip through the pages.", show_alert=True)
+        return
+    text = await asyncio.to_thread(build_fullhelp_page, page)
+    await query.answer()
+    try:
+        await query.edit_message_text(
+            text, parse_mode="HTML",
+            reply_markup=_fullhelp_keyboard(owner_id, page),
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+        )
+    except BadRequest:
+        pass  # same page tapped again - nothing to change
+
+
 async def premiumstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if is_owner(user.id):
@@ -9211,6 +9523,8 @@ def main():
     app.add_handler(CommandHandler("transfer", transfer_command))
     app.add_handler(CommandHandler("request", request_command))
     app.add_handler(CommandHandler("deleterequestprompt", deleterequestprompt_command))
+    app.add_handler(CommandHandler("searchcommand", searchcommand_command))
+    app.add_handler(CommandHandler("fullhelp", fullhelp_command))
     app.add_handler(CommandHandler("setpremium", setpremium_command))
     app.add_handler(CommandHandler("seepremiumplayers", seepremiumplayers_command))
     app.add_handler(CommandHandler("starbalance", starbalance_command))
@@ -9222,6 +9536,7 @@ def main():
     app.add_handler(CallbackQueryHandler(buydollar_button, pattern=r"^bd:\d+:\d+:\d+:\d+$"))
     app.add_handler(CallbackQueryHandler(transfer_button, pattern=r"^tf:[yn]:[0-9a-f]+$"))
     app.add_handler(CallbackQueryHandler(request_button, pattern=r"^rq:[yn]:\d+$"))
+    app.add_handler(CallbackQueryHandler(fullhelp_button, pattern=r"^fh:\d+:[gstpo]$"))
     app.add_handler(CallbackQueryHandler(premium_players_page_button, pattern=r"^spp:\d+$"))
     app.add_handler(CommandHandler("profile", profile_command))
     app.add_handler(CommandHandler("inviteandearn", inviteandearn_command))
