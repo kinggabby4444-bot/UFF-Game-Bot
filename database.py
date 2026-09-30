@@ -1373,10 +1373,12 @@ def register_group(chat_id, title, username=None, invite_link=None, added_by_id=
     try:
         cursor = conn.cursor()
         now = datetime.now().isoformat()
-        # current_stint_started_at is set to now() on EVERY call (both the
-        # initial insert and the ON CONFLICT re-add path), so it always
-        # reflects when the bot's CURRENT continuous membership began - unlike
-        # first_seen, which is only ever set once, on the very first insert.
+        # current_stint_started_at marks when the bot's CURRENT continuous
+        # membership began. It is set on the first insert, and again only when
+        # the bot is genuinely (re)added - i.e. the row was marked as left, or
+        # never had a start time. register_group() is also called for EVERY
+        # message the bot sees in a group; resetting the start time then is
+        # what kept the /claim and Invite & Earn countdown stuck at full length.
         cursor.execute("""
             INSERT INTO groups (chat_id, title, first_seen, last_active, username, invite_link, added_by_id, added_by_name, current_stint_started_at)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
@@ -1388,7 +1390,11 @@ def register_group(chat_id, title, username=None, invite_link=None, added_by_id=
                 invite_link=COALESCE(EXCLUDED.invite_link, groups.invite_link),
                 added_by_id=COALESCE(EXCLUDED.added_by_id, groups.added_by_id),
                 added_by_name=COALESCE(EXCLUDED.added_by_name, groups.added_by_name),
-                current_stint_started_at=EXCLUDED.current_stint_started_at
+                current_stint_started_at=CASE
+                    WHEN groups.left_at IS NOT NULL OR groups.current_stint_started_at IS NULL
+                    THEN EXCLUDED.current_stint_started_at
+                    ELSE groups.current_stint_started_at
+                END
         """, (chat_id, title, now, now, username, invite_link, added_by_id, added_by_name, now))
         conn.commit()
     finally:

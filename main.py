@@ -70,7 +70,7 @@ DEFAULT_REWARDS = {"win": 1, "cheat": -1}
 
 # --- Invite & Earn feature ---------------------------------------------
 INVITE_REWARD_MIN_MEMBERS = 200
-INVITE_REWARD_HOURS = 72
+INVITE_REWARD_HOURS = 24
 INVITE_REWARD_SECONDS = INVITE_REWARD_HOURS * 3600
 DEFAULT_INVITE_REWARD_AMOUNT = 1000
 
@@ -1795,12 +1795,14 @@ def _scrambleallcommands_text() -> str:
 /ranks - the full rank/level ladder and what balance unlocks each one (shared with Word Game)
 /scrambletopplayers - top 15, this chat or global
 /scrambletopgroups - the most active groups
-/inviteandearn - add me to a 200+ member group and keep me there 72 hours for a Word Scramble reward
+/inviteandearn - add me to a 200+ member group and keep me there 24 hours for a Word Scramble reward
 /claim - manual fallback to claim the Invite &amp; Earn reward for a qualifying group that was never automatically tracked
 /profile - view your own profile (balance, level, rank)
-/buypremium - premium doubles your 💵 Word Scramble and Word Game rewards (paid with Telegram Stars)
+/buypremium - premium doubles your 💵 Word Scramble and Word Game rewards (paid with Telegram Stars; used in a group it moves you to my DM, and the invoice has a ➡️ Premium features button)
 /premiumstatus - see whether premium is active and how much time is left
-/buydollar - premium only: buy 💵 Word Scramble coins with Telegram Stars (pack sizes and prices are shown live)
+/buycash - premium only: buy 💵 cash with Telegram Stars; it increases your balance, level and rank (pack sizes and prices are shown live; used in a group it moves you to my DM)
+/boostrank - premium only: same as /buycash - buy 💵 cash to boost your rank
+/boostlevel - premium only: same as /buycash - buy 💵 cash to boost your level
 /transfer &lt;@username|id&gt; &lt;amount&gt; - premium only: send 💵 from your Word Scramble balance to another player (or reply to their message with /transfer &lt;amount&gt;)
 /request &lt;@username|id&gt; &lt;amount&gt; - premium only: ask another player for 💵; they get Yes/No buttons (or reply to their message with /request &lt;amount&gt;)
 /settournament &lt;fee&gt; &lt;difficulty&gt; &lt;rounds&gt;rounds - host a Word Scramble tournament in a group (e.g. /settournament 2000 Medium 3rounds); everyone pays the entry fee from their Word Scramble balance and the winner takes the pot
@@ -1833,8 +1835,9 @@ def _scrambleallcommands_text() -> str:
 /tournamentban &lt;username|ID&gt; - owner/Bot Admins: ban a player (or reply to them) from tournaments only; also accepts a group username/ID to ban that group from running tournaments
 /tournamentunban &lt;username|ID&gt; - owner/Bot Admins: undo a tournament ban (player or group)
 /setpremium &lt;stars&gt; &lt;duration&gt; - owner only: set the premium price and length (no args shows current)
-/giftpremium &lt;username|ID&gt; - owner only: give someone 7 days of Premium (or reply to their message); works in DM too
-/setdollarpack &lt;1-5&gt; &lt;dollars&gt; &lt;stars&gt; - owner only: edit one /buydollar pack (no args lists the current packs)
+/giftpremium &lt;username|ID&gt; - Premium members only: gift Premium to another player (you pay the Stars, or reply to their message; used in a group it moves you to my DM). The owner gifts 7 days free
+/setdollarpack &lt;1-5&gt; &lt;dollars&gt; &lt;stars&gt; - owner only: edit one /buycash pack (no args lists the current packs)
+/editbuycashtext &lt;text&gt; - owner only, my DM: change the message above the /buycash, /boostrank and /boostlevel packs (send "reset" for the default; no args shows the current text)
 /seepremiumplayers - owner only: every current premium player with time remaining
 /starbalance - owner only: the bot's current Telegram Stars balance
 /withdraw - owner only: Stars balance + how to withdraw it via @BotFather
@@ -1846,7 +1849,7 @@ def _scrambleallcommands_text() -> str:
 /invitereward &lt;amount&gt; - owner only: set the Invite &amp; Earn reward amount (no args shows the current amount, default 💵1000)
 /scrambleallcommands - this list
 
-<i>Note: Word Scramble intentionally has no /scramblebanuser, /scramblebroadcast, /scrambleshare, or /scrambleadmins - banning, broadcasting, and bot-admin management are bot-wide systems shared with the Word Game, so /banuser, /broadcast, /share, and /addadmin already cover Word Scramble too. There's also no daily-reward feature specific to Word Scramble - the 🎁 Daily Reward always credits the Word Game balance, and every player's displayed Balance/Level/Rank on /start combines both games automatically. This list and /allcommands are visible to the bot owner, Bot Admins, and each group's own Telegram creator.</i>
+<i>Note: Word Scramble intentionally has no /scramblebanuser, /scramblebroadcast, /scrambleshare, or /scrambleadmins - banning, broadcasting, and bot-admin management are bot-wide systems shared with the Word Game, so /banuser, /broadcast, /share, and /addadmin already cover Word Scramble too. There's also no daily-reward feature specific to Word Scramble - the 🎁 Daily Reward always credits the Word Game balance, and every player's displayed Balance/Level/Rank on /start combines both games automatically. This list and /allcommands are visible to the bot owner, Bot Admins, and each group's own Telegram creator. The owner is alerted in DM whenever someone buys Premium, gifts Premium, buys 💵 cash or boosts their rank/level.</i>
 """
 
 
@@ -2787,7 +2790,7 @@ async def send_invite_claim_message(context, inviter_id, inviter_name, group_tit
 
 
 async def _run_invite_reward_payout(context: ContextTypes.DEFAULT_TYPE, row_id):
-    """The actual payout check - shared by both the 72-hour job and the
+    """The actual payout check - shared by both the timed job and the
     startup catch-up pass. Re-verifies BOTH that the bot is still in the
     group AND that the member count is still ≥200 right now (never trusts
     the count captured at add-time)."""
@@ -2912,7 +2915,7 @@ async def build_invite_earn_text() -> str:
     return (
         f"{DOLLAR} <b>Invite & Earn</b>\n\n"
         f"Add me to a group with 200+ members and keep me there for a full "
-        f"72 hours, and you'll earn {DOLLAR}{amount} straight into your Word "
+        f"{INVITE_REWARD_HOURS} hours, and you'll earn {DOLLAR}{amount} straight into your Word "
         f"Scramble balance - once per group, credited to whoever's link "
         f"actually did the inviting.\n\n"
         f"Use the buttons below to grab your personal invite link, check "
@@ -2932,9 +2935,9 @@ def invite_how_to_text(amount) -> str:
         "them the group picker, it doesn't matter whose finger does the "
         "tapping.\n\n"
         f"3️⃣ OR, send the bot's username to a group admin to add me to his/her group. "
-        f"After 72 hours, use /claim in that group to claim your {DOLLAR}{amount} reward.\n\n"
+        f"After {INVITE_REWARD_HOURS} hours, use /claim in that group to claim your {DOLLAR}{amount} reward.\n\n"
         f"Either way, keep the group above 200 members and don't let me get "
-        f"removed - after 72 straight hours, {DOLLAR}{amount} lands in your "
+        f"removed - after {INVITE_REWARD_HOURS} straight hours, {DOLLAR}{amount} lands in your "
         f"Word Scramble balance automatically, no need to ask."
     )
 
@@ -2958,6 +2961,29 @@ def settings_keyboard(user_id):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(label, callback_data="toggle_auto_lead")]
     ])
+
+
+async def _start_gift_from_deeplink(update: Update, context: ContextTypes.DEFAULT_TYPE, target_id):
+    user = update.effective_user
+    if not is_owner(user.id) and not await asyncio.to_thread(is_premium, user.id):
+        await update.message.reply_text(
+            "⭐ Only Premium members can gift Premium to others - use /buypremium to get Premium first."
+        )
+        return
+    if is_owner(user.id):
+        await update.message.reply_text("👑 As the owner, use /giftpremium <username|ID> to gift Premium for free.")
+        return
+    if target_id == user.id:
+        await update.message.reply_text("ℹ️ That's you! Use /buypremium to extend your own Premium.")
+        return
+    if is_owner(target_id):
+        await update.message.reply_text("👑 The bot owner always has Premium - nothing to gift!")
+        return
+    row = await asyncio.to_thread(db.get_user_by_id, target_id)
+    target_name = (row[1] if row else None) or str(target_id)
+    err = await send_gift_invoice(context, user.id, target_id, target_name)
+    if err:
+        await update.message.reply_text(err)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2993,6 +3019,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     name=f"invite_attrib_retry_{chat.id}_{referred_id}",
                 )
             return
+
+        # Group -> DM hand-offs (t.me/<bot>?start=<flow>): continue the command here.
+        if chat.type == ChatType.PRIVATE:
+            dm_flows = {
+                "buypremium": buypremium_command,
+                "buycash": buycash_command,
+                "boostrank": boostrank_command,
+                "boostlevel": boostlevel_command,
+            }
+            if first_arg in dm_flows:
+                await dm_flows[first_arg](update, context)
+                return
+            gift_match = re.fullmatch(r"gift_(\d+)", first_arg)
+            if gift_match:
+                await _start_gift_from_deeplink(update, context, int(gift_match.group(1)))
+                return
 
         if first_arg.startswith("adclick_"):
             try:
@@ -6594,9 +6636,11 @@ def _allcommands_text() -> str:
 /topgroups - the 10 most active groups
 /ranks - the full rank/level ladder and what balance unlocks each one
 /claimdailyreward - claim today's daily reward
-/buypremium - premium doubles your 💵 rewards in Word Game and Word Scramble (paid with Telegram Stars)
+/buypremium - premium doubles your 💵 rewards in Word Game and Word Scramble (paid with Telegram Stars; used in a group it moves you to my DM, and the invoice has a ➡️ Premium features button)
 /premiumstatus - see whether premium is active and how much time is left
-/buydollar - premium only: buy 💵 Word Scramble coins with Telegram Stars (pack sizes and prices are shown live)
+/buycash - premium only: buy 💵 cash with Telegram Stars; it increases your balance, level and rank (pack sizes and prices are shown live; used in a group it moves you to my DM)
+/boostrank - premium only: same as /buycash - buy 💵 cash to boost your rank
+/boostlevel - premium only: same as /buycash - buy 💵 cash to boost your level
 /transfer &lt;@username|id&gt; &lt;amount&gt; - premium only: send 💵 from your Word Scramble balance to another player (or reply to their message with /transfer &lt;amount&gt;)
 /request &lt;@username|id&gt; &lt;amount&gt; - premium only: ask another player for 💵; they get Yes/No buttons (or reply to their message with /request &lt;amount&gt;)
 /settournament &lt;fee&gt; &lt;difficulty&gt; &lt;rounds&gt;rounds - host a Word Scramble tournament in a group (e.g. /settournament 2000 Medium 3rounds); everyone pays the entry fee from their Word Scramble balance and the winner takes the pot
@@ -6638,8 +6682,9 @@ def _allcommands_text() -> str:
 /resumetournament - tournament host, bot owner or Bot Admins: continue a paused or stuck tournament from where it stopped (owner in DM: /resumetournament &lt;group id|@username&gt; or /resumetournament allgroups)
 /extendlobby &lt;2-9&gt;m - owner only: add minutes to the open tournament lobby in this group (e.g. /extendlobby 5m)
 /setpremium &lt;stars&gt; &lt;duration&gt; - owner only: set the premium price and length (e.g. /setpremium 99 7d; no args shows current)
-/giftpremium &lt;username|ID&gt; - owner only: give someone 7 days of Premium (or reply to their message); works in DM too
-/setdollarpack &lt;1-5&gt; &lt;dollars&gt; &lt;stars&gt; - owner only: edit one /buydollar pack (no args lists the current packs)
+/giftpremium &lt;username|ID&gt; - Premium members only: gift Premium to another player (you pay the Stars, or reply to their message; used in a group it moves you to my DM). The owner gifts 7 days free
+/setdollarpack &lt;1-5&gt; &lt;dollars&gt; &lt;stars&gt; - owner only: edit one /buycash pack (no args lists the current packs)
+/editbuycashtext &lt;text&gt; - owner only, my DM: change the message above the /buycash, /boostrank and /boostlevel packs (send "reset" for the default; no args shows the current text)
 /seepremiumplayers - owner only: every current premium player with time remaining
 /starbalance - owner only: the bot's current Telegram Stars balance
 /withdraw - owner only: Stars balance + how to withdraw it via @BotFather
@@ -6674,7 +6719,7 @@ def _allcommands_text() -> str:
 /changesponsoredad &lt;text, link, @username, or 'label | link'&gt; - owner only: replace the Sponsored Ad content (or 'clear' to reset)
 /showgamemedal on|off - owner/Bot Admins only: toggle the 🥇🥈🥉 medal prefix on Word Game names (global, no args shows current status)
 
-<i>Note: banuser/unbanuser/bangroup/unbangroup/broadcast/maintenance/addadmanager/changeadmanager/removeadmanager/admanager/adminmode/prompt/editprompt/groupadminmode can also be used by Bot Admins. /ad on|off, /botgroups, /addwords, /removewords, /shufflewords, and /gamedifficulty are owner-only. /autodelete's bare on/off form works for group admins too; its explicit-group and allgroups forms are owner-only. This list and /scrambleallcommands are visible to the bot owner, Bot Admins, and each group's own Telegram creator. Word Scramble has its own command list - see /scrambleallcommands (includes /scramblestopallgroups). The 🎁 Daily Reward always credits the Word Game balance, and every player's Balance/Level/Rank on /start combines their Word Game + Word Scramble balances automatically.</i>
+<i>Note: banuser/unbanuser/bangroup/unbangroup/broadcast/maintenance/addadmanager/changeadmanager/removeadmanager/admanager/adminmode/prompt/editprompt/groupadminmode can also be used by Bot Admins. /ad on|off, /botgroups, /addwords, /removewords, /shufflewords, and /gamedifficulty are owner-only. /autodelete's bare on/off form works for group admins too; its explicit-group and allgroups forms are owner-only. This list and /scrambleallcommands are visible to the bot owner, Bot Admins, and each group's own Telegram creator. The owner is alerted in DM whenever someone buys Premium, gifts Premium, buys 💵 cash or boosts their rank/level. Word Scramble has its own command list - see /scrambleallcommands (includes /scramblestopallgroups). The 🎁 Daily Reward always credits the Word Game balance, and every player's Balance/Level/Rank on /start combines their Word Game + Word Scramble balances automatically.</i>
 """
 
 
@@ -8153,6 +8198,52 @@ def _parse_premium_payload(payload):
         return None
 
 
+def premium_features_text(price, dur) -> str:
+    """Everything Premium gives, as the bot's code actually implements it."""
+    return (
+        f"⭐ <b>Premium features</b>\n\n"
+        f"💵 <b>Doubled rewards</b> - every {DOLLAR} you earn from Word Game wins (as the guesser AND as the "
+        f"leader) and Word Scramble wins is doubled, and Word Scramble win-streak bonuses are doubled too.\n\n"
+        f"🚀 <b>Buy cash</b> - /buycash, /boostrank and /boostlevel let you buy {DOLLAR} with Telegram Stars "
+        f"to increase your balance, level and rank.\n\n"
+        f"🔁 <b>Send cash</b> - /transfer sends {DOLLAR} from your Word Scramble balance to another player.\n\n"
+        f"🙏 <b>Ask for cash</b> - /request asks another player for {DOLLAR} (they get Yes/No buttons).\n\n"
+        f"🎁 <b>Gift Premium</b> - /giftpremium lets you give Premium to another player "
+        f"(you pay the Stars for their gift).\n\n"
+        f"⏰ <b>Renewal reminder</b> - I DM you before your Premium runs out, with a one-tap renew button.\n\n"
+        f"📊 <b>Status</b> - /premiumstatus shows whether it's active and how much time is left.\n\n"
+        f"➕ <b>Stacks</b> - buying again while active extends your time.\n\n"
+        f"ℹ️ Not doubled: purchased cash, the daily reward and tournament prizes.\n\n"
+        f"Price: {price} ⭐ for {_format_duration_words(dur)}."
+    )
+
+
+def _bot_deeplink(context, param) -> str:
+    uname = _bot_username(context)
+    return f"https://t.me/{uname}?start={param}" if uname else ""
+
+
+async def _redirect_to_dm(update: Update, context: ContextTypes.DEFAULT_TYPE, param, text, button_label):
+    """Group -> DM hand-off. The button is a t.me deep link: one tap opens the
+    bot's DM and Telegram's Start button continues the command there (the
+    /start handler picks `param` up and runs the real flow)."""
+    url = _bot_deeplink(context, param)
+    if not url:
+        await update.message.reply_text(f"{text}\n\nOpen my DM and send the command there.")
+        return
+    await update.message.reply_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(button_label, url=url)]]),
+    )
+
+
+def _premium_invoice_keyboard(price):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"Pay ⭐{price}", pay=True)],  # first button MUST be the Pay button
+        [InlineKeyboardButton("➡️ Premium features", callback_data="pf:show")],
+    ])
+
+
 async def send_premium_invoice(context: ContextTypes.DEFAULT_TYPE, user_id):
     """Sends the Stars invoice to the user's DM. Returns None on success or a
     short error string to show the user."""
@@ -8160,24 +8251,76 @@ async def send_premium_invoice(context: ContextTypes.DEFAULT_TYPE, user_id):
     title = f"Premium - {_format_duration_words(dur)}"[:32]
     description = (
         f"Doubles your {DOLLAR} rewards in Word Game and Word Scramble for "
-        f"{_format_duration_words(dur)}. Buying again while active extends it."
+        f"{_format_duration_words(dur)}. Buying again while active extends it. "
+        f"Tap ➡️ Premium features below to see all premium features."
+    )
+    kwargs = dict(
+        chat_id=user_id,
+        title=title,
+        description=description[:255],
+        payload=f"{PREMIUM_PAYLOAD_PREFIX}:{user_id}:{dur}:{price}",
+        provider_token="",  # must be empty for Telegram Stars
+        currency="XTR",
+        prices=[LabeledPrice(label=title, amount=int(price))],  # raw star count, no x100
     )
     try:
-        await context.bot.send_invoice(
-            chat_id=user_id,
-            title=title,
-            description=description[:255],
-            payload=f"{PREMIUM_PAYLOAD_PREFIX}:{user_id}:{dur}:{price}",
-            provider_token="",  # must be empty for Telegram Stars
-            currency="XTR",
-            prices=[LabeledPrice(label=title, amount=int(price))],  # raw star count, no x100
-        )
+        try:
+            await context.bot.send_invoice(reply_markup=_premium_invoice_keyboard(price), **kwargs)
+        except BadRequest as e:
+            # If Telegram ever rejects the extra button, still deliver a payable invoice.
+            logger.warning(f"premium invoice with features button rejected ({e}); sending plain invoice")
+            await context.bot.send_invoice(**kwargs)
     except Forbidden:
         return "⚠️ Please start a private chat with me first (open my DM and press Start), then try /buypremium again."
     except Exception as e:
         logger.error(f"Failed to send premium invoice to {user_id}: {e}")
         return "⚠️ Couldn't create the invoice right now. Please try again in a moment."
     return None
+
+
+async def premium_features_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """'➡️ Premium features' under the invoice, and its Back button."""
+    query = update.callback_query
+    user = query.from_user
+    data = query.data or ""
+    chat_id = query.message.chat_id if query.message else user.id
+
+    if data == "pf:show":
+        await query.answer()
+        price, dur = await asyncio.to_thread(get_premium_settings)
+        invoice_msg_id = query.message.message_id if query.message else 0
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=premium_features_text(price, dur),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Back", callback_data=f"pf:back:{invoice_msg_id}")
+            ]]),
+        )
+        return
+
+    # Back: drop the features list and the old invoice, then put a fresh
+    # invoice in front of the user so they land right where they pay.
+    await query.answer()
+    try:
+        old_invoice_id = int(data.split(":")[2])
+    except (IndexError, ValueError):
+        old_invoice_id = 0
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+    if old_invoice_id:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=old_invoice_id)
+        except Exception:
+            pass
+    err = await send_premium_invoice(context, user.id)
+    if err:
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=err)
+        except Exception:
+            pass
 
 
 async def buypremium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8188,12 +8331,18 @@ async def buypremium_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
 
+    if update.effective_chat.type != ChatType.PRIVATE:
+        await _redirect_to_dm(
+            update, context, "buypremium",
+            "⭐ Premium is bought in my DM. Tap the button below and press Start to continue there.",
+            "⭐ Continue in DM",
+        )
+        return
+
     err = await send_premium_invoice(context, user.id)
     if err:
         await update.message.reply_text(err)
         return
-    if update.effective_chat.type != ChatType.PRIVATE:
-        await update.message.reply_text("📩 I've sent the Premium invoice to your DM.")
 
 
 async def buypremium_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8225,6 +8374,8 @@ async def premium_precheckout_callback(update: Update, context: ContextTypes.DEF
             await _premium_precheckout(query)
         elif prefix == DOLLAR_PAYLOAD_PREFIX:
             await _dollar_precheckout(query)
+        elif prefix == GIFT_PAYLOAD_PREFIX:
+            await _gift_precheckout(query)
         else:
             await query.answer(ok=False, error_message="This payment isn't recognised. Please try again from the command you used.")
     except Exception as e:
@@ -8265,6 +8416,8 @@ async def premium_successful_payment_callback(update: Update, context: ContextTy
         await _premium_successful_payment(update, context)
     elif prefix == DOLLAR_PAYLOAD_PREFIX:
         await _dollar_successful_payment(update, context)
+    elif prefix == GIFT_PAYLOAD_PREFIX:
+        await _gift_successful_payment(update, context)
     else:
         logger.warning(f"successful_payment with unrecognised payload {payload!r}")
 
@@ -8311,10 +8464,33 @@ async def _premium_successful_payment(update: Update, context: ContextTypes.DEFA
         f"🎉 Premium activated! Your Word Game and Word Scramble {DOLLAR} rewards are now doubled.\n"
         f"⏳ Time remaining: {_format_remaining(remaining)}"
     )
+    await notify_owner_purchase(
+        context, "⭐ Premium purchased", message.from_user, payment.total_amount,
+        [f"Duration: {_format_duration_words(secs)}", f"Premium now has {_format_remaining(remaining)} left"],
+    )
+
+
+async def notify_owner_purchase(context, headline, payer, stars, extra_lines=None):
+    """DM the owner about a completed Stars payment. Never raises - an alert
+    problem must not affect the buyer's purchase."""
+    try:
+        uname = f"@{payer.username}" if getattr(payer, "username", None) else "no username"
+        lines = [
+            f"🔔 <b>{headline}</b>",
+            "",
+            f'👤 <a href="tg://user?id={payer.id}">{esc_name(payer.first_name)}</a> ({esc(uname)})',
+            f"🆔 <code>{payer.id}</code>",
+            f"⭐ Stars paid: {stars}",
+        ]
+        for line in (extra_lines or []):
+            lines.append(esc(line))
+        await context.bot.send_message(chat_id=OWNER_ID, text="\n".join(lines), parse_mode="HTML")
+    except Exception as e:
+        logger.warning(f"owner purchase alert failed: {e}")
 
 
 # =======================================================================
-# /buydollar - buy 💵 Word Scramble coins with Telegram Stars (premium only)
+# /buycash (+ /boostrank, /boostlevel) - buy 💵 cash with Telegram Stars (premium only)
 # =======================================================================
 
 DOLLAR_PAYLOAD_PREFIX = "dollar"
@@ -8343,9 +8519,14 @@ def _dollar_pack_label(coins, stars) -> str:
 
 
 def _parse_dollar_payload(payload):
-    """'dollar:<user_id>:<pack_index>:<coins>:<stars>' -> (uid, idx, coins, stars) or None."""
+    """'dollar:<user_id>:<pack_index>:<coins>:<stars>[:<source>]' -> (uid, idx, coins, stars) or None.
+    The optional trailing source letter (c/r/l) only records which command
+    the buyer used; older invoices without it are still valid."""
     try:
-        prefix, uid, idx, coins, stars = str(payload).split(":")
+        parts = str(payload).split(":")
+        if len(parts) not in (5, 6):
+            return None
+        prefix, uid, idx, coins, stars = parts[:5]
         if prefix != DOLLAR_PAYLOAD_PREFIX:
             return None
         uid, idx, coins, stars = int(uid), int(idx), int(coins), int(stars)
@@ -8356,26 +8537,111 @@ def _parse_dollar_payload(payload):
         return None
 
 
-def _buydollar_keyboard(user_id, packs):
+def _dollar_payload_source(payload) -> str:
+    parts = str(payload).split(":")
+    if len(parts) == 6 and parts[5] in CASH_SOURCES:
+        return parts[5]
+    return "c"
+
+
+# c = /buycash, r = /boostrank, l = /boostlevel (all three run the same flow)
+CASH_SOURCES = {
+    "c": ("buycash", "💵 Cash purchased"),
+    "r": ("boostrank", "🚀 Rank boosted"),
+    "l": ("boostlevel", "🚀 Level boosted"),
+}
+
+BUYCASH_TEXT_CONFIG_KEY = "buycash_text"
+DEFAULT_BUYCASH_TEXT = (
+    "💵 Buying cash increases 🚀 your balance, level and rank ⚡️, "
+    "and all purchased cash is added directly to your balance.\n\n"
+    "Choose a pack below 👇"
+)
+BUYCASH_TEXT_MAX_LEN = 1000
+
+
+def get_buycash_text() -> str:
+    """The text above the packs. The default stays in force until the owner
+    sets their own with /editbuycashtext. Sync (DB call)."""
+    val = db.get_config(BUYCASH_TEXT_CONFIG_KEY)
+    if val and val.strip():
+        return val
+    return DEFAULT_BUYCASH_TEXT
+
+
+def _buycash_button_label(coins, stars) -> str:
+    return f"Get {DOLLAR}{coins} for {stars} ⭐️"
+
+
+def _buydollar_keyboard(user_id, packs, src="c"):
     # callback_data carries the buyer's id AND the pack they saw (idx, coins,
     # stars): only they can press it, and a pack edited by the owner after the
     # menu was shown can't silently charge a different price.
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(_dollar_pack_label(c, st), callback_data=f"bd:{user_id}:{i}:{c}:{st}")]
+        [InlineKeyboardButton(_buycash_button_label(c, st), callback_data=f"bd:{user_id}:{i}:{c}:{st}:{src}")]
         for i, (c, st) in enumerate(packs)
     ])
 
 
-@premium_only
-async def buydollar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _cash_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, src):
+    cmd_name = CASH_SOURCES[src][0]
+    if update.effective_chat.type != ChatType.PRIVATE:
+        await _redirect_to_dm(
+            update, context, cmd_name,
+            f"{DOLLAR} Cash is bought in my DM. Tap the button below and press Start to continue there.",
+            f"{DOLLAR} Continue in DM",
+        )
+        return
     user = update.effective_user
     packs = await asyncio.to_thread(get_dollar_packs)
+    text = await asyncio.to_thread(get_buycash_text)
+    await update.message.reply_text(text, reply_markup=_buydollar_keyboard(user.id, packs, src))
+
+
+@premium_only
+async def buycash_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _cash_menu(update, context, "c")
+
+
+@premium_only
+async def boostrank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _cash_menu(update, context, "r")
+
+
+@premium_only
+async def boostlevel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _cash_menu(update, context, "l")
+
+
+@owner_only
+async def editbuycashtext_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != ChatType.PRIVATE:
+        await update.message.reply_text("🔒 Use /editbuycashtext in my DM.")
+        return
+
+    raw = update.message.text or ""
+    parts = raw.split(None, 1)  # keeps the new text's own line breaks
+    if len(parts) < 2 or not parts[1].strip():
+        current = await asyncio.to_thread(get_buycash_text)
+        await update.message.reply_text(
+            f"Current /buycash text:\n\n{current}\n\n"
+            f"Usage: /editbuycashtext <text>\n"
+            f"Send /editbuycashtext reset to go back to the default text."
+        )
+        return
+
+    new_text = parts[1].strip()
+    if new_text.lower() == "reset":
+        await asyncio.to_thread(db.set_config, BUYCASH_TEXT_CONFIG_KEY, "")
+        await update.message.reply_text(f"✅ Default text restored:\n\n{DEFAULT_BUYCASH_TEXT}")
+        return
+    if len(new_text) > BUYCASH_TEXT_MAX_LEN:
+        await update.message.reply_text(f"❌ That's too long - keep it under {BUYCASH_TEXT_MAX_LEN} characters.")
+        return
+
+    await asyncio.to_thread(db.set_config, BUYCASH_TEXT_CONFIG_KEY, new_text)
     await update.message.reply_text(
-        f"{DOLLAR} <b>Buy Word Scramble coins</b>\n\n"
-        f"Pick a pack - I'll send the Telegram Stars invoice to your DM. "
-        f"Coins go straight to your Word Scramble balance.",
-        parse_mode="HTML",
-        reply_markup=_buydollar_keyboard(user.id, packs),
+        f"✅ Updated. /buycash, /boostrank and /boostlevel now show:\n\n{new_text}"
     )
 
 
@@ -8383,14 +8649,18 @@ async def buydollar_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user = query.from_user
     try:
-        _prefix, owner_id, idx, coins, stars = query.data.split(":")
+        parts = query.data.split(":")
+        if len(parts) not in (5, 6):
+            raise ValueError("bad callback")
+        _prefix, owner_id, idx, coins, stars = parts[:5]
         owner_id, idx, coins, stars = int(owner_id), int(idx), int(coins), int(stars)
+        src = parts[5] if len(parts) == 6 and parts[5] in CASH_SOURCES else "c"
     except (ValueError, TypeError):
-        await query.answer("This menu is out of date. Run /buydollar again.", show_alert=True)
+        await query.answer("This menu is out of date. Run /buycash again.", show_alert=True)
         return
 
     if user.id != owner_id:
-        await query.answer("This menu isn't yours - run /buydollar for your own.", show_alert=True)
+        await query.answer("This menu isn't yours - run /buycash for your own.", show_alert=True)
         return
 
     # Re-check premium at the moment of tapping.
@@ -8400,15 +8670,15 @@ async def buydollar_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     packs = await asyncio.to_thread(get_dollar_packs)
     if not (0 <= idx < len(packs)) or packs[idx] != (coins, stars):
-        await query.answer("The packs have changed - please run /buydollar again.", show_alert=True)
+        await query.answer("The packs have changed - please run /buycash again.", show_alert=True)
         return
 
     try:
         await context.bot.send_invoice(
             chat_id=user.id,
-            title=f"{DOLLAR}{coins} Word Scramble coins"[:32],
-            description=f"{coins} {DOLLAR} added to your Word Scramble balance. Premium does not double purchased coins.",
-            payload=f"{DOLLAR_PAYLOAD_PREFIX}:{user.id}:{idx}:{coins}:{stars}",
+            title=f"{DOLLAR}{coins} cash"[:32],
+            description=f"{coins} {DOLLAR} added to your balance. Premium does not double purchased cash.",
+            payload=f"{DOLLAR_PAYLOAD_PREFIX}:{user.id}:{idx}:{coins}:{stars}:{src}",
             provider_token="",  # must be empty for Telegram Stars
             currency="XTR",
             prices=[LabeledPrice(label=f"{DOLLAR}{coins}"[:32], amount=int(stars))],  # raw star count, no x100
@@ -8432,14 +8702,14 @@ async def _dollar_precheckout(query):
     invoice that was already issued must always be payable."""
     parsed = _parse_dollar_payload(query.invoice_payload)
     if parsed is None or query.currency != "XTR":
-        await query.answer(ok=False, error_message="This payment isn't recognised. Please run /buydollar again.")
+        await query.answer(ok=False, error_message="This payment isn't recognised. Please run /buycash again.")
         return
     uid, _idx, _coins, stars = parsed
     if query.from_user.id != uid:
         await query.answer(ok=False, error_message="This invoice belongs to a different account.")
         return
     if query.total_amount != stars:
-        await query.answer(ok=False, error_message="This invoice is out of date. Please run /buydollar again.")
+        await query.answer(ok=False, error_message="This invoice is out of date. Please run /buycash again.")
         return
     await query.answer(ok=True)
 
@@ -8468,7 +8738,7 @@ async def _dollar_successful_payment(update: Update, context: ContextTypes.DEFAU
             await context.bot.send_message(
                 chat_id=OWNER_ID,
                 text=(
-                    f"🚨 A /buydollar Stars payment went through but failed to credit.\n"
+                    f"🚨 A /buycash Stars payment went through but failed to credit.\n"
                     f"User: {payer.id}\nCoins owed: {coins}\nStars: {payment.total_amount}\n"
                     f"Charge ID: {charge_id}\nError: {e}"
                 ),
@@ -8489,6 +8759,16 @@ async def _dollar_successful_payment(update: Update, context: ContextTypes.DEFAU
         f"New balance: {DOLLAR}{new_balance}"
     )
 
+    src = _dollar_payload_source(payment.invoice_payload)
+    extra = [f"Bought: {DOLLAR}{coins} via /{CASH_SOURCES[src][0]}", f"Word Scramble balance now: {new_balance}"]
+    try:
+        combined = await asyncio.to_thread(db.get_combined_balance, payer.id)
+        level, rank_name = db.compute_level_rank(combined)
+        extra.append(f"Now Level {level} - {rank_name}")
+    except Exception:
+        pass
+    await notify_owner_purchase(context, CASH_SOURCES[src][1], payer, payment.total_amount, extra)
+
 
 @owner_only
 async def setdollarpack_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8500,7 +8780,7 @@ async def setdollarpack_command(update: Update, context: ContextTypes.DEFAULT_TY
 
     usage = "Usage: /setdollarpack <1-5> <dollars> <stars>  (e.g. /setdollarpack 2 1500 130)"
     if not args:
-        await update.message.reply_text(f"{DOLLAR} Current /buydollar packs:\n\n{_listing()}\n\n{usage}")
+        await update.message.reply_text(f"{DOLLAR} Current /buycash packs:\n\n{_listing()}\n\n{usage}")
         return
     if len(args) != 3:
         await update.message.reply_text(usage)
@@ -9227,8 +9507,8 @@ def _fullhelp_scramble_page() -> str:
         f"🔥 <b>Win streaks</b> - win back-to-back rounds in the same chat for a bonus:\n{streak_lines}\n"
         f"Your streak resets when someone else wins a round.\n\n"
         f"⚙️ <b>Group settings</b> (group admins)\n"
-        f"/scrambleautomaticmode on|off - a new round starts right after each one ends. It switches itself off "
-        f"after 3 rounds in a row nobody answers, and can't be turned on while Slow Mode is on.\n"
+        f"/scrambleautomaticmode on|off - a new round starts right after each one ends and keeps going non-stop. "
+        f"It only switches itself off after 3 rounds in a row nobody answers, and can't be turned on while Slow Mode is on.\n"
         f"/slowmode on &lt;time&gt;|off - the next round starts exactly &lt;time&gt; after the last one ends "
         f"(e.g. /slowmode on 2m). It turns Automatic Mode off.\n"
         f"/scramblestopgame - stop the active round.\n\n"
@@ -9271,17 +9551,24 @@ def _fullhelp_tournament_page() -> str:
 def _fullhelp_premium_page() -> str:
     price, dur = get_premium_settings()
     packs = get_dollar_packs()
-    pack_lines = "\n".join(_dollar_pack_label(c, st) for c, st in packs)
+    pack_lines = "\n".join(_buycash_button_label(c, st) for c, st in packs)
     threshold = get_transfer_confirm_threshold()
     return (
         f"⭐ <b>Premium & Coins</b>\n\n"
         f"⭐ <b>Premium</b>\n"
-        f"/buypremium - {price} ⭐ for {_format_duration_words(dur)} (paid with Telegram Stars; buying again while active extends it).\n"
+        f"/buypremium - {price} ⭐ for {_format_duration_words(dur)} (paid with Telegram Stars; buying again while active extends it). "
+        f"Used in a group, it moves you to my DM to pay. Tap <b>➡️ Premium features</b> on the invoice to see everything Premium gives.\n"
         f"/premiumstatus - see if it's active and how much time is left.\n"
         f"It doubles the {DOLLAR} you earn from Word Game and Word Scramble wins (streak bonuses too). "
-        f"It does not double purchased coins, the daily reward or tournament prizes.\n\n"
-        f"{DOLLAR} <b>Buying coins</b> (Premium)\n"
-        f"/buydollar - pick a pack and I'll send the Stars invoice to your DM. Coins go to your Word Scramble balance.\n"
+        f"It does not double purchased cash, the daily reward or tournament prizes.\n\n"
+        f"🎁 <b>Gifting Premium</b> (Premium members)\n"
+        f"/giftpremium &lt;username|ID&gt; - gift Premium to another player (or reply to their message). "
+        f"You pay the Stars; they get the Premium, added on top of any time they already have.\n\n"
+        f"{DOLLAR} <b>Buying cash</b> (Premium)\n"
+        f"/buycash - buying cash increases your balance, level and rank, and the cash goes straight to your balance. "
+        f"Pick a pack and I'll send the Stars invoice to your DM.\n"
+        f"/boostrank and /boostlevel - do exactly the same as /buycash.\n"
+        f"Used in a group, all three move you to my DM.\n"
         f"{pack_lines}\n\n"
         f"🔁 <b>Sending coins</b> (Premium, Word Scramble balance)\n"
         f"/transfer &lt;@username|id&gt; &lt;amount&gt; - or reply to their message with /transfer &lt;amount&gt;. "
@@ -9549,13 +9836,145 @@ async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 GIFT_PREMIUM_SECONDS = 7 * 86400
+GIFT_PAYLOAD_PREFIX = "gift"
 
 
-@owner_only
+def _parse_gift_payload(payload):
+    """'gift:<payer_id>:<target_id>:<duration_seconds>:<stars>' -> tuple or None."""
+    try:
+        prefix, payer, target, secs, stars = str(payload).split(":")
+        if prefix != GIFT_PAYLOAD_PREFIX:
+            return None
+        return int(payer), int(target), int(secs), int(stars)
+    except (ValueError, TypeError):
+        return None
+
+
+async def send_gift_invoice(context: ContextTypes.DEFAULT_TYPE, payer_id, target_id, target_name):
+    """Stars invoice (sent to the gifter's DM) for gifting Premium to target_id.
+    Returns None on success or a short error string."""
+    price, dur = await asyncio.to_thread(get_premium_settings)
+    title = f"Gift Premium - {_format_duration_words(dur)}"[:32]
+    description = (
+        f"Gift {target_name} {_format_duration_words(dur)} of Premium: doubles their {DOLLAR} rewards in "
+        f"Word Game and Word Scramble. You pay the Stars; they get the Premium."
+    )
+    try:
+        await context.bot.send_invoice(
+            chat_id=payer_id,
+            title=title,
+            description=description[:255],
+            payload=f"{GIFT_PAYLOAD_PREFIX}:{payer_id}:{target_id}:{dur}:{price}",
+            provider_token="",  # must be empty for Telegram Stars
+            currency="XTR",
+            prices=[LabeledPrice(label=title, amount=int(price))],  # raw star count, no x100
+        )
+    except Forbidden:
+        return "⚠️ Please start a private chat with me first (open my DM and press Start), then try /giftpremium again."
+    except Exception as e:
+        logger.error(f"Failed to send gift invoice to {payer_id}: {e}")
+        return "⚠️ Couldn't create the invoice right now. Please try again in a moment."
+    return None
+
+
+async def _gift_precheckout(query):
+    parsed = _parse_gift_payload(query.invoice_payload)
+    if parsed is None or query.currency != "XTR":
+        await query.answer(ok=False, error_message="This payment isn't recognised. Please run /giftpremium again.")
+        return
+    payer_id, _target, _secs, stars = parsed
+    if query.from_user.id != payer_id:
+        await query.answer(ok=False, error_message="This invoice belongs to a different account.")
+        return
+    if query.total_amount != stars:
+        await query.answer(ok=False, error_message="This invoice is out of date. Please run /giftpremium again.")
+        return
+    await query.answer(ok=True)
+
+
+async def _gift_successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    payment = message.successful_payment
+    parsed = _parse_gift_payload(payment.invoice_payload)
+    if parsed is None:
+        logger.warning(f"successful_payment with unrecognised gift payload {payment.invoice_payload!r}")
+        return
+
+    payer = message.from_user
+    _payer_id, target_id, secs, _stars = parsed
+    charge_id = payment.telegram_payment_charge_id
+
+    try:
+        new_expiry = await asyncio.to_thread(
+            db.premium_grant_from_payment, charge_id, target_id, payment.total_amount, secs
+        )
+    except Exception as e:
+        logger.error(f"Failed to record gift payment {charge_id}: {e}", exc_info=True)
+        try:
+            await context.bot.send_message(
+                chat_id=OWNER_ID,
+                text=(
+                    f"🚨 A Premium GIFT Stars payment went through but failed to record.\n"
+                    f"Payer: {payer.id}\nRecipient: {target_id}\nStars: {payment.total_amount}\n"
+                    f"Charge ID: {charge_id}\nError: {e}"
+                ),
+            )
+        except Exception:
+            pass
+        await message.reply_text(
+            "⚠️ Your payment went through, but I hit an error delivering the gift. "
+            "The owner has been notified and will sort it out."
+        )
+        return
+
+    if new_expiry is None:
+        return  # duplicate delivery of an already-applied charge
+
+    remaining = _format_remaining((new_expiry - datetime.now()).total_seconds())
+    target_row = await asyncio.to_thread(db.get_user_by_id, target_id)
+    target_name = (target_row[1] if target_row else None) or str(target_id)
+
+    await message.reply_html(
+        f"🎁 Gift sent! <a href=\"tg://user?id={target_id}\">{esc_name(target_name)}</a> "
+        f"(<code>{target_id}</code>) now has Premium.\n"
+        f"⏳ Their Premium has {remaining} remaining."
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=target_id,
+            text=(
+                f"🎁 {payer.first_name or 'Someone'} gifted you {_format_duration_words(secs)} of Premium! "
+                f"Your {DOLLAR} rewards in Word Game and Word Scramble are now doubled.\n"
+                f"⏳ Time remaining: {remaining}"
+            ),
+        )
+    except Exception:
+        pass  # they may not have started the bot yet - the gift is still applied
+
+    await notify_owner_purchase(
+        context, "🎁 Premium gifted", payer, payment.total_amount,
+        [f"Gifted to: {target_name} ({target_id})", f"Duration: {_format_duration_words(secs)}"],
+    )
+
+
 async def giftpremium_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    owner_gifting = is_owner(user.id)
+
+    # Only Premium members (and the owner) can gift.
+    if not owner_gifting and not await asyncio.to_thread(is_premium, user.id):
+        await update.message.reply_text(
+            "⭐ Only Premium members can gift Premium to others - use /buypremium to get Premium first."
+        )
+        return
+
     usage = (
         "Usage: /giftpremium <username|ID>  (or reply to the person's message)\n"
-        "Gives them 7 days of Premium (added on top of any time they already have)."
+        + (
+            "Gives them 7 days of Premium, free (owner)."
+            if owner_gifting
+            else "You pay the Stars; they get the Premium (added on top of any time they already have)."
+        )
     )
     reply_msg = update.message.reply_to_message
 
@@ -9590,25 +10009,45 @@ async def giftpremium_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("👑 The bot owner always has Premium - nothing to gift!")
         return
 
-    new_expiry = await asyncio.to_thread(db.premium_grant_gift, target_id, GIFT_PREMIUM_SECONDS)
-    remaining = _format_remaining((new_expiry - datetime.now()).total_seconds())
+    if owner_gifting:
+        # Unchanged owner behaviour: free 7-day gift.
+        new_expiry = await asyncio.to_thread(db.premium_grant_gift, target_id, GIFT_PREMIUM_SECONDS)
+        remaining = _format_remaining((new_expiry - datetime.now()).total_seconds())
 
-    await update.message.reply_html(
-        f"🎁 Gifted 7 days of Premium to "
-        f'<a href="tg://user?id={target_id}">{esc_name(target_name)}</a> (<code>{target_id}</code>).\n'
-        f"⏳ Their Premium now has {remaining} remaining."
-    )
-
-    try:
-        await context.bot.send_message(
-            chat_id=target_id,
-            text=(
-                f"🎁 You've been gifted 7 days of Premium! Your {DOLLAR} rewards in Word Game and "
-                f"Word Scramble are now doubled.\n⏳ Time remaining: {remaining}"
-            ),
+        await update.message.reply_html(
+            f"🎁 Gifted 7 days of Premium to "
+            f'<a href="tg://user?id={target_id}">{esc_name(target_name)}</a> (<code>{target_id}</code>).\n'
+            f"⏳ Their Premium now has {remaining} remaining."
         )
-    except Exception:
-        pass  # they may not have started the bot yet - the gift is still applied
+
+        try:
+            await context.bot.send_message(
+                chat_id=target_id,
+                text=(
+                    f"🎁 You've been gifted 7 days of Premium! Your {DOLLAR} rewards in Word Game and "
+                    f"Word Scramble are now doubled.\n⏳ Time remaining: {remaining}"
+                ),
+            )
+        except Exception:
+            pass  # they may not have started the bot yet - the gift is still applied
+        return
+
+    # Paying premium member.
+    if target_id == user.id:
+        await update.message.reply_text("ℹ️ That's you! Use /buypremium to extend your own Premium.")
+        return
+
+    if update.effective_chat.type != ChatType.PRIVATE:
+        await _redirect_to_dm(
+            update, context, f"gift_{target_id}",
+            f"🎁 Gifts are paid for in my DM. Tap the button below and press Start to gift Premium to {target_name}.",
+            "🎁 Continue in DM",
+        )
+        return
+
+    err = await send_gift_invoice(context, user.id, target_id, target_name)
+    if err:
+        await update.message.reply_text(err)
 
 
 async def premium_renewal_reminder_job(context: ContextTypes.DEFAULT_TYPE):
@@ -9829,7 +10268,10 @@ def main():
     app.add_handler(CommandHandler("giftpremium", giftpremium_command))
     app.add_handler(CommandHandler("buypremium", buypremium_command))
     app.add_handler(CommandHandler("premiumstatus", premiumstatus_command))
-    app.add_handler(CommandHandler("buydollar", buydollar_command))
+    app.add_handler(CommandHandler("buycash", buycash_command))
+    app.add_handler(CommandHandler("boostrank", boostrank_command))
+    app.add_handler(CommandHandler("boostlevel", boostlevel_command))
+    app.add_handler(CommandHandler("editbuycashtext", editbuycashtext_command))
     app.add_handler(CommandHandler("setdollarpack", setdollarpack_command))
     app.add_handler(CommandHandler("transfer", transfer_command))
     app.add_handler(CommandHandler("request", request_command))
@@ -9844,7 +10286,8 @@ def main():
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, premium_successful_payment_callback))
     # Specific callback patterns must be registered BEFORE the catch-all button handler.
     app.add_handler(CallbackQueryHandler(buypremium_button, pattern=r"^buypremium$"))
-    app.add_handler(CallbackQueryHandler(buydollar_button, pattern=r"^bd:\d+:\d+:\d+:\d+$"))
+    app.add_handler(CallbackQueryHandler(premium_features_button, pattern=r"^pf:(show|back:\d+)$"))
+    app.add_handler(CallbackQueryHandler(buydollar_button, pattern=r"^bd:\d+:\d+:\d+:\d+(:[crl])?$"))
     app.add_handler(CallbackQueryHandler(transfer_button, pattern=r"^tf:[yn]:[0-9a-f]+$"))
     app.add_handler(CallbackQueryHandler(request_button, pattern=r"^rq:[yn]:\d+$"))
     app.add_handler(CallbackQueryHandler(fullhelp_button, pattern=r"^fh:\d+:[gstpo]$"))
