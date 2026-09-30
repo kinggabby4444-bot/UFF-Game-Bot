@@ -5,6 +5,7 @@ see the "shared tables" section at the bottom of create_tables()).
 
 import os
 import re
+import time
 from datetime import datetime, timedelta
 
 import psycopg2
@@ -80,21 +81,62 @@ class PooledConnection:
             self._closed = True
 
 
+POOL_WAIT_SECONDS = float(os.environ.get("GAME_DB_POOL_WAIT", "20"))
+
+
 def connect():
-    raw = _pool.getconn()
-    try:
-        # Set per-session instead of via options="-c statement_timeout=..."
-        # at connection time - Neon's pooled endpoint rejects that as an
-        # unsupported startup parameter. This SET is a cheap, harmless
-        # no-op round trip if it's ever redundant, and it's what actually
-        # caps a runaway query at 15s instead of letting it hang.
-        raw.cursor().execute("SET statement_timeout = 15000")
-    except Exception:
-        # If even this fails, don't block the caller on it - the
-        # keepalive settings on the pool still bound how long a truly
-        # dead connection can hang.
-        pass
-    return PooledConnection(raw, _pool)
+    """Check a connection out of the pool.
+
+    Two failure modes used to surface here as exceptions that silently
+    killed background chains (Automatic Mode, tournaments):
+      * the pool was momentarily exhausted - ThreadedConnectionPool raises
+        immediately instead of waiting, so we now wait for a free slot;
+      * the pooled connection had gone stale (server/pooler closed it while
+        idle) - it is now detected on checkout, thrown away, and replaced.
+    """
+    deadline = time.monotonic() + POOL_WAIT_SECONDS
+    stale_replaced = 0
+    while True:
+        try:
+            raw = _pool.getconn()
+        except psycopg2.pool.PoolError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
+            continue
+        except psycopg2.Error:
+            # Could not open a brand-new connection right now.
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.5)
+            continue
+
+        try:
+            if raw.closed:
+                raise psycopg2.InterfaceError("pooled connection is closed")
+            # Set per-session instead of via options="-c statement_timeout=..."
+            # at connection time - Neon's pooled endpoint rejects that as an
+            # unsupported startup parameter. This also doubles as a cheap
+            # liveness check for the connection we were just handed.
+            raw.cursor().execute("SET statement_timeout = 15000")
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            # Dead/stale connection: discard it and take another.
+            try:
+                _pool.putconn(raw, close=True)
+            except Exception:
+                pass
+            stale_replaced += 1
+            if stale_replaced > 5 or time.monotonic() >= deadline:
+                raise
+            continue
+        except Exception:
+            # Anything else: don't block the caller on it (as before), but
+            # clear any aborted-transaction state first.
+            try:
+                raw.rollback()
+            except Exception:
+                pass
+        return PooledConnection(raw, _pool)
 
 
 def create_tables():
@@ -3800,6 +3842,17 @@ def scramble_get_auto_mode(chat_id):
         if not row:
             return (0, False, 0)
         return (row[0], bool(row[1]), row[2])
+    finally:
+        conn.close()
+
+
+def scramble_get_auto_enabled_chats():
+    """Chat ids that currently have Automatic Mode switched on."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT chat_id FROM scramble_auto_mode WHERE auto_enabled=1")
+        return [r[0] for r in cursor.fetchall()]
     finally:
         conn.close()
 

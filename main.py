@@ -5,6 +5,7 @@ import random
 import re
 import asyncio
 import functools
+import time
 import json
 import logging
 import importlib
@@ -22,7 +23,7 @@ except ImportError:
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReactionTypeEmoji, LinkPreviewOptions, LabeledPrice
 from telegram.constants import ChatType
-from telegram.error import Forbidden, BadRequest, TimedOut, NetworkError
+from telegram.error import Forbidden, BadRequest, TimedOut, NetworkError, RetryAfter
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -244,14 +245,37 @@ async def level_badge_html(user_id) -> str:
     return f" · <b>{emoji} Lvl {level}</b>"
 
 
+SAFE_SEND_MAX_FLOOD_WAITS = 6
+SAFE_SEND_MAX_FLOOD_SLEEP = 90
+
+
 async def safe_send(bot, chat_id, retries=2, delay=2, **kwargs):
-    for attempt in range(retries + 1):
+    attempt = 0
+    flood_waits = 0
+    while True:
         try:
             return await bot.send_message(chat_id=chat_id, **kwargs)
+        except RetryAfter as e:
+            # Telegram flood control (roughly 20 messages/minute per group).
+            # Automatic Mode sends 2 messages per round, so fast rounds hit
+            # this limit after ~10 rounds. It used to escape as an uncaught
+            # exception and silently kill the whole round chain; now we wait
+            # exactly as long as Telegram asks and send again.
+            flood_waits += 1
+            if flood_waits > SAFE_SEND_MAX_FLOOD_WAITS:
+                logger.error(f"send_message to {chat_id}: still rate-limited after {flood_waits - 1} waits, giving up")
+                return None
+            wait = getattr(e, "retry_after", 5)
+            if hasattr(wait, "total_seconds"):
+                wait = wait.total_seconds()
+            wait = min(float(wait), SAFE_SEND_MAX_FLOOD_SLEEP) + 1
+            logger.warning(f"send_message to {chat_id}: flood control, waiting {wait:.0f}s")
+            await asyncio.sleep(wait)
         except (TimedOut, NetworkError) as e:
-            if attempt == retries:
+            if attempt >= retries:
                 logger.error(f"send_message to {chat_id} failed after retries: {e}")
                 return None
+            attempt += 1
             await asyncio.sleep(delay)
 
 
@@ -910,14 +934,71 @@ async def _resend_wordgame_prompt(context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# chat_id -> time.monotonic() of the last time a round started/ended there.
+# Used only by the watchdog so it never races a round change that is still
+# in flight.
+_scramble_last_activity = {}
+_scramble_start_locks = {}
+_PROCESS_BOOT_MONOTONIC = time.monotonic()
+
+
+def _scramble_touch(chat_id):
+    _scramble_last_activity[chat_id] = time.monotonic()
+
+
+def _scramble_start_lock(chat_id):
+    lock = _scramble_start_locks.get(chat_id)
+    if lock is None:
+        lock = _scramble_start_locks[chat_id] = asyncio.Lock()
+    return lock
+
+
 async def scramble_timeout_callback(context: ContextTypes.DEFAULT_TYPE):
     job = context.job
     chat_id = job.chat_id
 
-    word = await asyncio.to_thread(db.scramble_claim_round, chat_id)
+    try:
+        word = await asyncio.to_thread(db.scramble_claim_round, chat_id)
+    except Exception:
+        # Couldn't even reach the database: the round is still live, so try
+        # the timeout again shortly instead of leaving it with no timer.
+        logger.exception(f"scramble timeout: claim failed for {chat_id}; retrying in 5s")
+        if context.job_queue is not None:
+            context.job_queue.run_once(
+                scramble_timeout_callback, 5, chat_id=chat_id,
+                name=_scramble_timeout_job_name(chat_id),
+            )
+        return
     if not word:
         return
 
+    _scramble_touch(chat_id)
+    try:
+        await _scramble_timeout_after_claim(context, chat_id, word)
+    except Exception:
+        logger.exception(f"scramble timeout: post-claim step failed for {chat_id}; recovering")
+        await _scramble_recover_chain(context, chat_id, won=False)
+
+
+async def _scramble_recover_chain(context, chat_id, won=False, chat_obj=None):
+    """The round was already closed but something failed before the next
+    round was queued. Make sure the chat is never left stuck."""
+    try:
+        slow = await asyncio.to_thread(db.get_scramble_slowmode, chat_id)
+        if slow and slow[1]:
+            if context.job_queue is not None and not context.job_queue.get_jobs_by_name(_slowmode_next_job_name(chat_id)):
+                await schedule_slowmode_next_round(context.job_queue, chat_id, slow[0])
+            return
+        await _scramble_auto_continue(context, chat_id, won=won, chat_obj=chat_obj)
+    except Exception:
+        logger.exception(f"scramble recover chain failed for {chat_id}")
+        try:
+            schedule_scramble_send_retry(context.job_queue, chat_id, "auto")
+        except Exception:
+            pass
+
+
+async def _scramble_timeout_after_claim(context, chat_id, word):
     slow = await asyncio.to_thread(db.get_scramble_slowmode, chat_id)
     slow_enabled = bool(slow and slow[1])
 
@@ -949,7 +1030,7 @@ async def scramble_timeout_callback(context: ContextTypes.DEFAULT_TYPE):
 
 
 SCRAMBLE_SEND_RETRY_SECONDS = 8
-SCRAMBLE_SEND_RETRY_MAX_ATTEMPTS = 30
+SCRAMBLE_SEND_RETRY_MAX_ATTEMPTS = 60
 
 
 def _scramble_send_retry_job_name(chat_id):
@@ -1001,8 +1082,17 @@ async def scramble_send_retry_callback(context: ContextTypes.DEFAULT_TYPE):
 
     try:
         result = await start_scramble_round(context, chat)
+    except (Forbidden,) as e:
+        logger.error(f"scramble send retry: bot can't post in {chat_id} ({e}); turning Automatic Mode off there")
+        if kind == "auto":
+            try:
+                await asyncio.to_thread(db.scramble_set_auto_enabled, chat_id, False)
+            except Exception:
+                pass
+        return
     except Exception as e:
         logger.error(f"scramble send retry failed for chat {chat_id}: {e}")
+        _again()
         return
 
     if result == "send_failed":
@@ -1015,6 +1105,21 @@ async def scramble_send_retry_callback(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _scramble_auto_continue(context: ContextTypes.DEFAULT_TYPE, chat_id, won: bool, chat_obj=None):
+    """Never raises. Any failure while queuing the next round (stale DB
+    connection, Telegram hiccup, flood control...) used to end the chain for
+    good, leaving Automatic Mode 'on' but idle until someone typed
+    /wordscramble. Now a failure just schedules a short retry."""
+    try:
+        await _scramble_auto_continue_inner(context, chat_id, won, chat_obj)
+    except Exception:
+        logger.exception(f"Automatic Mode: continue step failed for {chat_id}; scheduling retry")
+        try:
+            schedule_scramble_send_retry(context.job_queue, chat_id, "auto")
+        except Exception:
+            logger.exception("could not schedule Automatic Mode retry")
+
+
+async def _scramble_auto_continue_inner(context: ContextTypes.DEFAULT_TYPE, chat_id, won: bool, chat_obj=None):
     _, auto_enabled, _ = await asyncio.to_thread(db.scramble_get_auto_mode, chat_id)
     if not auto_enabled:
         return
@@ -1038,6 +1143,8 @@ async def _scramble_auto_continue(context: ContextTypes.DEFAULT_TYPE, chat_id, w
         try:
             chat = await context.bot.get_chat(chat_id)
         except Exception:
+            # Transient lookup failure: retry instead of silently stopping.
+            schedule_scramble_send_retry(context.job_queue, chat_id, "auto")
             return
 
     result = await start_scramble_round(context, chat)
@@ -1050,6 +1157,16 @@ async def _scramble_auto_continue(context: ContextTypes.DEFAULT_TYPE, chat_id, w
 
 
 async def start_scramble_round(context: ContextTypes.DEFAULT_TYPE, chat):
+    # One start at a time per chat, so the normal chain, the retry job and
+    # the watchdog can never double-post a round.
+    async with _scramble_start_lock(chat.id):
+        result = await _start_scramble_round_locked(context, chat)
+    if result is True:
+        _scramble_touch(chat.id)
+    return result
+
+
+async def _start_scramble_round_locked(context: ContextTypes.DEFAULT_TYPE, chat):
     maintenance = await asyncio.to_thread(db.get_config, "scramble_maintenance_mode", "0")
     if maintenance == "1":
         return "maintenance"
@@ -1065,6 +1182,7 @@ async def start_scramble_round(context: ContextTypes.DEFAULT_TYPE, chat):
         return None
 
     scrambled = scramble_letters(word)
+    reward_now = await asyncio.to_thread(get_scramble_reward)
     await asyncio.to_thread(db.scramble_start_round, chat.id, word, scrambled)
 
     if chat.type != ChatType.PRIVATE:
@@ -1078,7 +1196,7 @@ async def start_scramble_round(context: ContextTypes.DEFAULT_TYPE, chat):
                 f"🎮 <b>WORD SCRAMBLE</b> 🎮\n\n"
                 f"Unscramble this word:\n\n"
                 f"<b>{esc(scrambled)}</b>\n\n"
-                f"First to type the correct word in the next 2 minutes wins {DOLLAR}{get_scramble_reward()}"
+                f"First to type the correct word in the next 2 minutes wins {DOLLAR}{reward_now}"
             ),
             parse_mode="HTML",
         )
@@ -1132,7 +1250,7 @@ async def wordscramble_command(update: Update, context: ContextTypes.DEFAULT_TYP
     user = update.effective_user
     await asyncio.to_thread(db.scramble_increment_played, user.id, chat.id, user.first_name)
 
-    if _slowmode_enabled(chat.id) and not await asyncio.to_thread(db.scramble_get_round, chat.id):
+    if await asyncio.to_thread(_slowmode_enabled, chat.id) and not await asyncio.to_thread(db.scramble_get_round, chat.id):
         interval = (await asyncio.to_thread(db.get_scramble_slowmode, chat.id))[0]
         await update.message.reply_text(
             f"🐢 Slow mode is on - a new round starts automatically every {_format_duration_words(interval)}. Please wait."
@@ -1169,10 +1287,19 @@ async def _scramble_handle_win(context: ContextTypes.DEFAULT_TYPE, chat, user, m
         return
 
     cancel_scramble_timeout(context, chat.id)
+    _scramble_touch(chat.id)
 
+    try:
+        await _scramble_handle_win_after_claim(context, chat, user, message, word)
+    except Exception:
+        logger.exception(f"scramble win: post-claim step failed in {chat.id}; recovering")
+        await _scramble_recover_chain(context, chat.id, won=True, chat_obj=chat)
+
+
+async def _scramble_handle_win_after_claim(context: ContextTypes.DEFAULT_TYPE, chat, user, message, word):
     await safe_react(context.bot, chat.id, message.message_id, "🎉")
 
-    reward = get_scramble_reward()
+    reward = await asyncio.to_thread(get_scramble_reward)
     winner_is_premium = await asyncio.to_thread(is_premium, user.id)
     if winner_is_premium:
         reward *= 2
@@ -7228,6 +7355,18 @@ async def _tournament_start_round(context, tid, attempt=1):
     )
 
 
+def _tournament_rearm_advance(context, tid, chat_id, seconds, attempt=1):
+    """Queue (or re-queue) the job that moves a tournament forward. Safe to
+    call any number of times - the advance callback re-checks the real state."""
+    try:
+        _schedule_tournament_job(
+            context.job_queue, tournament_advance_callback, _tournament_advance_job_name(tid),
+            seconds, chat_id, {"tid": tid, "attempt": attempt},
+        )
+    except Exception:
+        logger.exception(f"tournament {tid}: could not re-arm advance job")
+
+
 async def tournament_advance_callback(context: ContextTypes.DEFAULT_TYPE):
     """Moves an active tournament forward when no round is live: starts the
     next round, or finishes it. Used for send retries and restart catch-up."""
@@ -7235,13 +7374,19 @@ async def tournament_advance_callback(context: ContextTypes.DEFAULT_TYPE):
     tid, attempt = data.get("tid"), data.get("attempt", 1)
     if tid is None:
         return
-    t = await asyncio.to_thread(db.tournament_get, tid)
-    if not t or t["status"] != "active" or t["current_word"]:
-        return
-    if t["current_round"] >= t["total_rounds"]:
-        await _tournament_finish(context, tid)
-    else:
-        await _tournament_start_round(context, tid, attempt)
+    try:
+        t = await asyncio.to_thread(db.tournament_get, tid)
+        if not t or t["status"] != "active" or t["current_word"]:
+            return
+        if t["current_round"] >= t["total_rounds"]:
+            await _tournament_finish(context, tid)
+        else:
+            await _tournament_start_round(context, tid, attempt)
+    except Exception:
+        # A DB/Telegram hiccup used to leave the tournament stuck between
+        # rounds forever. Try again shortly (the watchdog is the backstop).
+        logger.exception(f"tournament {tid}: advance step failed; retrying")
+        _tournament_rearm_advance(context, tid, getattr(context.job, "chat_id", None), 8, attempt + 1)
 
 
 async def _tournament_after_round(context, tid, round_no, total_rounds):
@@ -7263,16 +7408,23 @@ async def tournament_round_timeout_callback(context: ContextTypes.DEFAULT_TYPE):
     if not claim:
         return  # a correct guess (or a stop) already closed this round
 
-    players = await asyncio.to_thread(db.tournament_get_players, tid)
-    await safe_send(
-        context.bot, t["chat_id"],
-        text=(
-            f"⏰ Time's up! Nobody got it - the word was <b>{esc(claim['word'])}</b>.\n\n"
-            + tournament_standings_text([(p[1], p[2]) for p in players])
-        ),
-        parse_mode="HTML",
-    )
-    await _tournament_after_round(context, tid, claim["round_no"], claim["total_rounds"])
+    try:
+        players = await asyncio.to_thread(db.tournament_get_players, tid)
+        await safe_send(
+            context.bot, t["chat_id"],
+            text=(
+                f"⏰ Time's up! Nobody got it - the word was <b>{esc(claim['word'])}</b>.\n\n"
+                + tournament_standings_text([(p[1], p[2]) for p in players])
+            ),
+            parse_mode="HTML",
+        )
+    except Exception:
+        logger.exception(f"tournament {tid}: time-up announcement failed; continuing anyway")
+    try:
+        await _tournament_after_round(context, tid, claim["round_no"], claim["total_rounds"])
+    except Exception:
+        logger.exception(f"tournament {tid}: moving to the next round failed; re-arming")
+        _tournament_rearm_advance(context, tid, t["chat_id"], 3)
 
 
 async def tournament_handle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -7316,18 +7468,177 @@ async def tournament_handle_guess(update: Update, context: ContextTypes.DEFAULT_
     _cancel_tournament_jobs(context.job_queue, t["id"], lobby=False, advance=False)
     await safe_react(context.bot, chat.id, message.message_id, "🎉")
 
-    players = await asyncio.to_thread(db.tournament_get_players, t["id"])
-    await safe_send(
-        context.bot, chat.id,
-        text=(
-            f"🎉 <b>{esc_name(user.first_name)}</b> got it - <b>{esc(claim['word'])}</b>! "
-            f"+💎{TOURNAMENT_POINTS_PER_WIN}\n\n"
-            + tournament_standings_text([(p[1], p[2]) for p in players])
-        ),
-        parse_mode="HTML",
-    )
-    await _tournament_after_round(context, t["id"], claim["round_no"], claim["total_rounds"])
+    try:
+        players = await asyncio.to_thread(db.tournament_get_players, t["id"])
+        await safe_send(
+            context.bot, chat.id,
+            text=(
+                f"🎉 <b>{esc_name(user.first_name)}</b> got it - <b>{esc(claim['word'])}</b>! "
+                f"+💎{TOURNAMENT_POINTS_PER_WIN}\n\n"
+                + tournament_standings_text([(p[1], p[2]) for p in players])
+            ),
+            parse_mode="HTML",
+        )
+    except Exception:
+        logger.exception(f"tournament {t['id']}: winner announcement failed; continuing anyway")
+    try:
+        await _tournament_after_round(context, t["id"], claim["round_no"], claim["total_rounds"])
+    except Exception:
+        logger.exception(f"tournament {t['id']}: moving to the next round failed; re-arming")
+        _tournament_rearm_advance(context, t["id"], chat.id, 3)
     return True
+
+
+# =======================================================================
+# WATCHDOG - the safety net behind Automatic Mode and Tournaments.
+# Every chain above already retries on failure; this job guarantees that even
+# if a timer was dropped, a deploy/restart happened mid-gap, or something
+# unforeseen went wrong, a stalled chat gets moving again within ~30 seconds.
+# =======================================================================
+
+SCRAMBLE_WATCHDOG_INTERVAL = 20
+SCRAMBLE_WATCHDOG_JOB_NAME = "scramble_watchdog"
+SCRAMBLE_WATCHDOG_IDLE_SECONDS = 30
+TOURNAMENT_WATCHDOG_IDLE_SECONDS = 25
+
+
+async def tournament_watchdog_round_timeout_callback(context: ContextTypes.DEFAULT_TYPE):
+    """Re-armed round timer. Only fires the real timeout if the SAME round is
+    still live, so it can never cut a newer round short."""
+    data = context.job.data or {}
+    t = await asyncio.to_thread(db.tournament_get, data.get("tid"))
+    if not t or t["status"] != "active" or not t["current_word"]:
+        return
+    if t["current_round"] != data.get("round_no"):
+        return
+    await tournament_round_timeout_callback(context)
+
+
+async def _scramble_watchdog_scan(context: ContextTypes.DEFAULT_TYPE):
+    jq = context.job_queue
+    if jq is None:
+        return
+    now_mono = time.monotonic()
+    now_dt = datetime.now()
+
+    # 1) Word Scramble rounds whose timeout timer went missing.
+    rounds = await asyncio.to_thread(db.get_all_active_scramble_rounds_with_time)
+    active_chats = set()
+    for chat_id, started_at in rounds:
+        active_chats.add(chat_id)
+        try:
+            age = (now_dt - datetime.fromisoformat(started_at)).total_seconds()
+        except (TypeError, ValueError):
+            age = SCRAMBLE_ROUND_SECONDS + 60
+        if age > SCRAMBLE_ROUND_SECONDS + 15 and not jq.get_jobs_by_name(_scramble_timeout_job_name(chat_id)):
+            logger.warning(f"watchdog: round in {chat_id} is {age:.0f}s old with no timer; expiring it")
+            jq.run_once(
+                scramble_timeout_callback, 1, chat_id=chat_id,
+                name=_scramble_timeout_job_name(chat_id),
+            )
+
+    # 2) Automatic Mode chats that have no live round and nothing queued.
+    auto_chats = await asyncio.to_thread(db.scramble_get_auto_enabled_chats)
+    for chat_id in auto_chats:
+        if chat_id in active_chats:
+            continue
+        idle = now_mono - _scramble_last_activity.get(chat_id, _PROCESS_BOOT_MONOTONIC)
+        if idle < SCRAMBLE_WATCHDOG_IDLE_SECONDS:
+            continue
+        if _scramble_start_lock(chat_id).locked():
+            continue
+        if jq.get_jobs_by_name(_scramble_send_retry_job_name(chat_id)) or jq.get_jobs_by_name(_slowmode_next_job_name(chat_id)):
+            continue
+        slow = await asyncio.to_thread(db.get_scramble_slowmode, chat_id)
+        if slow and slow[1]:
+            continue
+        if await asyncio.to_thread(db.tournament_get_open_for_chat, chat_id):
+            continue  # a tournament owns this chat right now; auto resumes after it
+
+        try:
+            chat = await context.bot.get_chat(chat_id)
+        except Forbidden:
+            logger.warning(f"watchdog: bot can't access {chat_id}; turning Automatic Mode off there")
+            await asyncio.to_thread(db.scramble_set_auto_enabled, chat_id, False)
+            continue
+        except BadRequest as e:
+            if "not found" in str(e).lower():
+                logger.warning(f"watchdog: chat {chat_id} not found; turning Automatic Mode off there")
+                await asyncio.to_thread(db.scramble_set_auto_enabled, chat_id, False)
+            continue
+        except Exception:
+            continue
+
+        logger.warning(f"watchdog: Automatic Mode in {chat_id} was idle {idle:.0f}s with no round; restarting it")
+        try:
+            result = await start_scramble_round(context, chat)
+        except Forbidden:
+            await asyncio.to_thread(db.scramble_set_auto_enabled, chat_id, False)
+            continue
+        except Exception:
+            logger.exception(f"watchdog: could not restart round in {chat_id}")
+            _scramble_touch(chat_id)
+            continue
+        if result == "send_failed":
+            schedule_scramble_send_retry(jq, chat_id, "auto")
+        elif result in (False, None, "maintenance"):
+            _scramble_touch(chat_id)
+        await asyncio.sleep(0.3)
+
+    # 3) Tournaments stuck mid-flight.
+    for t in await asyncio.to_thread(db.tournament_get_all_open):
+        if t["status"] != "active":
+            continue
+        tid, chat_id = t["id"], t["chat_id"]
+        round_job = jq.get_jobs_by_name(_tournament_round_job_name(tid))
+        advance_job = jq.get_jobs_by_name(_tournament_advance_job_name(tid))
+
+        if t["current_word"]:
+            if round_job:
+                continue
+            try:
+                age = (now_dt - datetime.fromisoformat(t["round_started_at"])).total_seconds()
+            except (TypeError, ValueError):
+                age = TOURNAMENT_ROUND_SECONDS + 1
+            if age < 10:
+                continue
+            logger.warning(f"watchdog: tournament {tid} round has no timer; re-arming")
+            _schedule_tournament_job(
+                jq, tournament_watchdog_round_timeout_callback, _tournament_round_job_name(tid),
+                max(TOURNAMENT_ROUND_SECONDS - age, 1), chat_id,
+                {"tid": tid, "round_no": t["current_round"]},
+            )
+        else:
+            if round_job or advance_job:
+                continue
+            try:
+                idle = (now_dt - datetime.fromisoformat(t["idle_since"])).total_seconds()
+            except (TypeError, ValueError):
+                continue
+            if idle < TOURNAMENT_WATCHDOG_IDLE_SECONDS:
+                continue
+            logger.warning(f"watchdog: tournament {tid} idle {idle:.0f}s between rounds; advancing it")
+            _tournament_rearm_advance(context, tid, chat_id, 1)
+
+
+async def scramble_watchdog_callback(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        await _scramble_watchdog_scan(context)
+    except Exception:
+        logger.exception("scramble watchdog scan failed (will run again)")
+
+
+def schedule_scramble_watchdog(job_queue):
+    if job_queue is None:
+        return
+    for job in job_queue.get_jobs_by_name(SCRAMBLE_WATCHDOG_JOB_NAME):
+        job.schedule_removal()
+    job_queue.run_repeating(
+        scramble_watchdog_callback,
+        interval=SCRAMBLE_WATCHDOG_INTERVAL,
+        first=25,
+        name=SCRAMBLE_WATCHDOG_JOB_NAME,
+    )
 
 
 async def scramble_group_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -9562,6 +9873,16 @@ def main():
     ), group=1)
 
     if app.job_queue is not None:
+        # A timer that fires even 1-2 seconds late (event loop briefly busy)
+        # is DROPPED by APScheduler under its default 1-second grace window.
+        # A dropped timeout/next-round timer is exactly what makes a chain
+        # go quiet, so late jobs must still run.
+        try:
+            app.job_queue.scheduler._job_defaults["misfire_grace_time"] = None
+            app.job_queue.scheduler._job_defaults["coalesce"] = True
+        except Exception:
+            logger.warning("GAME BOT: could not relax scheduler misfire grace time")
+
         restore_stale_scramble_rounds(app.job_queue)
         restore_stale_slowmode_waits(app.job_queue)
         restore_stale_word_games(app.job_queue)
@@ -9572,6 +9893,7 @@ def main():
         schedule_premium_reminder_job(app.job_queue)
         restore_stale_tournaments(app.job_queue)
         schedule_tournament_pause_check(app.job_queue)
+        schedule_scramble_watchdog(app.job_queue)
 
         if db.get_config("scramble_mode_enabled", "0") == "1":
             try:
