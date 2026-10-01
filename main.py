@@ -49,6 +49,15 @@ logging.getLogger("telegram").setLevel(logging.WARNING)
 
 DOLLAR = "💵"
 
+
+def fmt_coins(n):
+    """Leaderboard score with real thousands separators: 16000 -> 16,000, 1000 -> 1,000.
+    Anything under 1,000 is left alone (100 -> 100)."""
+    try:
+        return f"{int(n):,}"
+    except (TypeError, ValueError):
+        return str(n)
+
 EXPLAIN_TIMEOUT_SECONDS = 90
 
 MAX_LEADERBOARD_NAME_LEN = 20
@@ -1182,6 +1191,11 @@ async def _start_scramble_round_locked(context: ContextTypes.DEFAULT_TYPE, chat)
         return None
 
     scrambled = scramble_letters(word)
+    # "x" difficulty modes (easyx, medium x, ...): show the letters in lowercase
+    # so a capital letter can't reveal the word's first letter.
+    _diff_label = await asyncio.to_thread(db.get_effective_game_difficulty, chat.id)
+    if _split_difficulty_label(_diff_label)[1]:
+        scrambled = scrambled.lower()
     reward_now = await asyncio.to_thread(get_scramble_reward)
     await asyncio.to_thread(db.scramble_start_round, chat.id, word, scrambled)
 
@@ -1447,12 +1461,12 @@ def format_scramble_board(rows, title, position_info=None, requester_name=None) 
             prefix = medals.get(i, f"{i}.")
             display_name = truncate_name(name)
             streak_display = f" 🔥{streak}" if streak and streak > 1 else ""
-            text += f"{prefix} {display_name}\t{DOLLAR}{earned}{streak_display}\n"
+            text += f"{prefix} {display_name}\t{DOLLAR}{fmt_coins(earned)}{streak_display}\n"
 
     if position_info:
         pos, name, wins, earned, streak = position_info
         display_name = truncate_name(requester_name or name)
-        text += f"\n  Your Position\n{pos}. {display_name} {DOLLAR}{earned}\n"
+        text += f"\n  Your Position\n{pos}. {display_name} {DOLLAR}{fmt_coins(earned)}\n"
 
     text += ad_footer_html()
     return text
@@ -1495,7 +1509,7 @@ def format_scramble_top_players(rows, title, position_info, requester_name, posi
                 name, wins, earned = row
                 streak_display = ""
             display_name = truncate_name(name)
-            text += f"{prefix} {display_name}\t{DOLLAR}{earned}{streak_display}\n"
+            text += f"{prefix} {display_name}\t{DOLLAR}{fmt_coins(earned)}{streak_display}\n"
 
     if position_info:
         if len(position_info) == 5:
@@ -1503,7 +1517,7 @@ def format_scramble_top_players(rows, title, position_info, requester_name, posi
         else:
             pos, name, wins, earned = position_info
         display_name = truncate_name(requester_name or name)
-        text += f"\n{position_label}:\n#{pos} • {display_name} • {DOLLAR}{earned}\n"
+        text += f"\n{position_label}:\n#{pos} • {display_name} • {DOLLAR}{fmt_coins(earned)}\n"
 
     text += ad_footer_html()
     return text
@@ -1605,7 +1619,7 @@ async def scramblesetreward_command(update: Update, context: ContextTypes.DEFAUL
 
 @owner_only
 async def gamedifficulty_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    valid = ("easy", "easy3", "easy4", "easy5", "easy6", "medium", "hard", "off")
+    valid = _DIFFICULTY_LABELS
 
     if not context.args or context.args[0].lower() not in valid:
         current_global = await asyncio.to_thread(db.get_config, "game_difficulty_global", "off")
@@ -1616,7 +1630,11 @@ async def gamedifficulty_command(update: Update, context: ContextTypes.DEFAULT_T
             "<code>/gamedifficulty medium</code> — words of 8+ letters, compounds excluded\n"
             "<code>/gamedifficulty hard</code> — words of 11+ letters, compounds included\n"
             "<code>/gamedifficulty off</code> — use the full word pool\n\n"
-            "Add a group ID or @username at the end to target just that group.\n\n"
+            "Add <b>x</b> to any mode (<code>easyx</code>, <code>easy3x</code>/easy4x/easy5x/easy6x, "
+            "<code>mediumx</code>, <code>hardx</code>, <code>offx</code>) for the same thing, but the scrambled "
+            "letters are shown in lowercase so the first letter isn't given away.\n\n"
+            "Add a group ID or @username at the end to target just that group. "
+            "With no group, it applies to ALL groups immediately (and to new groups).\n\n"
             f"Current global default: <b>{esc(current_global)}</b>"
         )
         return
@@ -1637,8 +1655,15 @@ async def gamedifficulty_command(update: Update, context: ContextTypes.DEFAULT_T
             f"✅ Difficulty for <b>{esc(target_title)}</b> set to <b>{label}</b>."
         )
     else:
+        # Global: save the new default AND clear every group's own override, so
+        # it takes effect in all existing groups right now. New groups have no
+        # override, so they pick up this global default automatically.
         await asyncio.to_thread(db.set_config, "game_difficulty_global", label)
-        await update.message.reply_html(f"✅ Global default difficulty set to <b>{label}</b>.")
+        cleared = await asyncio.to_thread(db.clear_all_group_game_difficulty_overrides)
+        await update.message.reply_html(
+            f"✅ Global difficulty set to <b>{label}</b> — applied to all groups immediately "
+            f"({cleared} group setting{'s' if cleared != 1 else ''} replaced). New groups will use it too."
+        )
 
 
 @owner_only
@@ -1822,7 +1847,8 @@ def _scrambleallcommands_text() -> str:
 /scramblesetreward &lt;amount&gt; - set the win reward
 /scramblereloadwords - reload the word pool from medium_words_raw.py
 /shufflewords - reshuffle the shared word pool (Word Game and Word Scramble both draw from it)
-/gamedifficulty easy|easy3-6|medium|hard|off [group] - control which word lengths get picked (shared with Word Game)
+/gamedifficulty easy|easy3-6|medium|hard|off [group] - control which word lengths get picked (shared with Word Game); with no group it applies to ALL groups at once (and new groups)
+/gamedifficulty easyx|easy3x-6x|mediumx|hardx|offx [group] - same as the modes above, but the scrambled letters are shown in lowercase so the first letter isn't given away
 /scrambleforceend [Chat ID] - force-end a stuck round in one chat
 /scramblestopallgroups - force-end the active round in EVERY chat at once and pause new ones (until /scramblemaintenance off)
 /scramblemaintenance on|off - pause new Word Scramble rounds only (Word Game unaffected)
@@ -1847,6 +1873,7 @@ def _scrambleallcommands_text() -> str:
 /showlevel on|off - bot owner or Bot Admins: toggle the Level/Rank badge on Word Scramble winner messages (global, no args shows current status)
 /showmedal on|off - bot owner or Bot Admins: toggle the 🥇🥈🥉 medal prefix on Word Scramble messages (global, no args shows current status)
 /invitereward &lt;amount&gt; - owner only: set the Invite &amp; Earn reward amount (no args shows the current amount, default 💵1000)
+/botusers - users who started the bot in DM: total/active/blocked, tappable, with per-user Word Game and Scramble activity
 /scrambleallcommands - this list
 
 <i>Note: Word Scramble intentionally has no /scramblebanuser, /scramblebroadcast, /scrambleshare, or /scrambleadmins - banning, broadcasting, and bot-admin management are bot-wide systems shared with the Word Game, so /banuser, /broadcast, /share, and /addadmin already cover Word Scramble too. There's also no daily-reward feature specific to Word Scramble - the 🎁 Daily Reward always credits the Word Game balance, and every player's displayed Balance/Level/Rank on /start combines both games automatically. This list and /allcommands are visible to the bot owner, Bot Admins, and each group's own Telegram creator. The owner is alerted in DM whenever someone buys Premium, gifts Premium, buys 💵 cash or boosts their rank/level.</i>
@@ -2395,7 +2422,23 @@ def _is_compound_word(word: str) -> bool:
     return False
 
 
+_DIFFICULTY_BASE_LABELS = ("easy", "easy3", "easy4", "easy5", "easy6", "medium", "hard", "off")
+# Every base mode also has an "x" twin (easyx, easy3x, ..., offx): identical word
+# selection, but the scrambled letters are shown in lowercase so no capital
+# letter gives away the first letter of the word.
+_DIFFICULTY_LABELS = _DIFFICULTY_BASE_LABELS + tuple(f"{b}x" for b in _DIFFICULTY_BASE_LABELS)
+
+
+def _split_difficulty_label(label):
+    """'easy3x' -> ('easy3', True); 'easy3' -> ('easy3', False); None -> ('off', False)."""
+    label = (label or "off").lower()
+    if label.endswith("x") and label[:-1] in _DIFFICULTY_BASE_LABELS:
+        return label[:-1], True
+    return label, False
+
+
 def _filter_by_difficulty(pool, label):
+    label, _hide_caps = _split_difficulty_label(label)
     if not label or label == "off":
         return pool
     if label == "easy":
@@ -2413,6 +2456,7 @@ def _filter_by_difficulty(pool, label):
 
 
 def _get_difficulty_pool(pool_name, base_pool, label):
+    label, _hide_caps = _split_difficulty_label(label)
     key = (pool_name, label or "off")
     if key not in _DIFFICULTY_CACHE:
         _DIFFICULTY_CACHE[key] = _filter_by_difficulty(base_pool, label)
@@ -3798,11 +3842,15 @@ Tap a button below to continue your adventure!
         _, which, sort = query.data.split(":")
         if which == "bot":
             header, keyboard = build_botgroups_list_page(0, sort)
+        elif which == "busers":
+            header, keyboard = build_botusers_list_page(0, sort)
         else:
             header, keyboard = build_groups_list_page(0, sort)
         await query.answer()
         if header is None:
-            await query.edit_message_text("No groups registered yet.")
+            await query.edit_message_text(
+                "No users registered yet." if which == "busers" else "No groups registered yet."
+            )
             return
         await query.edit_message_text(header, parse_mode="HTML", reply_markup=keyboard)
         return
@@ -3895,6 +3943,65 @@ Tap a button below to continue your adventure!
         await query.answer()
         await query.edit_message_text(
             text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard_rows)
+        )
+        return
+
+    if query.data.startswith("bulpg:"):
+        if not is_owner(user.id):
+            await query.answer("🚫 Owner only.", show_alert=True)
+            return
+        _, sort, page_str = query.data.split(":")
+        page = int(page_str)
+        header, keyboard = build_botusers_list_page(page, sort)
+        await query.answer()
+        if header is None:
+            await query.edit_message_text("No users registered yet.")
+            return
+        await query.edit_message_text(header, parse_mode="HTML", reply_markup=keyboard)
+        return
+
+    if query.data.startswith("bu:"):
+        if not is_owner(user.id):
+            await query.answer("🚫 Owner only.", show_alert=True)
+            return
+        _, uid_str, bu_sort, page_str = query.data.split(":")
+        page = int(page_str)
+
+        details = await asyncio.to_thread(db.get_bot_user_full_details, int(uid_str))
+        if not details:
+            await query.answer("❌ User data not found.", show_alert=True)
+            return
+
+        (u_id, u_name, u_username, wg_played, started_at, blocked_at,
+         scr_played, last_active, balance) = details
+        status_display = (
+            "🟢 Active (bot open in DM)" if not blocked_at
+            else f"🔴 Blocked / removed the bot ({_format_stored_time(blocked_at)})"
+        )
+        uname_display = f"@{u_username}" if u_username else "—"
+        id_mention = f'<a href="tg://user?id={u_id}">{u_id}</a>'
+
+        text = f"""
+👤 <b>Bot User Details</b>
+
+📛 Name: {esc(u_name or 'Unknown')}
+🔖 Username: {uname_display}
+🆔 Telegram ID: <code>{u_id}</code> (tap to open chat: {id_mention})
+{status_display}
+
+📅 Started Bot: {_format_stored_time(started_at)}
+🕒 Last Active: {_format_stored_time(last_active)}
+{DOLLAR} Word Game Balance: {balance}
+
+🎮 Word Game — Games Played: <b>{wg_played}</b>
+🔤 Word Scramble — Rounds Played: <b>{scr_played}</b>
+"""
+        await query.answer()
+        await query.edit_message_text(
+            text, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅ Back", callback_data=f"bulpg:{bu_sort}:{page}")]
+            ]),
         )
         return
 
@@ -4571,12 +4678,12 @@ def format_board(rows, title, position_info=None, requester_name=None):
         for i, (name, coins) in enumerate(rows, start=1):
             prefix = medals.get(i, f"{i}.")
             display_name = truncate_name(name)
-            text += f"{prefix} {display_name}\t{DOLLAR}{coins}\n"
+            text += f"{prefix} {display_name}\t{DOLLAR}{fmt_coins(coins)}\n"
 
     if position_info:
         pos, name, coins = position_info
         display_name = truncate_name(requester_name or name)
-        text += f"\n  Your Position\n{pos}. {display_name} {DOLLAR}{coins}\n"
+        text += f"\n  Your Position\n{pos}. {display_name} {DOLLAR}{fmt_coins(coins)}\n"
 
     text += ad_footer_html()
 
@@ -4718,6 +4825,13 @@ async def pre_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await asyncio.to_thread(db.add_user, user.id, user.first_name, user.username)
 
+    # Any DM activity proves this user has the bot open in private (/botusers).
+    if chat is not None and chat.type == ChatType.PRIVATE and update.my_chat_member is None:
+        try:
+            await asyncio.to_thread(db.mark_user_bot_started, user.id)
+        except Exception:
+            logger.exception("Failed to record DM start for /botusers")
+
 
 async def on_bot_membership_change(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = update.my_chat_member
@@ -4728,6 +4842,19 @@ async def on_bot_membership_change(update: Update, context: ContextTypes.DEFAULT
     old_status = result.old_chat_member.status
     new_status = result.new_chat_member.status
     actor = result.from_user
+
+    if chat.type == ChatType.PRIVATE:
+        # Someone opened or blocked the bot in DM - this is NOT a group. Only
+        # record it for /botusers: no group registration, no group welcome
+        # message, no Invite & Earn member-count notice, no owner group alert.
+        try:
+            if new_status in ("member", "administrator"):
+                await asyncio.to_thread(db.mark_user_bot_started, chat.id)
+            elif new_status in ("left", "kicked"):
+                await asyncio.to_thread(db.mark_user_bot_blocked, chat.id)
+        except Exception as e:
+            logger.error(f"Failed to record DM start/block for {chat.id}: {e}")
+        return
 
     if new_status in ("member", "administrator"):
         if await asyncio.to_thread(db.is_group_banned, chat.id):
@@ -4900,12 +5027,12 @@ def format_top_players(rows, title, position_info, requester_name, position_labe
     else:
         for i, (name, coins) in enumerate(rows, start=1):
             display_name = truncate_name(name)
-            text += f"{i}. {display_name}\t{DOLLAR}{coins}\n"
+            text += f"{i}. {display_name}\t{DOLLAR}{fmt_coins(coins)}\n"
 
     if position_info:
         pos, name, coins = position_info
         display_name = truncate_name(requester_name or name)
-        text += f"\n{position_label}:\n#{pos} • {display_name} • {DOLLAR}{coins}\n"
+        text += f"\n{position_label}:\n#{pos} • {display_name} • {DOLLAR}{fmt_coins(coins)}\n"
 
     text += ad_footer_html()
 
@@ -4932,7 +5059,7 @@ def owner_top_players_keyboard(scope: str, ctx_chat_id: int):
 
     keyboard = [
         [InlineKeyboardButton(
-            f"{i}. {truncate_name(name)} — {DOLLAR}{coins}",
+            f"{i}. {truncate_name(name)} — {DOLLAR}{fmt_coins(coins)}",
             callback_data=f"op:{uid}:{scope}:{ctx_chat_id}",
         )]
         for i, (uid, name, coins) in enumerate(rows, start=1)
@@ -5497,7 +5624,7 @@ def build_users_list_page(page: int):
 
     keyboard = [
         [InlineKeyboardButton(
-            f"{start_n + i}. {truncate_name(name)} — {DOLLAR}{coins}",
+            f"{start_n + i}. {truncate_name(name)} — {DOLLAR}{fmt_coins(coins)}",
             callback_data=f"op:{uid}:userslist:{page}",
         )]
         for i, (uid, name, username, coins, last_active) in enumerate(rows)
@@ -5609,6 +5736,63 @@ async def botgroups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+BOTUSERS_PAGE_SIZE = 20
+
+
+def build_botusers_list_page(page: int, sort: str = "games"):
+    if sort not in ("games", "time"):
+        sort = "games"
+    total = db.get_botusers_count()
+    offset = page * BOTUSERS_PAGE_SIZE
+    rows = db.get_botusers_page(offset, BOTUSERS_PAGE_SIZE, sort)
+
+    if not rows:
+        return None, None
+
+    total_pages = max(1, (total + BOTUSERS_PAGE_SIZE - 1) // BOTUSERS_PAGE_SIZE)
+    start_n = offset + 1
+    end_n = offset + len(rows)
+    sort_label = "🎮 Games Played" if sort == "games" else "🕒 Time Started"
+
+    s = db.get_bot_users_stats()
+    header = (
+        f"👤 <b>Bot Users</b>\n"
+        f"📊 Total Ever: <b>{s['total']}</b> | 🟢 Active: <b>{s['current']}</b> | 🔴 Blocked: <b>{s['removed']}</b>\n\n"
+        f"Page {page + 1}/{total_pages} • Sorted by: {sort_label} • <code>🎮 Word Game | 🔤 Scramble</code>\n"
+        f"<i>Entries {start_n}–{end_n} • Tap a user to inspect.</i>"
+    )
+
+    keyboard = []
+    for i, (uid, name, wg_played, blocked_at, scr_played) in enumerate(rows):
+        status = "🟢" if not blocked_at else "🔴"
+        label = f"{start_n + i}. {status} {truncate_name(name or 'Unknown')} — 🎮{wg_played} 🔤{scr_played}"
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"bu:{uid}:{sort}:{page}")])
+
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"bulpg:{sort}:{page - 1}"))
+    if offset + BOTUSERS_PAGE_SIZE < total:
+        nav_row.append(InlineKeyboardButton("➡️ Next", callback_data=f"bulpg:{sort}:{page + 1}"))
+    if nav_row:
+        keyboard.append(nav_row)
+
+    return header, InlineKeyboardMarkup(keyboard)
+
+
+@owner_only
+async def botusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await asyncio.to_thread(db.get_botusers_count) == 0:
+        await update.message.reply_text("No users registered yet.")
+        return
+    await update.message.reply_html(
+        "👤 <b>Bot Users</b>\n\nHow would you like the list ordered?",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🎮 Games Played", callback_data="gsort:busers:games")],
+            [InlineKeyboardButton("🕒 Time Started", callback_data="gsort:busers:time")],
+        ]),
+    )
+
+
 @owner_only
 async def groups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args:
@@ -5662,7 +5846,7 @@ async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             uname = f"@{username}" if username else "—"
             lines.append(
                 f"• {truncate_name(name)} ({uname})\n"
-                f"  ID: <code>{uid}</code> | Balance: {DOLLAR}{coins}"
+                f"  ID: <code>{uid}</code> | Balance: {DOLLAR}{fmt_coins(coins)}"
             )
         if len(rows) > MAX_SEARCH_RESULTS:
             lines.append(f"\n<i>+{len(rows) - MAX_SEARCH_RESULTS} more - refine your search to narrow it down.</i>")
@@ -6663,11 +6847,13 @@ def _allcommands_text() -> str:
 /autodelete on|off [interval] - group admins (or the owner) can enable cleanup of the bot's own messages here; add a number+s/m/h/d (e.g. 9m) for periodic cleanup instead of round-based
 /deleterequestprompt off|on [&lt;1-9&gt;s|m] - group admins (or the owner) can control whether resolved /request prompts are deleted here and after how long (default on, 30 seconds; no args shows the current setting)
 /groupadminmode on|off &lt;group ID or @username&gt; - owner/Bot Admins only, works from my DM: require (or not) that I'm an admin here before games can start, overriding the global /adminmode default
-/gamedifficulty easy|easy3-6|medium|hard|off [group] - owner only: control which word lengths get picked; add a group to target just that group
+/gamedifficulty easy|easy3-6|medium|hard|off [group] - owner only: control which word lengths get picked; add a group to target just that group, or leave it out to apply to ALL groups at once (and new groups)
+/gamedifficulty easyx|easy3x-6x|mediumx|hardx|offx [group] - owner only: same as the modes above, but the scrambled letters are shown in lowercase so the first letter isn't given away
 
 <b>👑 Owner Commands</b>
 /stats - bot-wide statistics
-/botgroups (alias: /botsgroups) - total/current/removed groups, tappable, with per-group Word Game and Scramble activity
+/botgroups (alias: /botsgroups) - groups only: total/current/removed groups, tappable, with per-group Word Game and Scramble activity
+/botusers - users who started the bot in DM: total/active/blocked, tappable, with per-user Word Game and Scramble activity (same layout as /botgroups)
 /groups [query] - list/search every group the bot has seen
 /users [query] - list/search every registered user
 /banuser &lt;ID&gt; - ban a user from the bot
@@ -6719,7 +6905,7 @@ def _allcommands_text() -> str:
 /changesponsoredad &lt;text, link, @username, or 'label | link'&gt; - owner only: replace the Sponsored Ad content (or 'clear' to reset)
 /showgamemedal on|off - owner/Bot Admins only: toggle the 🥇🥈🥉 medal prefix on Word Game names (global, no args shows current status)
 
-<i>Note: banuser/unbanuser/bangroup/unbangroup/broadcast/maintenance/addadmanager/changeadmanager/removeadmanager/admanager/adminmode/prompt/editprompt/groupadminmode can also be used by Bot Admins. /ad on|off, /botgroups, /addwords, /removewords, /shufflewords, and /gamedifficulty are owner-only. /autodelete's bare on/off form works for group admins too; its explicit-group and allgroups forms are owner-only. This list and /scrambleallcommands are visible to the bot owner, Bot Admins, and each group's own Telegram creator. The owner is alerted in DM whenever someone buys Premium, gifts Premium, buys 💵 cash or boosts their rank/level. Word Scramble has its own command list - see /scrambleallcommands (includes /scramblestopallgroups). The 🎁 Daily Reward always credits the Word Game balance, and every player's Balance/Level/Rank on /start combines their Word Game + Word Scramble balances automatically.</i>
+<i>Note: banuser/unbanuser/bangroup/unbangroup/broadcast/maintenance/addadmanager/changeadmanager/removeadmanager/admanager/adminmode/prompt/editprompt/groupadminmode can also be used by Bot Admins. /ad on|off, /botgroups, /botusers, /addwords, /removewords, /shufflewords, and /gamedifficulty are owner-only. /autodelete's bare on/off form works for group admins too; its explicit-group and allgroups forms are owner-only. This list and /scrambleallcommands are visible to the bot owner, Bot Admins, and each group's own Telegram creator. The owner is alerted in DM whenever someone buys Premium, gifts Premium, buys 💵 cash or boosts their rank/level. Word Scramble has its own command list - see /scrambleallcommands (includes /scramblestopallgroups). The 🎁 Daily Reward always credits the Word Game balance, and every player's Balance/Level/Rank on /start combines their Word Game + Word Scramble balances automatically.</i>
 """
 
 
@@ -8515,7 +8701,7 @@ def get_dollar_packs():
 
 
 def _dollar_pack_label(coins, stars) -> str:
-    return f"{DOLLAR}{coins} for {stars} ⭐"
+    return f"{DOLLAR}{fmt_coins(coins)} for {stars} ⭐"
 
 
 def _parse_dollar_payload(payload):
@@ -8570,7 +8756,7 @@ def get_buycash_text() -> str:
 
 
 def _buycash_button_label(coins, stars) -> str:
-    return f"Get {DOLLAR}{coins} for {stars} ⭐️"
+    return f"Get {DOLLAR}{fmt_coins(coins)} for {stars} ⭐️"
 
 
 def _buydollar_keyboard(user_id, packs, src="c"):
@@ -8676,12 +8862,12 @@ async def buydollar_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.send_invoice(
             chat_id=user.id,
-            title=f"{DOLLAR}{coins} cash"[:32],
-            description=f"{coins} {DOLLAR} added to your balance. Premium does not double purchased cash.",
+            title=f"{DOLLAR}{fmt_coins(coins)} cash"[:32],
+            description=f"{fmt_coins(coins)} {DOLLAR} added to your balance. Premium does not double purchased cash.",
             payload=f"{DOLLAR_PAYLOAD_PREFIX}:{user.id}:{idx}:{coins}:{stars}:{src}",
             provider_token="",  # must be empty for Telegram Stars
             currency="XTR",
-            prices=[LabeledPrice(label=f"{DOLLAR}{coins}"[:32], amount=int(stars))],  # raw star count, no x100
+            prices=[LabeledPrice(label=f"{DOLLAR}{fmt_coins(coins)}"[:32], amount=int(stars))],  # raw star count, no x100
         )
     except Forbidden:
         await query.answer(
@@ -8755,12 +8941,12 @@ async def _dollar_successful_payment(update: Update, context: ContextTypes.DEFAU
         return  # duplicate delivery of an already-applied charge
 
     await message.reply_text(
-        f"✅ Payment received! {DOLLAR}{coins} added to your Word Scramble balance.\n"
-        f"New balance: {DOLLAR}{new_balance}"
+        f"✅ Payment received! {DOLLAR}{fmt_coins(coins)} added to your Word Scramble balance.\n"
+        f"New balance: {DOLLAR}{fmt_coins(new_balance)}"
     )
 
     src = _dollar_payload_source(payment.invoice_payload)
-    extra = [f"Bought: {DOLLAR}{coins} via /{CASH_SOURCES[src][0]}", f"Word Scramble balance now: {new_balance}"]
+    extra = [f"Bought: {DOLLAR}{fmt_coins(coins)} via /{CASH_SOURCES[src][0]}", f"Word Scramble balance now: {fmt_coins(new_balance)}"]
     try:
         combined = await asyncio.to_thread(db.get_combined_balance, payer.id)
         level, rank_name = db.compute_level_rank(combined)
@@ -9598,9 +9784,15 @@ def _fullhelp_other_page() -> str:
         f"/leaderboard, /chattop, /globaltop, /topplayers, /topgroups - Word Game and combined rankings\n"
         f"/scrambleleaderboard, /scrambletopplayers, /scrambletopgroups - Word Scramble rankings\n\n"
         f"👤 <b>Profile</b>\n"
-        f"/profile - your balance, level and rank. Reply to someone's message with /start to see their profile. "
+        f"/start - the main menu with your balance, level and rank; works in my DM and in groups. "
+        f"Reply to someone's message with /start to see their profile.\n"
+        f"/profile - your balance, level and rank. "
         f"Balance, level and rank combine your Word Game and Word Scramble earnings.\n"
         f"/ranks - the full rank ladder and what each level needs.\n\n"
+        f"🧹 <b>Group admin tools</b>\n"
+        f"/autodelete on|off [interval] - group admins can have me clean up my own messages in the group; "
+        f"add a number + s/m/h/d (e.g. 9m) for periodic cleanup instead of round-based.\n"
+        f"/stopgame and /scramblestopgame - stop a live round. /slowmode and /scrambleautomaticmode - see the Word Scramble page.\n\n"
         f"🔎 <b>Finding commands</b>\n"
         f"/searchcommand &lt;text&gt; - search commands by name or description.\n"
         f"/help and /scramblehelp - the short how-to-play guides.\n"
@@ -10212,6 +10404,7 @@ def main():
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("botgroups", botgroups_command))
     app.add_handler(CommandHandler("botsgroups", botgroups_command))
+    app.add_handler(CommandHandler("botusers", botusers_command))
     app.add_handler(CommandHandler("groups", groups_command))
     app.add_handler(CommandHandler("prompt", prompt_command))
     app.add_handler(CommandHandler("editprompt", editprompt_command))

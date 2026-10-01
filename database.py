@@ -161,6 +161,24 @@ def create_tables():
 
         cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_chat_id BIGINT")
 
+        # /botusers: who has started the bot in DM, and who blocked/removed it.
+        # The one-time backfill treats every already-registered user as having
+        # started the bot (their real start time is unknown, so last_active is
+        # used); it only runs the first time these columns are created.
+        cursor.execute(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = 'users' "
+            "AND column_name = 'bot_started_at'"
+        )
+        _had_bot_started_col = cursor.fetchone() is not None
+        cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS bot_started_at TEXT")
+        cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS bot_blocked_at TEXT")
+        if not _had_bot_started_col:
+            cursor.execute(
+                "UPDATE users SET bot_started_at = COALESCE(last_active, %s) WHERE bot_started_at IS NULL",
+                (datetime.now().isoformat(),),
+            )
+
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS word_games (
             chat_id BIGINT PRIMARY KEY,
@@ -1421,11 +1439,11 @@ def get_bot_groups_stats():
     conn = connect()
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM groups")
+        cursor.execute("SELECT COUNT(*) FROM groups WHERE chat_id < 0")
         total = cursor.fetchone()[0]
-        cursor.execute("SELECT COUNT(*) FROM groups WHERE left_at IS NULL")
+        cursor.execute("SELECT COUNT(*) FROM groups WHERE chat_id < 0 AND left_at IS NULL")
         current = cursor.fetchone()[0]
-        cursor.execute("SELECT COUNT(*) FROM groups WHERE left_at IS NOT NULL")
+        cursor.execute("SELECT COUNT(*) FROM groups WHERE chat_id < 0 AND left_at IS NOT NULL")
         removed = cursor.fetchone()[0]
         return {"total": total, "current": current, "removed": removed}
     finally:
@@ -1436,7 +1454,7 @@ def get_botgroups_count():
     conn = connect()
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM groups")
+        cursor.execute("SELECT COUNT(*) FROM groups WHERE chat_id < 0")
         return cursor.fetchone()[0]
     finally:
         conn.close()
@@ -1457,10 +1475,113 @@ def get_botgroups_page(offset, limit, sort="games"):
             SELECT g.chat_id, g.title, g.games_played, g.left_at, COALESCE(s.rounds_played, 0)
             FROM groups g
             LEFT JOIN scramble_group_stats s ON s.chat_id = g.chat_id
+            WHERE g.chat_id < 0
             ORDER BY {order_clause}
             LIMIT %s OFFSET %s
         """, (limit, offset))
         return cursor.fetchall()
+    finally:
+        conn.close()
+
+
+# --- /botusers: users who started the bot in DM (and who blocked it) ---------
+
+def mark_user_bot_started(user_id):
+    """Record that this user has the bot open in DM. Cheap no-op when already recorded."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE users SET bot_started_at = COALESCE(bot_started_at, %s), bot_blocked_at = NULL "
+            "WHERE id=%s AND (bot_started_at IS NULL OR bot_blocked_at IS NOT NULL)",
+            (datetime.now().isoformat(), user_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def mark_user_bot_blocked(user_id):
+    """Record that this user blocked / removed the bot in DM."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        now = datetime.now().isoformat()
+        cursor.execute(
+            "UPDATE users SET bot_started_at = COALESCE(bot_started_at, %s), bot_blocked_at = %s WHERE id=%s",
+            (now, now, user_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_bot_users_stats():
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM users WHERE bot_started_at IS NOT NULL")
+        total = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM users WHERE bot_started_at IS NOT NULL AND bot_blocked_at IS NULL")
+        current = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM users WHERE bot_started_at IS NOT NULL AND bot_blocked_at IS NOT NULL")
+        removed = cursor.fetchone()[0]
+        return {"total": total, "current": current, "removed": removed}
+    finally:
+        conn.close()
+
+
+def get_botusers_count():
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM users WHERE bot_started_at IS NOT NULL")
+        return cursor.fetchone()[0]
+    finally:
+        conn.close()
+
+
+def get_botusers_page(offset, limit, sort="games"):
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        if sort == "time":
+            order_clause = "u.bot_started_at ASC"
+        else:
+            order_clause = (
+                "(u.bot_blocked_at IS NULL) DESC, "
+                "(COALESCE(u.games_played, 0) + COALESCE(sc.played, 0)) DESC, u.last_active DESC"
+            )
+        cursor.execute(f"""
+            SELECT u.id, u.name, COALESCE(u.games_played, 0), u.bot_blocked_at, COALESCE(sc.played, 0)
+            FROM users u
+            LEFT JOIN (
+                SELECT user_id, SUM(played) AS played FROM scramble_chat_stats GROUP BY user_id
+            ) sc ON sc.user_id = u.id
+            WHERE u.bot_started_at IS NOT NULL
+            ORDER BY {order_clause}
+            LIMIT %s OFFSET %s
+        """, (limit, offset))
+        return cursor.fetchall()
+    finally:
+        conn.close()
+
+
+def get_bot_user_full_details(user_id):
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT u.id, u.name, u.username, COALESCE(u.games_played, 0), u.bot_started_at,
+                   u.bot_blocked_at, COALESCE(sc.played, 0), u.last_active, COALESCE(g.coins, 0)
+            FROM users u
+            LEFT JOIN (
+                SELECT user_id, SUM(played) AS played FROM scramble_chat_stats GROUP BY user_id
+            ) sc ON sc.user_id = u.id
+            LEFT JOIN global_scores g ON g.user_id = u.id
+            WHERE u.id=%s AND u.bot_started_at IS NOT NULL
+        """, (user_id,))
+        return cursor.fetchone()
     finally:
         conn.close()
 
@@ -3794,6 +3915,20 @@ def set_group_game_difficulty_override(chat_id, value):
         cursor = conn.cursor()
         cursor.execute("UPDATE groups SET game_difficulty_override=%s WHERE chat_id=%s", (value, chat_id))
         conn.commit()
+    finally:
+        conn.close()
+
+
+def clear_all_group_game_difficulty_overrides() -> int:
+    """Used by a global /gamedifficulty so the new setting reaches EVERY group.
+    Returns how many groups had their own override cleared."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE groups SET game_difficulty_override=NULL WHERE game_difficulty_override IS NOT NULL")
+        cleared = cursor.rowcount
+        conn.commit()
+        return cleared
     finally:
         conn.close()
 
