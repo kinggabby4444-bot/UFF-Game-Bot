@@ -2233,8 +2233,9 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 MESSAGEAPPLICANT_USAGE = (
-    "Usage: /messageapplicant <username|Allapplicants> <message text>\n"
+    "Usage: /messageapplicant <@username|username|user ID|Allapplicants> <message text>\n"
     "Example: /messageapplicant @john Hello!\n"
+    "Example: /messageapplicant 123456789 Hello!\n"
     "Example: /messageapplicant Allapplicants Hello everyone!"
 )
 
@@ -2273,10 +2274,14 @@ async def messageapplicant_command(update: Update, context: ContextTypes.DEFAULT
         )
         return
 
-    applicant_id = await asyncio.to_thread(db.get_applicant_id_by_username, target)
+    if target.lstrip("@").isdigit():
+        # Telegram usernames can't be purely numeric, so digits mean a user ID.
+        applicant_id = await asyncio.to_thread(db.get_applicant_id_by_user_id, target.lstrip("@"))
+    else:
+        applicant_id = await asyncio.to_thread(db.get_applicant_id_by_username, target)
     if applicant_id is None:
         await update.message.reply_text(
-            f"❌ No applicant found with username {target}.\n\n{MESSAGEAPPLICANT_USAGE}"
+            f"❌ No applicant matches that username or user ID ({target}).\n\n{MESSAGEAPPLICANT_USAGE}"
         )
         return
     try:
@@ -2842,7 +2847,7 @@ async def allcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 /payments - payments waiting for verification (owner/admin)
 /searchads &lt;query&gt; - search by user/business/link/ID (owner)
 /broadcast &lt;everyone|approved|pending|rejected&gt; &lt;message&gt;
-/messageapplicant &lt;username|Allapplicants&gt; &lt;message&gt;
+/messageapplicant &lt;@username|username|user ID|Allapplicants&gt; &lt;message&gt;
 /approveall - approve every currently pending application (owner)
 /rejectall [reason] - reject every currently pending application (owner)
 

@@ -658,6 +658,26 @@ def get_applicant_id_by_username(username):
         conn.close()
 
 
+def get_applicant_id_by_user_id(user_id):
+    """Returns the applicant_id if a numeric Telegram user ID matches an
+    existing applicant (any application), else None."""
+    try:
+        user_id = int(str(user_id).strip())
+    except (TypeError, ValueError):
+        return None
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT applicant_id FROM ad_applications WHERE applicant_id=%s LIMIT 1",
+            (user_id,),
+        )
+        row = cursor.fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
 def create_payment(application_id, file_id, file_kind):
     conn = connect()
     try:

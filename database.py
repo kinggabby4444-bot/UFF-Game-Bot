@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 DAILY_REWARD = 50
+DAILY_REWARD_PREMIUM = 100
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
@@ -557,6 +558,65 @@ def create_tables():
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_tournament_players_unique "
             "ON tournament_players (tournament_id, user_id)"
         )
+        # Which balance the entry fee was taken from ('scramble' or 'global'),
+        # so a refund goes back to the same place. Old rows default to scramble.
+        cursor.execute("ALTER TABLE tournament_players ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'scramble'")
+
+        # ---- Elimination game (separate from tournaments) ------------------
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS eliminations (
+            id BIGSERIAL PRIMARY KEY,
+            chat_id BIGINT NOT NULL,
+            host_id BIGINT NOT NULL,
+            fee BIGINT NOT NULL,
+            difficulty TEXT,
+            start_countdown INTEGER NOT NULL,
+            current_countdown INTEGER NOT NULL,
+            status TEXT DEFAULT 'lobby',
+            cycle_no INTEGER DEFAULT 1,
+            current_player_id BIGINT,
+            current_word TEXT,
+            current_scrambled TEXT,
+            turn_started_at TEXT,
+            turn_seconds INTEGER,
+            created_at TEXT,
+            lobby_message_id BIGINT,
+            idle_since TEXT
+        )
+        """)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS elimination_players (
+            id BIGSERIAL PRIMARY KEY,
+            elimination_id BIGINT NOT NULL,
+            user_id BIGINT NOT NULL,
+            name TEXT,
+            status TEXT DEFAULT 'staked',
+            source TEXT DEFAULT 'scramble',
+            play_pos INTEGER,
+            last_cycle INTEGER DEFAULT 0,
+            out_order INTEGER
+        )
+        """)
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_eliminations_one_open_per_chat "
+            "ON eliminations (chat_id) WHERE status IN ('lobby', 'active')"
+        )
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_elimination_players_unique "
+            "ON elimination_players (elimination_id, user_id)"
+        )
+
+        # ---- /support (Telegram Stars) -------------------------------------
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS support_payments (
+            charge_id TEXT PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            name TEXT,
+            stars INTEGER NOT NULL,
+            paid_at TEXT
+        )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_support_payments_user ON support_payments (user_id)")
 
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS premium_users (
@@ -763,7 +823,7 @@ def award_global_coins(user_id, name, amount):
         increment_stat("total_rewards_given", amount)
 
 
-def claim_daily_reward(user_id, name, username=None):
+def claim_daily_reward(user_id, name, username=None, premium=False):
     conn = connect()
     try:
         cursor = conn.cursor()
@@ -784,7 +844,10 @@ def claim_daily_reward(user_id, name, username=None):
     finally:
         conn.close()
 
-    amount = int(get_config("reward_daily", DAILY_REWARD))
+    if premium:
+        amount = int(get_config("reward_daily_premium", DAILY_REWARD_PREMIUM))
+    else:
+        amount = int(get_config("reward_daily", DAILY_REWARD))
     award_global_coins(user_id, name, amount)
     log_daily_claim(user_id, name, username, amount)
     return True, get_combined_balance(user_id)
@@ -1989,6 +2052,65 @@ def _tx_credit(cursor, user_id, name, amount):
     return cursor.fetchone()[0]
 
 
+def _tx_deduct_global(cursor, user_id, name, amount):
+    """Same as _tx_deduct but against the Word Game (global_scores) balance."""
+    cursor.execute("""
+        UPDATE global_scores
+        SET coins = coins - %s, name = %s
+        WHERE user_id = %s AND coins >= %s
+        RETURNING coins
+    """, (amount, name, user_id, amount))
+    row = cursor.fetchone()
+    return row[0] if row else None
+
+
+def _tx_credit_global(cursor, user_id, name, amount):
+    cursor.execute("""
+        INSERT INTO global_scores (user_id, name, coins)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (user_id) DO UPDATE SET
+            coins = global_scores.coins + EXCLUDED.coins,
+            name = EXCLUDED.name
+        RETURNING coins
+    """, (user_id, name, amount))
+    return cursor.fetchone()[0]
+
+
+def _tx_deduct_any(cursor, user_id, name, amount):
+    """Takes `amount` from whichever balance covers it: the Word Scramble
+    balance first (the old behaviour), then the Word Game (global) balance.
+    Never goes negative and never splits a fee across both.
+    Returns (new_balance, source) or (None, None)."""
+    bal = _tx_deduct(cursor, user_id, name, amount)
+    if bal is not None:
+        return bal, "scramble"
+    bal = _tx_deduct_global(cursor, user_id, name, amount)
+    if bal is not None:
+        return bal, "global"
+    return None, None
+
+
+def _tx_credit_source(cursor, user_id, name, amount, source):
+    """Refund helper: puts money back into the balance it was taken from."""
+    if source == "global":
+        return _tx_credit_global(cursor, user_id, name, amount)
+    return _tx_credit(cursor, user_id, name, amount)
+
+
+def _tx_credit_chat_scramble(cursor, user_id, chat_id, name, amount):
+    """Registers winnings for ONE group's 'in this chat' Word Scramble board
+    (scramble_chat_stats) only - the global balance is credited separately by
+    the caller, so nothing is double counted."""
+    cursor.execute("""
+        INSERT INTO scramble_chat_stats
+            (user_id, chat_id, name, wins, earned, current_streak, best_streak)
+        VALUES (%s, %s, %s, 0, GREATEST(0, %s), 0, 0)
+        ON CONFLICT (user_id, chat_id) DO UPDATE SET
+            earned = GREATEST(0, scramble_chat_stats.earned + %s),
+            name = EXCLUDED.name
+    """, (user_id, chat_id, name, amount, amount))
+
+
 def scramble_conditional_deduct(user_id, name, amount):
     """Atomically deducts `amount` from the Word Scramble global balance only
     if the balance covers it. Returns the new balance, or None if insufficient
@@ -2004,17 +2126,14 @@ def scramble_conditional_deduct(user_id, name, amount):
 
 
 def tournament_create(chat_id, host_id, host_name, fee, difficulty, total_rounds):
-    """Returns ('ok', tournament_id, host_new_balance) | ('exists', None, None)
-    | ('insufficient', None, None). Deduct + tournament row + host player row
-    are one transaction."""
+    """Returns ('ok', tournament_id, None) | ('exists', None, None).
+    The lobby opens EMPTY: the host is not joined and is not charged - they
+    join with /join like everyone else."""
     conn = connect()
     try:
         cursor = conn.cursor()
         try:
-            new_balance = _tx_deduct(cursor, host_id, host_name, fee)
-            if new_balance is None:
-                conn.rollback()
-                return "insufficient", None, None
+            new_balance = None
 
             cursor.execute("""
                 INSERT INTO tournaments (chat_id, host_id, fee, difficulty, total_rounds,
@@ -2030,11 +2149,6 @@ def tournament_create(chat_id, host_id, host_name, fee, difficulty, total_rounds
                 conn.rollback()
                 return "exists", None, None
             tid = row[0]
-
-            cursor.execute("""
-                INSERT INTO tournament_players (tournament_id, user_id, name, score, status)
-                VALUES (%s, %s, %s, 0, 'staked')
-            """, (tid, host_id, host_name))
             conn.commit()
             return "ok", tid, new_balance
         except Exception as e:
@@ -2068,15 +2182,15 @@ def tournament_join(tournament_id, user_id, name):
                 conn.rollback()
                 return "already", None
 
-            new_balance = _tx_deduct(cursor, user_id, name, fee)
+            new_balance, source = _tx_deduct_any(cursor, user_id, name, fee)
             if new_balance is None:
                 conn.rollback()
                 return "insufficient", None
 
             cursor.execute("""
-                INSERT INTO tournament_players (tournament_id, user_id, name, score, status)
-                VALUES (%s, %s, %s, 0, 'staked')
-            """, (tournament_id, user_id, name))
+                INSERT INTO tournament_players (tournament_id, user_id, name, score, status, source)
+                VALUES (%s, %s, %s, 0, 'staked', %s)
+            """, (tournament_id, user_id, name, source))
             conn.commit()
             return "ok", new_balance
         except Exception as e:
@@ -2302,10 +2416,12 @@ def tournament_settle(tournament_id):
             _status, fee, chat_id = trow
 
             cursor.execute("""
-                SELECT user_id, name, score FROM tournament_players
+                SELECT user_id, name, score, COALESCE(source, 'scramble') FROM tournament_players
                 WHERE tournament_id=%s AND status='staked' ORDER BY id ASC
             """, (tournament_id,))
             players = cursor.fetchall()
+            _sources = {p[0]: p[3] for p in players}
+            players = [(p[0], p[1], p[2]) for p in players]
             if not players:
                 cursor.execute("UPDATE tournaments SET status='finished', current_word=NULL WHERE id=%s", (tournament_id,))
                 conn.commit()
@@ -2331,7 +2447,7 @@ def tournament_settle(tournament_id):
                 case = "refund"
                 for uid, name, _score in players:
                     if _mark(uid, "refunded"):
-                        refunds.append((uid, name, fee, _tx_credit(cursor, uid, name, fee)))
+                        refunds.append((uid, name, fee, _tx_credit_source(cursor, uid, name, fee, _sources.get(uid))))
             else:
                 top_players = [p for p in players if p[2] == top]  # already in join order
                 case = "single" if len(top_players) == 1 else "tie"
@@ -2340,6 +2456,8 @@ def tournament_settle(tournament_id):
                     payout = share + (remainder if i == 0 else 0)  # remainder -> earliest joiner
                     if _mark(uid, "won"):
                         winners.append((uid, name, payout, _tx_credit(cursor, uid, name, payout)))
+                        # Winnings also count for THIS group's "in this chat" board.
+                        _tx_credit_chat_scramble(cursor, uid, chat_id, name, payout)
                 for uid, name, score in players:
                     if score != top:
                         _mark(uid, "lost")
@@ -2380,17 +2498,17 @@ def tournament_abort(tournament_id, delete=False):
             _status, fee, chat_id = trow
 
             cursor.execute("""
-                SELECT user_id, name FROM tournament_players
+                SELECT user_id, name, COALESCE(source, 'scramble') FROM tournament_players
                 WHERE tournament_id=%s AND status='staked' ORDER BY id ASC
             """, (tournament_id,))
             refunds = []
-            for uid, name in cursor.fetchall():
+            for uid, name, source in cursor.fetchall():
                 cursor.execute("""
                     UPDATE tournament_players SET status='refunded'
                     WHERE tournament_id=%s AND user_id=%s AND status='staked'
                 """, (tournament_id, uid))
                 if cursor.rowcount == 1:
-                    refunds.append((uid, name, fee, _tx_credit(cursor, uid, name, fee)))
+                    refunds.append((uid, name, fee, _tx_credit_source(cursor, uid, name, fee, source)))
 
             if delete:
                 cursor.execute("DELETE FROM tournament_players WHERE tournament_id=%s", (tournament_id,))
@@ -4387,5 +4505,592 @@ def create_rewarded_invite_direct(chat_id, group_title, user_id, user_name, memb
         row = cursor.fetchone()
         conn.commit()
         return row[0] if row else None
+    finally:
+        conn.close()
+
+# =======================================================================
+# ELIMINATION (word-scramble elimination game)
+# Same safety model as the tournament: every money movement happens in the
+# same transaction as the status change that guards it.
+# =======================================================================
+
+_ELIM_COLS = (
+    "id, chat_id, host_id, fee, difficulty, start_countdown, current_countdown, status, "
+    "cycle_no, current_player_id, current_word, current_scrambled, turn_started_at, "
+    "turn_seconds, created_at, lobby_message_id, idle_since"
+)
+_ELIM_KEYS = [c.strip() for c in _ELIM_COLS.split(",")]
+
+
+def _elim_row(row):
+    return dict(zip(_ELIM_KEYS, row)) if row else None
+
+
+def elim_create(chat_id, host_id, fee, difficulty, countdown):
+    """Returns ('ok', elimination_id) | ('exists', None). The lobby opens empty."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                INSERT INTO eliminations (chat_id, host_id, fee, difficulty, start_countdown,
+                                          current_countdown, status, cycle_no, created_at)
+                SELECT %s, %s, %s, %s, %s, %s, 'lobby', 1, %s
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM eliminations WHERE chat_id=%s AND status IN ('lobby', 'active')
+                )
+                RETURNING id
+            """, (chat_id, host_id, fee, difficulty, countdown, countdown,
+                  datetime.now().isoformat(), chat_id))
+            row = cursor.fetchone()
+            if not row:
+                conn.rollback()
+                return "exists", None
+            conn.commit()
+            return "ok", row[0]
+        except Exception as e:
+            conn.rollback()
+            if getattr(e, "pgcode", None) == "23505":
+                return "exists", None
+            raise
+    finally:
+        conn.close()
+
+
+def elim_get(elimination_id):
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT {_ELIM_COLS} FROM eliminations WHERE id=%s", (elimination_id,))
+        return _elim_row(cursor.fetchone())
+    finally:
+        conn.close()
+
+
+def elim_get_open_for_chat(chat_id):
+    """The chat's lobby/active elimination (at most one), or None."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"SELECT {_ELIM_COLS} FROM eliminations WHERE chat_id=%s AND status IN ('lobby', 'active')",
+            (chat_id,),
+        )
+        return _elim_row(cursor.fetchone())
+    finally:
+        conn.close()
+
+
+def elim_get_all_open():
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT {_ELIM_COLS} FROM eliminations WHERE status IN ('lobby', 'active')")
+        return [_elim_row(r) for r in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+def elim_get_players(elimination_id):
+    """Join order. Rows: (user_id, name, status, play_pos, last_cycle)."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT user_id, name, status, play_pos, last_cycle FROM elimination_players
+            WHERE elimination_id=%s ORDER BY id ASC
+        """, (elimination_id,))
+        return cursor.fetchall()
+    finally:
+        conn.close()
+
+
+def elim_set_lobby_message(elimination_id, message_id):
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE eliminations SET lobby_message_id=%s WHERE id=%s", (message_id, elimination_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def elim_join(elimination_id, user_id, name):
+    """Returns ('ok', source, player_count) | ('closed', None, None)
+    | ('already', None, None) | ('insufficient', None, None). The fee comes
+    from whichever balance covers it (Scramble first, then Word Game)."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT status, fee FROM eliminations WHERE id=%s FOR UPDATE", (elimination_id,))
+            row = cursor.fetchone()
+            if not row or row[0] != "lobby":
+                conn.rollback()
+                return "closed", None, None
+            fee = row[1]
+
+            cursor.execute(
+                "SELECT 1 FROM elimination_players WHERE elimination_id=%s AND user_id=%s",
+                (elimination_id, user_id),
+            )
+            if cursor.fetchone():
+                conn.rollback()
+                return "already", None, None
+
+            new_balance, source = _tx_deduct_any(cursor, user_id, name, fee)
+            if new_balance is None:
+                conn.rollback()
+                return "insufficient", None, None
+
+            cursor.execute("""
+                INSERT INTO elimination_players (elimination_id, user_id, name, status, source, last_cycle)
+                VALUES (%s, %s, %s, 'staked', %s, 0)
+            """, (elimination_id, user_id, name, source))
+            cursor.execute(
+                "SELECT COUNT(*) FROM elimination_players WHERE elimination_id=%s", (elimination_id,)
+            )
+            count = cursor.fetchone()[0]
+            conn.commit()
+            return "ok", source, count
+        except Exception as e:
+            conn.rollback()
+            if getattr(e, "pgcode", None) == "23505":
+                return "already", None, None
+            raise
+    finally:
+        conn.close()
+
+
+def elim_activate(elimination_id, ordered_user_ids):
+    """lobby -> active, exactly once. `ordered_user_ids` is the (already
+    shuffled) play order, stored as play_pos. Needs 2+ staked players."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT status FROM eliminations WHERE id=%s FOR UPDATE", (elimination_id,))
+            row = cursor.fetchone()
+            if not row or row[0] != "lobby":
+                conn.rollback()
+                return False
+            cursor.execute(
+                "SELECT COUNT(*) FROM elimination_players WHERE elimination_id=%s AND status='staked'",
+                (elimination_id,),
+            )
+            if cursor.fetchone()[0] < 2:
+                conn.rollback()
+                return False
+            for pos, uid in enumerate(ordered_user_ids, start=1):
+                cursor.execute("""
+                    UPDATE elimination_players SET play_pos=%s, last_cycle=0
+                    WHERE elimination_id=%s AND user_id=%s AND status='staked'
+                """, (pos, elimination_id, uid))
+            cursor.execute("""
+                UPDATE eliminations
+                SET status='active', cycle_no=1, current_countdown=start_countdown,
+                    current_word=NULL, current_scrambled=NULL, current_player_id=NULL,
+                    idle_since=%s
+                WHERE id=%s
+            """, (datetime.now().isoformat(), elimination_id))
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+    finally:
+        conn.close()
+
+
+def elim_next_turn(elimination_id):
+    """Decides who plays next. Every alive player gets one turn per cycle (in
+    the fixed shuffled order) BEFORE the countdown drops.
+    Returns one of:
+      {'kind': 'none'}  - not an active game
+      {'kind': 'busy'}  - a turn is already live
+      {'kind': 'over'}  - 1 (or 0) players left
+      {'kind': 'turn', 'uid', 'name', 'countdown', 'cycle_no',
+       'cycle_changed': bool, 'prev_countdown': int|None}"""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT status, cycle_no, current_countdown, current_word
+                FROM eliminations WHERE id=%s FOR UPDATE
+            """, (elimination_id,))
+            row = cursor.fetchone()
+            if not row or row[0] != "active":
+                conn.rollback()
+                return {"kind": "none"}
+            _status, cycle_no, countdown, current_word = row
+            if current_word is not None:
+                conn.rollback()
+                return {"kind": "busy"}
+
+            cursor.execute("""
+                SELECT user_id, name, last_cycle FROM elimination_players
+                WHERE elimination_id=%s AND status='staked' ORDER BY play_pos ASC, id ASC
+            """, (elimination_id,))
+            alive = cursor.fetchall()
+            if len(alive) <= 1:
+                conn.rollback()
+                return {"kind": "over"}
+
+            nxt = next((a for a in alive if (a[2] or 0) < cycle_no), None)
+            cycle_changed, prev = False, None
+            if nxt is None:
+                prev = countdown
+                countdown = max(2, (prev + 1) // 2)  # halves round UP, floor of 2s
+                cycle_no += 1
+                cycle_changed = True
+                cursor.execute(
+                    "UPDATE eliminations SET current_countdown=%s, cycle_no=%s WHERE id=%s",
+                    (countdown, cycle_no, elimination_id),
+                )
+                nxt = alive[0]
+            conn.commit()
+            return {"kind": "turn", "uid": nxt[0], "name": nxt[1], "countdown": countdown,
+                    "cycle_no": cycle_no, "cycle_changed": cycle_changed, "prev_countdown": prev}
+        except Exception:
+            conn.rollback()
+            raise
+    finally:
+        conn.close()
+
+
+def elim_set_turn(elimination_id, user_id, word, scrambled, seconds):
+    """Starts the live turn. Returns the turn_started_at string, or None if the
+    game isn't active / a turn is already live."""
+    now = datetime.now().isoformat()
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                UPDATE eliminations
+                SET current_player_id=%s, current_word=%s, current_scrambled=%s,
+                    turn_started_at=%s, turn_seconds=%s
+                WHERE id=%s AND status='active' AND current_word IS NULL
+                RETURNING cycle_no
+            """, (user_id, word, scrambled, now, seconds, elimination_id))
+            row = cursor.fetchone()
+            if not row:
+                conn.rollback()
+                return None
+            cursor.execute("""
+                UPDATE elimination_players SET last_cycle=%s
+                WHERE elimination_id=%s AND user_id=%s
+            """, (row[0], elimination_id, user_id))
+            conn.commit()
+            return now
+        except Exception:
+            conn.rollback()
+            raise
+    finally:
+        conn.close()
+
+
+def elim_unset_turn(elimination_id, user_id):
+    """Rolls a turn back (e.g. the word message could not be delivered) so the
+    player is not skipped for this cycle."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE eliminations
+            SET current_word=NULL, current_scrambled=NULL, current_player_id=NULL,
+                idle_since=%s
+            WHERE id=%s AND status='active'
+        """, (datetime.now().isoformat(), elimination_id))
+        cursor.execute("""
+            UPDATE elimination_players SET last_cycle=GREATEST(0, COALESCE(last_cycle, 0) - 1)
+            WHERE elimination_id=%s AND user_id=%s
+        """, (elimination_id, user_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def elim_resolve_turn(elimination_id, correct, expected_uid=None, expected_started=None):
+    """Atomically closes the live turn - exactly one caller (correct guess OR
+    the timeout) can ever win this. A wrong/timed-out player becomes 'out'.
+    Returns {'word', 'uid', 'name', 'alive': [(uid, name)], 'cycle_no'} or None
+    if there was no live turn (or it was already closed / belongs to someone
+    else / is a newer turn than the timer that fired)."""
+    now = datetime.now().isoformat()
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT status, current_player_id, current_word, cycle_no, turn_started_at
+                FROM eliminations WHERE id=%s FOR UPDATE
+            """, (elimination_id,))
+            row = cursor.fetchone()
+            if not row or row[0] != "active" or row[2] is None:
+                conn.rollback()
+                return None
+            _status, uid, word, cycle_no, started = row
+            if expected_uid is not None and uid != expected_uid:
+                conn.rollback()
+                return None
+            if expected_started is not None and started != expected_started:
+                conn.rollback()
+                return None
+
+            cursor.execute("""
+                UPDATE eliminations
+                SET current_word=NULL, current_scrambled=NULL, current_player_id=NULL, idle_since=%s
+                WHERE id=%s
+            """, (now, elimination_id))
+            cursor.execute(
+                "SELECT name FROM elimination_players WHERE elimination_id=%s AND user_id=%s",
+                (elimination_id, uid),
+            )
+            nrow = cursor.fetchone()
+            name = nrow[0] if nrow else str(uid)
+            if not correct:
+                cursor.execute(
+                    "SELECT COALESCE(MAX(out_order), 0) + 1 FROM elimination_players WHERE elimination_id=%s",
+                    (elimination_id,),
+                )
+                order = cursor.fetchone()[0]
+                cursor.execute("""
+                    UPDATE elimination_players SET status='out', out_order=%s
+                    WHERE elimination_id=%s AND user_id=%s AND status='staked'
+                """, (order, elimination_id, uid))
+            cursor.execute("""
+                SELECT user_id, name FROM elimination_players
+                WHERE elimination_id=%s AND status='staked' ORDER BY play_pos ASC, id ASC
+            """, (elimination_id,))
+            alive = cursor.fetchall()
+            conn.commit()
+            return {"word": word, "uid": uid, "name": name, "alive": alive, "cycle_no": cycle_no}
+        except Exception:
+            conn.rollback()
+            raise
+    finally:
+        conn.close()
+
+
+def elim_restart_turn_clock(elimination_id):
+    """Gives the live turn a fresh full countdown WITHOUT changing the word or
+    the player (used after a restart / by /resumeelimination). Returns the new
+    turn_started_at or None if there is no live turn."""
+    now = datetime.now().isoformat()
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE eliminations SET turn_started_at=%s
+            WHERE id=%s AND status='active' AND current_word IS NOT NULL
+            RETURNING id
+        """, (now, elimination_id))
+        ok = cursor.fetchone() is not None
+        conn.commit()
+        return now if ok else None
+    finally:
+        conn.close()
+
+
+def elim_mark_idle(elimination_id):
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE eliminations SET idle_since=%s WHERE id=%s AND status='active'",
+            (datetime.now().isoformat(), elimination_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def elim_settle(elimination_id):
+    """Ends an ACTIVE game with <=1 player left and pays the whole prize pool
+    (fee x (players + 1): the bonus is the bot's, not a player's money) to the
+    winner. If nobody is left alive, the LAST player eliminated wins.
+    Idempotent. Returns {chat_id, fee, pot, winner: (uid, name), balance} or None."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT status, fee, chat_id FROM eliminations WHERE id=%s FOR UPDATE", (elimination_id,)
+            )
+            row = cursor.fetchone()
+            if not row or row[0] != "active":
+                conn.rollback()
+                return None
+            _status, fee, chat_id = row
+
+            cursor.execute("""
+                SELECT user_id, name FROM elimination_players
+                WHERE elimination_id=%s AND status='staked' ORDER BY play_pos ASC, id ASC
+            """, (elimination_id,))
+            alive = cursor.fetchall()
+            if len(alive) >= 2:
+                conn.rollback()
+                return None
+
+            cursor.execute("""
+                SELECT COUNT(*) FROM elimination_players
+                WHERE elimination_id=%s AND status IN ('staked', 'out')
+            """, (elimination_id,))
+            total = cursor.fetchone()[0]
+            pot = fee * (total + 1)
+
+            if alive:
+                winner = alive[0]
+            else:
+                cursor.execute("""
+                    SELECT user_id, name FROM elimination_players
+                    WHERE elimination_id=%s AND status='out'
+                    ORDER BY out_order DESC NULLS LAST LIMIT 1
+                """, (elimination_id,))
+                winner = cursor.fetchone()
+                if not winner:
+                    cursor.execute("UPDATE eliminations SET status='finished' WHERE id=%s", (elimination_id,))
+                    conn.commit()
+                    return None
+
+            uid, name = winner
+            cursor.execute("""
+                UPDATE elimination_players SET status='won'
+                WHERE elimination_id=%s AND user_id=%s
+            """, (elimination_id, uid))
+            balance = _tx_credit(cursor, uid, name, pot)
+            _tx_credit_chat_scramble(cursor, uid, chat_id, name, pot)
+            cursor.execute("""
+                UPDATE eliminations
+                SET status='finished', current_word=NULL, current_scrambled=NULL, current_player_id=NULL
+                WHERE id=%s
+            """, (elimination_id,))
+            conn.commit()
+            return {"chat_id": chat_id, "fee": fee, "pot": pot, "winner": (uid, name), "balance": balance}
+        except Exception:
+            conn.rollback()
+            raise
+    finally:
+        conn.close()
+
+
+def elim_cancel(elimination_id):
+    """Cancels a lobby/active game and refunds EVERY player's join fee (even
+    those already eliminated) to the balance it came from. The first-player
+    bonus was never real money, so it simply disappears. Idempotent.
+    Returns {chat_id, fee, refunds: [(uid, name, fee, new_balance)]} or None."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT status, fee, chat_id FROM eliminations WHERE id=%s FOR UPDATE", (elimination_id,)
+            )
+            row = cursor.fetchone()
+            if not row or row[0] not in ("lobby", "active"):
+                conn.rollback()
+                return None
+            _status, fee, chat_id = row
+
+            cursor.execute("""
+                SELECT user_id, name, COALESCE(source, 'scramble') FROM elimination_players
+                WHERE elimination_id=%s AND status IN ('staked', 'out') ORDER BY id ASC
+            """, (elimination_id,))
+            refunds = []
+            for uid, name, source in cursor.fetchall():
+                cursor.execute("""
+                    UPDATE elimination_players SET status='refunded'
+                    WHERE elimination_id=%s AND user_id=%s AND status IN ('staked', 'out')
+                """, (elimination_id, uid))
+                if cursor.rowcount == 1:
+                    refunds.append((uid, name, fee, _tx_credit_source(cursor, uid, name, fee, source)))
+
+            cursor.execute("""
+                UPDATE eliminations
+                SET status='cancelled', current_word=NULL, current_scrambled=NULL, current_player_id=NULL
+                WHERE id=%s
+            """, (elimination_id,))
+            conn.commit()
+            return {"chat_id": chat_id, "fee": fee, "refunds": refunds}
+        except Exception:
+            conn.rollback()
+            raise
+    finally:
+        conn.close()
+
+
+# =======================================================================
+# /support (Telegram Stars)
+# =======================================================================
+
+def support_record(charge_id, user_id, name, stars):
+    """Stores one support payment. Returns False if this charge was already
+    recorded (a redelivered successful_payment), True otherwise."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO support_payments (charge_id, user_id, name, stars, paid_at)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (charge_id) DO NOTHING
+            RETURNING charge_id
+        """, (charge_id, user_id, name, stars, datetime.now().isoformat()))
+        inserted = cursor.fetchone() is not None
+        conn.commit()
+        return inserted
+    finally:
+        conn.close()
+
+
+def support_get_user(user_id):
+    """(total_stars, contributions) for one user."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT COALESCE(SUM(stars), 0), COUNT(*) FROM support_payments WHERE user_id=%s", (user_id,)
+        )
+        row = cursor.fetchone()
+        return (row[0] or 0, row[1] or 0)
+    finally:
+        conn.close()
+
+
+def support_leaderboard(limit=10):
+    """[(user_id, latest_name, total_stars, contributions)], biggest first."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT user_id,
+                   (ARRAY_AGG(name ORDER BY paid_at DESC))[1] AS name,
+                   SUM(stars) AS total, COUNT(*) AS n
+            FROM support_payments
+            GROUP BY user_id
+            ORDER BY total DESC, MIN(paid_at) ASC
+            LIMIT %s
+        """, (limit,))
+        return cursor.fetchall()
+    finally:
+        conn.close()
+
+
+def support_stats(latest=5):
+    """{'total_stars', 'supporters', 'contributions', 'latest': [(user_id, name, stars, paid_at)]}"""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT COALESCE(SUM(stars), 0), COUNT(DISTINCT user_id), COUNT(*) FROM support_payments"
+        )
+        total, supporters, contributions = cursor.fetchone()
+        cursor.execute("""
+            SELECT user_id, name, stars, paid_at FROM support_payments
+            ORDER BY paid_at DESC LIMIT %s
+        """, (latest,))
+        return {"total_stars": total or 0, "supporters": supporters or 0,
+                "contributions": contributions or 0, "latest": cursor.fetchall()}
     finally:
         conn.close()
