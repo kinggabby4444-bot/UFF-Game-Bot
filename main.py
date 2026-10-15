@@ -1862,6 +1862,7 @@ def _scrambleallcommands_text() -> str:
 /playgame - groups only: pick Normal Mode, Slow Mode, Automatic Mode or Tournament and start it with one tap
 /elimination - quick-start an Elimination: same as /setelimination 10 easy 60s (the host is not joined automatically - use /join)
 /setelimination &lt;fee&gt; &lt;difficulty&gt; &lt;countdown&gt;s - start an Elimination lobby (e.g. /setelimination 100 easy 20s); fee 10 or more; players take turns, the timer halves every cycle, the last player standing wins the whole prize
+/startelimination - the host who opened the lobby or the bot owner: start the open Elimination right now instead of waiting for the 2-minute lobby
 /resumeelimination - anyone can use it: continue a hung Elimination from the exact place it stopped
 /support - support the bot with Telegram Stars (quick amounts or a custom amount; gives no in-game advantage; used in a group it moves you to my DM)
 /supporters - the top supporters leaderboard
@@ -6913,6 +6914,7 @@ def _allcommands_text() -> str:
 /playgame - groups only: pick Normal Mode, Slow Mode, Automatic Mode or Tournament and start it with one tap
 /elimination - quick-start an Elimination: same as /setelimination 10 easy 60s (the host is not joined automatically - use /join)
 /setelimination &lt;fee&gt; &lt;difficulty&gt; &lt;countdown&gt;s - start an Elimination lobby (e.g. /setelimination 100 easy 20s); fee 10 or more; players take turns, the timer halves every cycle, the last player standing wins the whole prize
+/startelimination - the host who opened the lobby or the bot owner: start the open Elimination right now instead of waiting for the 2-minute lobby
 /resumeelimination - anyone can use it: continue a hung Elimination from the exact place it stopped
 /support - support the bot with Telegram Stars (quick amounts or a custom amount; gives no in-game advantage; used in a group it moves you to my DM)
 /supporters - the top supporters leaderboard
@@ -8442,6 +8444,11 @@ _ELIM_CHATS = set()  # chats with an open elimination (so group messages cost no
 _ELIM_LOCKS = defaultdict(asyncio.Lock)
 
 
+def _elim_mention(uid, name) -> str:
+    """Blue, tappable name that opens the player's profile."""
+    return f'<a href="tg://user?id={uid}">{esc_name(name)}</a>'
+
+
 def _elim_lobby_job_name(eid):
     return f"elim_lobby_{eid}"
 
@@ -8514,17 +8521,17 @@ def elimination_lobby_text(e, players) -> str:
     lines.append(f"🎯 Difficulty: {esc(e['difficulty'] or 'off')}")
     lines.append(f"⏱️ Starting countdown: {e['start_countdown']}s")
     if players:
-        names = ", ".join(esc_name(p[1]) for p in players)
+        names = ", ".join(_elim_mention(p[0], p[1]) for p in players)
         lines.append(f"👥 Players ({len(players)}): {names}")
     lines += ["", "Use /join to join!"]
     return "\n".join(lines)
 
 
-def _elim_turn_text(name, seconds, scrambled, header=None) -> str:
+def _elim_turn_text(uid, name, seconds, scrambled, header=None) -> str:
     body = (
-        f"👉 {esc_name(name)}, your turn!\n"
+        f"👉 {_elim_mention(uid, name)}, your turn!\n"
         f"Unscramble the word in {seconds}s\n\n"
-        f"<b>{esc(str(scrambled).upper())}</b>"
+        f"<b>{esc(str(scrambled))}</b>"
     )
     return f"{header}\n\n{body}" if header else body
 
@@ -8550,8 +8557,8 @@ def _elim_peek_next_name(e, players):
                    key=lambda p: p[3] if p[3] is not None else 10 ** 9)
     for p in alive:
         if (p[4] or 0) < e["cycle_no"]:
-            return p[1]
-    return alive[0][1] if alive else None
+            return p[0], p[1]
+    return (alive[0][0], alive[0][1]) if alive else None
 
 
 async def _elim_post_lobby(context, eid):
@@ -8675,7 +8682,7 @@ async def _elimination_join(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         await _elim_post_lobby(context, e["id"])  # edits the lobby message: prize + player list
         await safe_send(
             context.bot, chat.id,
-            text=f"✅ {esc_name(user.first_name)} joined",
+            text=f"✅ {_elim_mention(user.id, user.first_name)} joined",
             parse_mode="HTML",
         )
 
@@ -8716,7 +8723,7 @@ async def _elim_start(context, eid):
     names = {p[0]: p[1] for p in staked}
 
     lines = ["🔥 <b>ELIMINATION STARTS!</b> 🔥", "👥 Play order:"]
-    lines += [f"{i}. {esc_name(names[uid])}" for i, uid in enumerate(order, start=1)]
+    lines += [f"{i}. {_elim_mention(uid, names[uid])}" for i, uid in enumerate(order, start=1)]
     lines.append(f"💰 Prize pool: {DOLLAR}{fmt_coins(e['fee'] * (len(staked) + 1))}")
     lines.append(f"⏱️ Round 1 countdown: {e['start_countdown']}s")
     try:
@@ -8768,6 +8775,11 @@ async def _elim_run_next_locked(context, eid):
         return
 
     scrambled = scramble_letters(word)
+    # Same pattern as the game difficulty: letters keep the word's own capital
+    # (only the first letter of the word is capital); "x" modes show lowercase
+    # so a capital can't reveal the first letter.
+    if _split_difficulty_label(e["difficulty"])[1]:
+        scrambled = scrambled.lower()
     started = await asyncio.to_thread(
         db.elim_set_turn, eid, info["uid"], word, scrambled, info["countdown"]
     )
@@ -8778,7 +8790,7 @@ async def _elim_run_next_locked(context, eid):
     try:
         sent = await safe_send(
             context.bot, chat_id,
-            text=_elim_turn_text(info["name"], info["countdown"], scrambled),
+            text=_elim_turn_text(info["uid"], info["name"], info["countdown"], scrambled),
             parse_mode="HTML",
         )
     except Exception as ex:
@@ -8827,13 +8839,13 @@ async def elim_turn_timeout_callback(context: ContextTypes.DEFAULT_TYPE):
             return  # answered in time, stopped, or this timer belongs to an older turn
         e = await asyncio.to_thread(db.elim_get, eid)
         chat_id = e["chat_id"] if e else getattr(context.job, "chat_id", None)
-        still = ", ".join(esc_name(n) for _u, n in res["alive"])
+        still = ", ".join(_elim_mention(u, n) for u, n in res["alive"])
         try:
             await safe_send(
                 context.bot, chat_id,
                 text=(
-                    f"⏰ Time's up! {esc_name(res['name'])} is ELIMINATED ❌\n"
-                    f"(The word was {esc(res['word'].upper())})\n"
+                    f"⏰ Time's up! {_elim_mention(res['uid'], res['name'])} is ELIMINATED ❌\n"
+                    f"(The word was {esc(res['word'])})\n"
                     f"👥 Still in: {still}"
                 ),
                 parse_mode="HTML",
@@ -8890,9 +8902,9 @@ async def elimination_handle_guess(update: Update, context: ContextTypes.DEFAULT
         e2 = await asyncio.to_thread(db.elim_get, e["id"])
         players = await asyncio.to_thread(db.elim_get_players, e["id"])
         nxt = _elim_peek_next_name(e2, players) if e2 else None
-        text = f"✅ {esc_name(res['name'])} got it right! ({esc(res['word'].upper())})"
+        text = f"✅ {_elim_mention(res['uid'], res['name'])} got it right! ({esc(res['word'])})"
         if nxt:
-            text += f" Next up: {esc_name(nxt)}"
+            text += f" Next up: {_elim_mention(nxt[0], nxt[1])}"
         await safe_send(context.bot, chat.id, text=text, parse_mode="HTML")
     except Exception:
         logger.exception(f"elimination {e['id']}: correct-answer announcement failed; continuing anyway")
@@ -8913,11 +8925,11 @@ async def _elim_finish(context, eid):
     if not res:
         return
     _ELIM_CHATS.discard(res["chat_id"])
-    _uid, name = res["winner"]
+    w_uid, name = res["winner"]
     text = (
         "🏆 <b>ELIMINATION OVER</b> 🏆\n\n"
         "Elimination 🔥\n\n"
-        f"👑 Winner: <b>{esc_name(name)}</b> takes the whole prize - {DOLLAR}{fmt_coins(res['pot'])}!\n"
+        f"👑 Winner: <b>{_elim_mention(w_uid, name)}</b> takes the whole prize - {DOLLAR}{fmt_coins(res['pot'])}!\n"
         f"New balance: {DOLLAR}{fmt_coins(res['balance'])}"
     )
     try:
@@ -8943,6 +8955,27 @@ async def _elim_cancel_and_announce(context, eid, headline):
     except Exception as ex:
         logger.info(f"elimination cancel notice to {res['chat_id']} not delivered: {ex}")
     return res
+
+
+async def startelimination_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Starts the open Elimination lobby right now instead of waiting for the
+    120 seconds. Only the host who opened it or the bot owner."""
+    chat = update.effective_chat
+    user = update.effective_user
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await update.message.reply_text("🔥 Run /startelimination inside the group with the open elimination lobby.")
+        return
+    e = await asyncio.to_thread(db.elim_get_open_for_chat, chat.id)
+    if not e:
+        await update.message.reply_text("🔥 There's no elimination lobby open in this group.")
+        return
+    if not (is_owner(user.id) or user.id == e["host_id"]):
+        await update.message.reply_text("🚫 Only the host who opened this elimination or the bot owner can start it early.")
+        return
+    if e["status"] != "lobby":
+        await update.message.reply_text("🔥 This elimination has already started.")
+        return
+    await _elim_start(context, e["id"])
 
 
 async def stopelimination_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8984,10 +9017,10 @@ def _elim_running_text(e, players=None) -> str:
     if players and e.get("current_player_id"):
         for p in players:
             if p[0] == e["current_player_id"]:
-                name = p[1]
+                name = _elim_mention(p[0], p[1])
                 break
     if name:
-        return f"▶️ The Elimination is running normally - it's {esc_name(name)}'s turn."
+        return f"▶️ The Elimination is running normally - it's {name}'s turn."
     return "▶️ The Elimination is running normally - the next turn is about to start."
 
 
@@ -9042,7 +9075,7 @@ async def _elim_resume_one(context, e, force=False, header=None):
                 sent = await safe_send(
                     context.bot, chat_id,
                     text=_elim_turn_text(
-                        pname, secs, e["current_scrambled"],
+                        e["current_player_id"], pname, secs, e["current_scrambled"],
                         header=header or "▶️ <b>Elimination resumed!</b>",
                     ),
                     parse_mode="HTML",
@@ -11102,6 +11135,7 @@ def _fullhelp_tournament_page() -> str:
         f"Players /join (the host is not joined automatically). When the 2-minute lobby closes the play order is shuffled and players take turns one by one; "
         f"fail to unscramble in time and you're out. After everyone has played, the countdown halves (never below 2s). "
         f"Last player standing wins the whole prize: fee × (players + 1). "
+        f"The host (or the bot owner) can send /startelimination to start early. "
         f"If I hang, anyone can send /resumeelimination to continue from the exact place it stopped. "
         f"Not enough players = cancelled and refunded.\n\n"
         f"🛠️ <b>If something goes wrong</b>\n"
@@ -11862,6 +11896,7 @@ def main():
     app.add_handler(CommandHandler("playgame", playgame_command))
     app.add_handler(CommandHandler("elimination", elimination_command))
     app.add_handler(CommandHandler("setelimination", setelimination_command))
+    app.add_handler(CommandHandler("startelimination", startelimination_command))
     app.add_handler(CommandHandler("stopelimination", stopelimination_command))
     app.add_handler(CommandHandler("resumeelimination", resumeelimination_command))
     app.add_handler(CommandHandler("boostrank", boostrank_command))
