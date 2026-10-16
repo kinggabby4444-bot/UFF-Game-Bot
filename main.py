@@ -299,6 +299,46 @@ async def safe_react(bot, chat_id, message_id, emoji):
         logger.debug(f"set_message_reaction failed in {chat_id}: {e}")
 
 
+WINNER_CAPTION_LIMIT = 1024  # Telegram's limit for a photo caption
+
+
+async def send_winner_message(bot, chat_id, text, winner_uid=None, headline=None):
+    """Sends a game's winning message (HTML) with the winner's Telegram
+    profile picture attached. Used by /tournament, /settournament,
+    /elimination, /setelimination and /hack.
+
+    - No winner_uid (e.g. a tie), no profile photo, hidden by privacy, or ANY
+      failure -> the same message goes out as normal text. Never raises
+      because of the photo, and the prize is always paid before this runs.
+    - The text becomes the photo caption when it fits Telegram's 1024
+      characters. If it is longer, the photo carries only `headline` as its
+      caption and the full text follows as a normal message."""
+    file_id = None
+    if winner_uid is not None:
+        try:
+            photos = await bot.get_user_profile_photos(winner_uid, limit=1)
+            if photos and photos.total_count and photos.photos:
+                file_id = photos.photos[0][-1].file_id  # last size = the biggest
+        except Exception as ex:
+            logger.debug(f"winner photo lookup failed for {winner_uid}: {ex}")
+
+    if file_id:
+        photo_sent = False
+        try:
+            if len(text) <= WINNER_CAPTION_LIMIT:
+                await bot.send_photo(chat_id=chat_id, photo=file_id, caption=text, parse_mode="HTML")
+                return True
+            if headline and len(headline) <= WINNER_CAPTION_LIMIT:
+                await bot.send_photo(chat_id=chat_id, photo=file_id, caption=headline, parse_mode="HTML")
+                photo_sent = True
+        except Exception as ex:
+            logger.info(f"winner photo not sent to {chat_id} ({ex}); sending text instead")
+        if photo_sent:
+            return await safe_send(bot, chat_id, text=text, parse_mode="HTML")
+
+    return await safe_send(bot, chat_id, text=text, parse_mode="HTML")
+
+
 def apply_chat_credit_for_global_earning(user_id, name, amount, current_chat=None):
     if current_chat is not None and current_chat.type != ChatType.PRIVATE:
         db.credit_chat_score(user_id, current_chat.id, name, amount)
@@ -1200,6 +1240,8 @@ async def _start_scramble_round_locked(context: ContextTypes.DEFAULT_TYPE, chat)
         return "tournament"
     if chat.type != ChatType.PRIVATE and await asyncio.to_thread(db.elim_get_open_for_chat, chat.id):
         return "tournament"  # an Elimination owns the chat too (same "paused until it ends" handling)
+    if chat.type != ChatType.PRIVATE and await asyncio.to_thread(db.hack_get_open_for_chat, chat.id):
+        return "tournament"  # so does a Hack
 
     if await asyncio.to_thread(db.scramble_get_round, chat.id):
         return False
@@ -1282,6 +1324,12 @@ async def wordscramble_command(update: Update, context: ContextTypes.DEFAULT_TYP
     if await asyncio.to_thread(db.elim_get_open_for_chat, chat.id):
         await update.message.reply_text(
             "🔥 An Elimination is in progress here - Word Scramble rounds are paused until it ends."
+        )
+        return
+
+    if await asyncio.to_thread(db.hack_get_open_for_chat, chat.id):
+        await update.message.reply_text(
+            "💻 A Hack game is in progress here - Word Scramble rounds are paused until it ends."
         )
         return
 
@@ -1856,14 +1904,19 @@ def _scrambleallcommands_text() -> str:
 /request &lt;@username|id&gt; &lt;amount&gt; - premium only: ask another player for 💵; they get Yes/No buttons (or reply to their message with /request &lt;amount&gt;) Nothing is sent if the other player doesn't have that amount.
 /settournament &lt;fee&gt; &lt;difficulty&gt; &lt;rounds&gt;rounds - host a Word Scramble tournament in a group (e.g. /settournament 2000 Medium 3rounds); everyone (the host too, with /join) pays the entry fee from their Word Scramble or Word Game balance and the winner takes the pot
 /tournament - quick-start a tournament instantly: same as /settournament 5 easy 20rounds (the host is not joined automatically - everyone, host included, uses /join)
-/join - join the Tournament or Elimination lobby that's open in this group (the host is NOT joined automatically - they use /join too; the fee comes from your Word Scramble or Word Game balance)
+/join - join the Tournament, Elimination or Hack lobby that's open in this group (the host is NOT joined automatically - they use /join too; the fee comes from your Word Scramble or Word Game balance)
 /daily - claim today's daily reward (works only in my DM; premium members get 💵100, everyone else 💵50)
 /getcash - same as /buycash: premium only, buy 💵 cash with Telegram Stars
-/playgame - groups only: pick Normal Mode, Slow Mode, Automatic Mode or Tournament and start it with one tap
+/playgame - groups only: pick Normal Mode, Slow Mode, Automatic Mode, Tournament, Elimination or Hack and start it with one tap
 /elimination - quick-start an Elimination: same as /setelimination 10 easy 60s (the host is not joined automatically - use /join)
 /setelimination &lt;fee&gt; &lt;difficulty&gt; &lt;countdown&gt;s - start an Elimination lobby (e.g. /setelimination 100 easy 20s); fee 10 or more; players take turns, the timer halves every cycle, the last player standing wins the whole prize
 /startelimination - the host who opened the lobby or the bot owner: start the open Elimination right now instead of waiting for the 2-minute lobby
-/resumeelimination - anyone can use it: continue a hung Elimination from the exact place it stopped
+/resumeelimination - host or bot owner only: continue a hung Elimination from the exact place it stopped
+/hack &lt;fee&gt; &lt;digits&gt; - start a Hack lobby in a group (e.g. /hack 3000 3); fee 10 or more, 3-6 digits; players /join (the host is NOT joined automatically), then race to /guess the hidden number (digits 1-9, all different); the first to crack it wins the whole pool, and if nobody does the bot keeps it
+/guess &lt;number&gt; - joined players only: guess the hidden Hack number (🟩 Hacks = right digit in the right spot, 🟨 Glitches = right digit in the wrong spot); you get 30/35/40/50 guesses for 3/4/5/6 digits
+/starthack - the host who opened the lobby or the bot owner: start the open Hack right now instead of waiting for the 2-minute lobby
+/stophack - the host who opened the Hack or the bot owner: cancel the lobby or running Hack; every other player is refunded (the host's own fee stays with the bot)
+/resumehack - host or bot owner only: continue a stuck Hack from the exact place it stopped
 /support - support the bot with Telegram Stars (quick amounts or a custom amount; gives no in-game advantage; used in a group it moves you to my DM)
 /supporters - the top supporters leaderboard
 /mysupport - your own total support and number of contributions
@@ -1890,7 +1943,7 @@ def _scrambleallcommands_text() -> str:
 /controlgroup automaticmode on|off &lt;group&gt; | slowmode on &lt;time&gt;|off &lt;group&gt; - owner only: remotely control Slow Mode / Automatic Mode in any group (&lt;group&gt; = ID, @username or allgroups)
 /starttournament - tournament host, bot owner or Bot Admins: start the lobby early
 /stoptournament - tournament host, bot owner or Bot Admins: cancel a lobby (or a paused tournament) and refund everyone
-/resumetournament - tournament host, bot owner or Bot Admins: continue a paused or stuck tournament from where it stopped (owner in DM: /resumetournament &lt;group id|@username&gt; or /resumetournament allgroups)
+/resumetournament - host or bot owner only: continue a paused or stuck tournament from where it stopped (owner in DM: /resumetournament &lt;group id|@username&gt; or /resumetournament allgroups)
 /stopelimination - owner only: cancel the running Elimination (lobby or game) and refund every join fee
 /supportstats - owner only: total Stars received, number of supporters and the latest supporters
 /setsupport on|off - owner only: turn /support on or off
@@ -4726,7 +4779,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /hint - see the leader's clues so far
 /stopvote - vote to stop a stuck round (3 votes needed)
 /stopgame - admins can stop a round instantly
-/playgame - (groups) start Normal, Slow, Automatic Mode or a Tournament from one menu
+/playgame - (groups) start Normal, Slow, Automatic Mode, a Tournament, Elimination or Hack from one menu
+/hack &lt;fee&gt; &lt;digits&gt; - (groups) open a Hack lobby: crack the hidden number, the winner takes all (see /fullhelp)
 /daily - claim your daily reward (in my DM)
 /support - support the bot with Telegram Stars
 /leaderboard - this chat's leaderboard
@@ -6908,14 +6962,19 @@ def _allcommands_text() -> str:
 /request &lt;@username|id&gt; &lt;amount&gt; - premium only: ask another player for 💵; they get Yes/No buttons (or reply to their message with /request &lt;amount&gt;) Nothing is sent if the other player doesn't have that amount.
 /settournament &lt;fee&gt; &lt;difficulty&gt; &lt;rounds&gt;rounds - host a Word Scramble tournament in a group (e.g. /settournament 2000 Medium 3rounds); everyone (the host too, with /join) pays the entry fee from their Word Scramble or Word Game balance and the winner takes the pot
 /tournament - quick-start a tournament instantly: same as /settournament 5 easy 20rounds (the host is not joined automatically - everyone, host included, uses /join)
-/join - join the Tournament or Elimination lobby that's open in this group (the host is NOT joined automatically - they use /join too; the fee comes from your Word Scramble or Word Game balance)
+/join - join the Tournament, Elimination or Hack lobby that's open in this group (the host is NOT joined automatically - they use /join too; the fee comes from your Word Scramble or Word Game balance)
 /daily - claim today's daily reward (works only in my DM; premium members get 💵100, everyone else 💵50)
 /getcash - same as /buycash: premium only, buy 💵 cash with Telegram Stars
-/playgame - groups only: pick Normal Mode, Slow Mode, Automatic Mode or Tournament and start it with one tap
+/playgame - groups only: pick Normal Mode, Slow Mode, Automatic Mode, Tournament, Elimination or Hack and start it with one tap
 /elimination - quick-start an Elimination: same as /setelimination 10 easy 60s (the host is not joined automatically - use /join)
 /setelimination &lt;fee&gt; &lt;difficulty&gt; &lt;countdown&gt;s - start an Elimination lobby (e.g. /setelimination 100 easy 20s); fee 10 or more; players take turns, the timer halves every cycle, the last player standing wins the whole prize
 /startelimination - the host who opened the lobby or the bot owner: start the open Elimination right now instead of waiting for the 2-minute lobby
-/resumeelimination - anyone can use it: continue a hung Elimination from the exact place it stopped
+/resumeelimination - host or bot owner only: continue a hung Elimination from the exact place it stopped
+/hack &lt;fee&gt; &lt;digits&gt; - start a Hack lobby in a group (e.g. /hack 3000 3); fee 10 or more, 3-6 digits; players /join (the host is NOT joined automatically), then race to /guess the hidden number (digits 1-9, all different); the first to crack it wins the whole pool, and if nobody does the bot keeps it
+/guess &lt;number&gt; - joined players only: guess the hidden Hack number (🟩 Hacks = right digit in the right spot, 🟨 Glitches = right digit in the wrong spot); you get 30/35/40/50 guesses for 3/4/5/6 digits
+/starthack - the host who opened the lobby or the bot owner: start the open Hack right now instead of waiting for the 2-minute lobby
+/stophack - the host who opened the Hack or the bot owner: cancel the lobby or running Hack; every other player is refunded (the host's own fee stays with the bot)
+/resumehack - host or bot owner only: continue a stuck Hack from the exact place it stopped
 /support - support the bot with Telegram Stars (quick amounts or a custom amount; gives no in-game advantage; used in a group it moves you to my DM)
 /supporters - the top supporters leaderboard
 /mysupport - your own total support and number of contributions
@@ -6955,7 +7014,7 @@ def _allcommands_text() -> str:
 /controlgroup automaticmode on|off &lt;group&gt; | slowmode on &lt;time&gt;|off &lt;group&gt; - owner only: control Word Scramble Slow Mode / Automatic Mode in any group (&lt;group&gt; = ID, @username or allgroups)
 /starttournament - tournament host, bot owner or Bot Admins: start the lobby early
 /stoptournament - tournament host, bot owner or Bot Admins: cancel a lobby (or a paused tournament) and refund everyone
-/resumetournament - tournament host, bot owner or Bot Admins: continue a paused or stuck tournament from where it stopped (owner in DM: /resumetournament &lt;group id|@username&gt; or /resumetournament allgroups)
+/resumetournament - host or bot owner only: continue a paused or stuck tournament from where it stopped (owner in DM: /resumetournament &lt;group id|@username&gt; or /resumetournament allgroups)
 /stopelimination - owner only: cancel the running Elimination (lobby or game) and refund every join fee
 /supportstats - owner only: total Stars received, number of supporters and the latest supporters
 /setsupport on|off - owner only: turn /support on or off
@@ -7211,7 +7270,7 @@ TOURNAMENT_PAUSE_CHECK_SECONDS = 600
 TOURNAMENT_PAUSE_CHECK_JOB_NAME = "tournament_pause_check"
 TOURNAMENT_PAUSED_BLOCK_TEXT = (
     "🏟️ A tournament is paused in this group because of a technical issue - entry fees are safe. "
-    "The host or an admin can send /resumetournament to continue it (or /stoptournament to cancel and refund)."
+    "The host or the bot owner can send /resumetournament to continue it (or /stoptournament to cancel and refund)."
 )
 DAILY_GETCASH_HINT = "Use /daily to claim daily reward or use /getcash to get cash"
 TOURNAMENT_USAGE = (
@@ -7425,6 +7484,9 @@ async def _open_tournament_lobby(update: Update, context: ContextTypes.DEFAULT_T
     if await asyncio.to_thread(db.elim_get_open_for_chat, chat.id):
         await update.message.reply_text("🔥 An elimination is already running (or open for joining) in this group.")
         return
+    if await asyncio.to_thread(db.hack_get_open_for_chat, chat.id):
+        await update.message.reply_text("💻 A hack game is already running (or open for joining) in this group.")
+        return
     if await asyncio.to_thread(db.scramble_get_round, chat.id):
         await update.message.reply_text(
             "🎮 A Word Scramble round is in progress here - wait for it to end before starting a tournament."
@@ -7452,7 +7514,7 @@ async def join_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
 
     if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
-        await update.message.reply_text("🏟️ /join only works inside a group with an open tournament or elimination.")
+        await update.message.reply_text("🏟️ /join only works inside a group with an open tournament, elimination or hack.")
         return
 
     t = await asyncio.to_thread(db.tournament_get_open_for_chat, chat.id)
@@ -7462,8 +7524,12 @@ async def join_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if e and e["status"] == "lobby":
             await _elimination_join(update, context, e)
             return
+        hk = await asyncio.to_thread(db.hack_get_open_for_chat, chat.id)
+        if hk and hk["status"] == "lobby":
+            await _hack_join(update, context, hk)
+            return
         await update.message.reply_text(
-            "🏟️ There's no tournament or elimination open for joining in this group right now."
+            "🏟️ There's no tournament, elimination or hack open for joining in this group right now."
         )
         return
 
@@ -7895,6 +7961,8 @@ async def _scramble_watchdog_scan(context: ContextTypes.DEFAULT_TYPE):
             continue  # a tournament owns this chat right now; auto resumes after it
         if await asyncio.to_thread(db.elim_get_open_for_chat, chat_id):
             continue  # so does an elimination
+        if await asyncio.to_thread(db.hack_get_open_for_chat, chat_id):
+            continue  # and a hack
 
         try:
             chat = await context.bot.get_chat(chat_id)
@@ -7971,6 +8039,10 @@ async def scramble_watchdog_callback(context: ContextTypes.DEFAULT_TYPE):
         await _elim_watchdog_scan(context)
     except Exception:
         logger.exception("elimination watchdog scan failed (will run again)")
+    try:
+        await _hack_watchdog_scan(context)
+    except Exception:
+        logger.exception("hack watchdog scan failed (will run again)")
 
 
 def schedule_scramble_watchdog(job_queue):
@@ -8005,11 +8077,14 @@ async def _tournament_finish(context, tid):
     chat_id = res["chat_id"]
     standings = tournament_standings_text([(name, score) for _uid, name, score in res["standings"]])
     lines = ["🏆 <b>TOURNAMENT OVER</b> 🏆", "", standings, ""]
+    winner_uid, headline = None, None  # a tie / no winner = plain text, no photo
 
     if res["case"] == "single":
         uid, name, payout, balance = res["winners"][0]
         lines.append(f"👑 Winner: <b>{esc_name(name)}</b> takes the whole prize - {DOLLAR}{fmt_coins(payout)}!")
         lines.append(f"New balance: {DOLLAR}{fmt_coins(balance)}")
+        winner_uid = uid
+        headline = "\n".join(["🏆 <b>TOURNAMENT OVER</b> 🏆", ""] + lines[-2:])
     elif res["case"] == "tie":
         lines.append("🤝 It's a tie! The prize is split:")
         for uid, name, payout, balance in res["winners"]:
@@ -8020,7 +8095,9 @@ async def _tournament_finish(context, tid):
             f"Every player was refunded their {DOLLAR}{fmt_coins(res['fee'])} entry fee."
         )
 
-    await safe_send(context.bot, chat_id, text="\n".join(lines), parse_mode="HTML")
+    await send_winner_message(
+        context.bot, chat_id, "\n".join(lines), winner_uid=winner_uid, headline=headline
+    )
 
 
 def _tournament_message_is_stale(message, t) -> bool:
@@ -8392,10 +8469,8 @@ async def resumetournament_command(update: Update, context: ContextTypes.DEFAULT
             "🏟️ There's no paused or running tournament in this group to resume (or it already finished)."
         )
         return
-    if not await _tournament_may_manage(user.id, t):
-        await update.message.reply_text(
-            "❌ Only the tournament host, the bot owner, or Bot Admins can resume it."
-        )
+    if not (is_owner(user.id) or user.id == t["host_id"]):
+        await update.message.reply_text("🚫 Only the host or the bot owner can resume this tournament.")
         return
 
     code, data = await _tournament_resume_one(context, t)
@@ -8430,6 +8505,23 @@ ELIM_RETRY_SECONDS = 8
 ELIM_TURN_GRACE_SECONDS = 10
 ELIM_IDLE_RESUME_SECONDS = 20
 ELIM_STALE_SECONDS = 6 * 3600  # an elimination that has not moved for this long is cancelled and refunded
+
+# ---- Hack game constants (number-cracking game) -------------------------
+HACK_LOBBY_SECONDS = 120
+HACK_MIN_FEE = 10
+HACK_MAX_FEE_GUARD = 9_000_000_000_000_000_000  # only guards the BIGINT column; there is no real maximum
+HACK_QUICK_FEE = 10        # used by the /playgame "💻 Hack" button
+HACK_QUICK_DIGITS = 3      # used by the /playgame "💻 Hack" button
+HACK_DIGIT_CHOICES = (3, 4, 5, 6)
+HACK_GUESSES_BY_DIGITS = {3: 30, 4: 35, 5: 40, 6: 50}  # guesses each player gets
+HACK_STALE_SECONDS = 6 * 3600  # a hack that has not moved for this long is cancelled and refunded
+HACK_USAGE = (
+    "Usage: /hack <fee> <digits>\n"
+    "Example: /hack 3000 3\n\n"
+    f"Fee: {HACK_MIN_FEE:,} or more • Digits: 3, 4, 5 or 6\n"
+    f"Players get {HACK_GUESSES_BY_DIGITS[3]}/{HACK_GUESSES_BY_DIGITS[4]}/"
+    f"{HACK_GUESSES_BY_DIGITS[5]}/{HACK_GUESSES_BY_DIGITS[6]} guesses for 3/4/5/6 digits."
+)
 
 ELIM_USAGE = (
     "Usage: /setelimination <fee> <difficulty> <countdown>s\n"
@@ -8638,6 +8730,9 @@ async def _open_elimination_lobby(update: Update, context: ContextTypes.DEFAULT_
         return
     if await asyncio.to_thread(db.elim_get_open_for_chat, chat.id):
         await update.message.reply_text("🔥 An elimination is already running (or open for joining) in this group.")
+        return
+    if await asyncio.to_thread(db.hack_get_open_for_chat, chat.id):
+        await update.message.reply_text("💻 A hack game is already running (or open for joining) in this group.")
         return
     if await asyncio.to_thread(db.scramble_get_round, chat.id):
         await update.message.reply_text(
@@ -8933,7 +9028,7 @@ async def _elim_finish(context, eid):
         f"New balance: {DOLLAR}{fmt_coins(res['balance'])}"
     )
     try:
-        await safe_send(context.bot, res["chat_id"], text=text, parse_mode="HTML")
+        await send_winner_message(context.bot, res["chat_id"], text, winner_uid=w_uid)
     except Exception:
         logger.exception(f"elimination {eid}: winner announcement failed (the prize was already paid)")
 
@@ -9103,8 +9198,9 @@ async def _elim_resume_one(context, e, force=False, header=None):
 
 
 async def resumeelimination_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Everyone can use it: if the elimination hung, it continues from the exact place it stopped."""
+    """Bot owner or the host only: if the elimination hung, it continues from the exact place it stopped."""
     chat = update.effective_chat
+    user = update.effective_user
     if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         await update.message.reply_text(
             "🔥 Run /resumeelimination inside the group whose elimination you want to continue."
@@ -9116,6 +9212,9 @@ async def resumeelimination_command(update: Update, context: ContextTypes.DEFAUL
         await update.message.reply_text(
             "🔥 There's no elimination running in this group to resume (or it already finished)."
         )
+        return
+    if not (is_owner(user.id) or user.id == e["host_id"]):
+        await update.message.reply_text("🚫 Only the host or the bot owner can resume this elimination.")
         return
 
     code, data = await _elim_resume_one(context, e)
@@ -9192,6 +9291,505 @@ async def _elim_watchdog_scan(context: ContextTypes.DEFAULT_TYPE):
             await _elim_resume_one(context, e, force=False)
         except Exception:
             logger.exception(f"watchdog: elimination {eid} check failed (will run again)")
+
+
+# =======================================================================
+# HACK GAME (number-cracking)
+# Players join a lobby (fee from Scramble balance first, then Word Game),
+# then race to crack a hidden number made of unique digits 1-9. Each player
+# has their own number of guesses. The first to crack it wins the whole pool;
+# if nobody does, the bot keeps the money. All state lives in the database
+# (hacks / hack_players / hack_last_secret), so a restart never loses a game.
+# =======================================================================
+
+_HACK_LOCKS = defaultdict(asyncio.Lock)
+
+
+def _hack_lobby_job_name(hid):
+    return f"hack_lobby_{hid}"
+
+
+def _hack_restore_job_name(hid):
+    return f"hack_restore_{hid}"
+
+
+def _hack_cancel_jobs(job_queue, hid):
+    if job_queue is None:
+        return
+    for job in job_queue.get_jobs_by_name(_hack_lobby_job_name(hid)):
+        job.schedule_removal()
+
+
+def _parse_hack_args(args):
+    """Returns (fee, digits, error)."""
+    if len(args) != 2:
+        return None, None, HACK_USAGE
+    fee_raw = args[0].replace(",", "")
+    if not re.fullmatch(r"\d+", fee_raw) or not re.fullmatch(r"\d+", args[1]):
+        return None, None, HACK_USAGE
+    fee = int(fee_raw)
+    digits = int(args[1])
+    if fee < HACK_MIN_FEE:
+        return None, None, f"❌ The entry fee must be at least {DOLLAR}{HACK_MIN_FEE}."
+    if fee > HACK_MAX_FEE_GUARD:
+        return None, None, "❌ That entry fee is too large."
+    if digits not in HACK_DIGIT_CHOICES:
+        return None, None, "❌ Digits must be 3, 4, 5 or 6.\n\n" + HACK_USAGE
+    return fee, digits, None
+
+
+def hack_lobby_text(h, players) -> str:
+    """Empty lobby shows a 0 prize pool and no player line. Prize pool =
+    entry fee x players (no bonus)."""
+    n = len(players)
+    lines = [
+        "💻 <b>HACK GAME</b> 💻",
+        "",
+        f"Crack the hidden {h['digits']}-digit number!",
+        "",
+        f"💰 Prize pool: {DOLLAR}{fmt_coins(h['fee'] * n)}",
+        f"💵 Entry fee: {fmt_coins(h['fee'])}",
+        f"🔢 Digits: {h['digits']}",
+        f"⏳ Guesses per player: {h['guesses_each']}",
+    ]
+    if players:
+        names = ", ".join(_elim_mention(p[0], p[1]) for p in players)
+        lines.append(f"👥 Players ({n}): {names}")
+    lines += ["", "Use /join to join!"]
+    return "\n".join(lines)
+
+
+async def _hack_post_lobby(context, hid):
+    """Creates the lobby message once; every later call EDITS that same
+    message. If the message was deleted or the edit fails, nothing else is
+    sent - the game simply carries on."""
+    h = await asyncio.to_thread(db.hack_get, hid)
+    if not h or h["status"] != "lobby":
+        return
+    players = [p for p in await asyncio.to_thread(db.hack_get_players, hid) if p[2] == "staked"]
+    text = hack_lobby_text(h, players)
+
+    if h.get("lobby_message_id"):
+        try:
+            await context.bot.edit_message_text(
+                chat_id=h["chat_id"], message_id=h["lobby_message_id"], text=text, parse_mode="HTML"
+            )
+        except BadRequest as ex:
+            if "not modified" not in str(ex).lower():
+                logger.info(f"hack {hid}: lobby edit failed ({ex}); carrying on")
+        except Exception as ex:
+            logger.info(f"hack {hid}: lobby edit failed ({ex}); carrying on")
+        return
+
+    try:
+        sent = await safe_send(context.bot, h["chat_id"], text=text, parse_mode="HTML")
+    except Exception as ex:
+        logger.error(f"hack {hid}: lobby post failed: {ex}")
+        return
+    if sent:
+        await asyncio.to_thread(db.hack_set_lobby_message, hid, sent.message_id)
+
+
+async def hack_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/hack <fee> <digits>  e.g. /hack 3000 3"""
+    if update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await update.message.reply_text("💻 Games are played in groups - add me to a group and start a Hack there!")
+        return
+    fee, digits, error = _parse_hack_args(context.args or [])
+    if error:
+        await update.message.reply_text(error)
+        return
+    await _open_hack_lobby(update, context, fee, digits)
+
+
+async def _open_hack_lobby(update: Update, context: ContextTypes.DEFAULT_TYPE, fee, digits):
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await update.message.reply_text("💻 Games are played in groups - add me to a group and start a Hack there!")
+        return
+
+    # Same gates the tournament / elimination use.
+    if await asyncio.to_thread(db.is_tournament_banned, "group", chat.id):
+        await update.message.reply_text("🚫 This group isn't allowed to run tournaments, eliminations or hacks.")
+        return
+    if await asyncio.to_thread(db.is_tournament_banned, "user", user.id):
+        await update.message.reply_text("🚫 You're banned from tournaments, eliminations and hacks.")
+        return
+    if await asyncio.to_thread(db.get_config, "scramble_maintenance_mode", "0") == "1":
+        await update.message.reply_text("🛠️ Word Scramble is currently under maintenance. Please try again later.")
+        return
+
+    _open_t = await asyncio.to_thread(db.tournament_get_open_for_chat, chat.id)
+    if _open_t:
+        if _open_t["status"] == "paused":
+            await update.message.reply_text(TOURNAMENT_PAUSED_BLOCK_TEXT)
+        else:
+            await update.message.reply_text("🏟️ A tournament is already running (or open for joining) in this group.")
+        return
+    if await asyncio.to_thread(db.elim_get_open_for_chat, chat.id):
+        await update.message.reply_text("🔥 An elimination is already running (or open for joining) in this group.")
+        return
+    if await asyncio.to_thread(db.hack_get_open_for_chat, chat.id):
+        await update.message.reply_text("💻 A hack game is already running (or open for joining) in this group.")
+        return
+    if await asyncio.to_thread(db.scramble_get_round, chat.id):
+        await update.message.reply_text(
+            "🎮 A Word Scramble round is in progress here - wait for it to end before starting a hack."
+        )
+        return
+
+    # The host is NOT joined and NOT charged - they use /join like everyone else.
+    status, hid = await asyncio.to_thread(
+        db.hack_create, chat.id, user.id, fee, digits, HACK_GUESSES_BY_DIGITS[digits]
+    )
+    if status == "exists":
+        await update.message.reply_text("💻 A hack game is already running (or open for joining) in this group.")
+        return
+
+    await _hack_post_lobby(context, hid)
+    _schedule_tournament_job(
+        context.job_queue, hack_lobby_close_callback,
+        _hack_lobby_job_name(hid), HACK_LOBBY_SECONDS, chat.id, {"hid": hid},
+    )
+
+
+async def _hack_join(update: Update, context: ContextTypes.DEFAULT_TYPE, h):
+    """Called by /join when the open lobby is a hack."""
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if await asyncio.to_thread(db.is_tournament_banned, "user", user.id):
+        await update.message.reply_text("🚫 You're banned from tournaments, eliminations and hacks.")
+        return
+
+    status, _source, _count = await asyncio.to_thread(db.hack_join, h["id"], user.id, user.first_name)
+    if status == "closed":
+        await update.message.reply_text("💻 The lobby has just closed - too late to join.")
+    elif status == "already":
+        await update.message.reply_text("✅ You've already joined this hack.")
+    elif status == "insufficient":
+        await update.message.reply_text(
+            f"❌ You don't have enough cash to join ({DOLLAR}{fmt_coins(h['fee'])} needed).\n\n"
+            f"{DAILY_GETCASH_HINT}"
+        )
+    else:
+        await _hack_post_lobby(context, h["id"])  # edits the lobby message: prize + player list
+        await safe_send(
+            context.bot, chat.id,
+            text=f"✅ {_elim_mention(user.id, user.first_name)} joined",
+            parse_mode="HTML",
+        )
+
+
+async def hack_lobby_close_callback(context: ContextTypes.DEFAULT_TYPE):
+    hid = (context.job.data or {}).get("hid")
+    if hid is None:
+        return
+    try:
+        await _hack_start(context, hid)
+    except Exception:
+        logger.exception(f"hack {hid}: starting failed; the watchdog will retry")
+
+
+def _hack_new_secret(digits, last_secret=None) -> str:
+    """A fresh cryptographically random number: digits 1-9 only, all unique,
+    never equal to the previous game's number in this chat."""
+    rng = random.SystemRandom()
+    while True:
+        secret = "".join(rng.sample("123456789", digits))
+        if secret != last_secret:
+            return secret
+
+
+async def _hack_start(context, hid):
+    async with _HACK_LOCKS[hid]:
+        await _hack_start_locked(context, hid)
+
+
+async def _hack_start_locked(context, hid):
+    h = await asyncio.to_thread(db.hack_get, hid)
+    if not h or h["status"] != "lobby":
+        return
+    chat_id = h["chat_id"]
+    _hack_cancel_jobs(context.job_queue, hid)
+
+    players = await asyncio.to_thread(db.hack_get_players, hid)
+    staked = [p for p in players if p[2] == "staked"]
+    if len(staked) < 2:
+        res = await asyncio.to_thread(db.hack_cancel, hid, False)  # refund EVERY player, host included
+        if res:
+            await safe_send(
+                context.bot, chat_id,
+                text="⚠️ Hack cancelled: not enough players. All join fees have been refunded.",
+            )
+        return
+
+    last = await asyncio.to_thread(db.hack_get_last_secret, chat_id)
+    secret = _hack_new_secret(h["digits"], last)  # picked now, when the game starts
+    if not await asyncio.to_thread(db.hack_activate, hid, secret):
+        return
+
+    names = ", ".join(_elim_mention(p[0], p[1]) for p in staked)
+    example = "".join(str(i) for i in range(1, h["digits"] + 1))
+    text = (
+        "💻 <b>HACK GAME STARTS!</b> 💻\n\n"
+        f"🔢 Digits: {h['digits']} (1-9, no repeats)\n"
+        f"💰 Prize pool: {DOLLAR}{fmt_coins(h['fee'] * len(staked))}\n"
+        f"⏳ Guesses per player: {h['guesses_each']}\n"
+        f"👥 Players ({len(staked)}): {names}\n\n"
+        f"Crack the number with /guess &lt;number&gt; - e.g. /guess {example}"
+    )
+    try:
+        await safe_send(context.bot, chat_id, text=text, parse_mode="HTML")
+    except Exception:
+        logger.exception(f"hack {hid}: start announcement failed; the game carries on")
+
+
+async def guess_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/guess <number> - only joined players of the running Hack count;
+    everyone else is ignored silently."""
+    chat = update.effective_chat
+    user = update.effective_user
+    message = update.message
+    if not message or not user or chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+
+    h = await asyncio.to_thread(db.hack_get_open_for_chat, chat.id)
+    if not h or h["status"] != "active":
+        return
+
+    raw = ((context.args or [""])[0] or "").strip()
+    res = await asyncio.to_thread(db.hack_guess, h["id"], user.id, raw)
+    kind = res.get("kind")
+
+    if kind == "ignore":
+        return
+    if kind == "nomore":
+        if res.get("first"):
+            await message.reply_text("⏳ You have no guesses left.")
+        return
+    if kind == "invalid":
+        example = "".join(str(i) for i in range(1, res["digits"] + 1))
+        await message.reply_text(f"❌ The numbers must be unique and can't include 0, example {example}")
+        return
+
+    mention = _elim_mention(res["uid"], res["name"])
+    text = (
+        "💻 <b>Hack Game</b>\n\n"
+        f"{mention}: {esc(res['guess'])}\n"
+        f"🟩 Hacks: {res['hacks']}\n"
+        f"🟨 Glitches: {res['glitches']}\n"
+        f"⏳ Guesses left: {res['left']}"
+    )
+    try:
+        await message.reply_html(text)
+    except Exception:
+        try:
+            await safe_send(context.bot, chat.id, text=text, parse_mode="HTML")
+        except Exception:
+            logger.exception(f"hack {h['id']}: guess result not delivered")
+
+    if kind == "win":
+        n = res["count"]
+        win_text = (
+            "🏆 <b>HACK COMPLETE</b> 🏆\n\n"
+            f"🔓 The number was {esc(res['secret'])}\n\n"
+            f"👑 Winner: {mention} cracked it in {n} {'guess' if n == 1 else 'guesses'}!\n"
+            f"💰 Prize: {DOLLAR}{fmt_coins(res['pot'])}\n"
+            f"New balance: {DOLLAR}{fmt_coins(res['balance'])}"
+        )
+        try:  # the prize is already paid; a failed message can never undo it
+            await send_winner_message(context.bot, chat.id, win_text, winner_uid=res["uid"])
+        except Exception:
+            logger.exception(f"hack {h['id']}: winner announcement failed (the prize was already paid)")
+    elif kind == "over":
+        over_text = (
+            "💻 <b>Hack Game over</b>\n\n"
+            f"🔓 The number was {esc(res['secret'])}\n"
+            f"Nobody cracked it, so the {DOLLAR}{fmt_coins(res['pot'])} stays with the bot."
+        )
+        try:
+            await safe_send(context.bot, chat.id, text=over_text, parse_mode="HTML")
+        except Exception:
+            logger.exception(f"hack {h['id']}: game-over announcement failed")
+
+
+async def _hack_cancel_and_announce(context, hid, headline, keep_host_fee=False):
+    """Refund (everyone, or everyone but the host), finalize and tell the
+    chat. Idempotent."""
+    _hack_cancel_jobs(context.job_queue, hid)
+    res = await asyncio.to_thread(db.hack_cancel, hid, keep_host_fee)
+    if not res:
+        return None
+    n = len(res["refunds"])
+    lines = [f"❌ {headline}", ""]
+    if n:
+        lines.append(f"{n} player(s) were refunded their {DOLLAR}{fmt_coins(res['fee'])} entry fee.")
+    elif res["kept"]:
+        lines.append("Nobody else had joined, so there was nothing to refund.")
+    else:
+        lines.append("Nobody had joined yet, so there was nothing to refund.")
+    if res["kept"]:
+        lines.append("The host's own entry fee stays with the bot.")
+    try:
+        await safe_send(context.bot, res["chat_id"], text="\n".join(lines))
+    except Exception as ex:
+        logger.info(f"hack cancel notice to {res['chat_id']} not delivered: {ex}")
+    return res
+
+
+async def starthack_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Starts the open Hack lobby right now instead of waiting for the 120s.
+    Only the host who opened it or the bot owner."""
+    chat = update.effective_chat
+    user = update.effective_user
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await update.message.reply_text("💻 Run /starthack inside the group with the open hack lobby.")
+        return
+    h = await asyncio.to_thread(db.hack_get_open_for_chat, chat.id)
+    if not h:
+        await update.message.reply_text("💻 There's no hack lobby open in this group.")
+        return
+    if not (is_owner(user.id) or user.id == h["host_id"]):
+        await update.message.reply_text("🚫 Only the host who opened this hack or the bot owner can start it early.")
+        return
+    if h["status"] != "lobby":
+        await update.message.reply_text("💻 This hack has already started.")
+        return
+    await _hack_start(context, h["id"])
+
+
+async def stophack_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancels the lobby or running Hack. Every OTHER player is refunded; the
+    host's own fee (if they joined) stays with the bot."""
+    chat = update.effective_chat
+    user = update.effective_user
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await update.message.reply_text("💻 Run /stophack inside the group with the hack you want to stop.")
+        return
+    h = await asyncio.to_thread(db.hack_get_open_for_chat, chat.id)
+    if not h:
+        await update.message.reply_text("💻 There's no hack running in this group.")
+        return
+    if not (is_owner(user.id) or user.id == h["host_id"]):
+        await update.message.reply_text("🚫 Only the host who opened this hack or the bot owner can stop it.")
+        return
+    await _hack_cancel_and_announce(context, h["id"], "Hack stopped.", keep_host_fee=True)
+
+
+async def _hack_resume_one(context, h, force=False):
+    """Makes a stuck Hack continue from the exact place it stopped. Only acts
+    if it is really stuck (the lobby lost its timer); otherwise it is healthy.
+    Returns (code, data) with code 'resumed' | 'healthy' | 'none'."""
+    hid = h["id"]
+    jq = context.job_queue
+    h = await asyncio.to_thread(db.hack_get, hid)
+    if not h or h["status"] not in ("lobby", "active"):
+        return "none", "That hack has already ended."
+
+    if h["status"] == "lobby":
+        created = _elim_parse_dt(h["created_at"]) or datetime.now()
+        remaining = HACK_LOBBY_SECONDS - (datetime.now() - created).total_seconds()
+        has_job = bool(jq is not None and jq.get_jobs_by_name(_hack_lobby_job_name(hid)))
+        if not force and has_job:
+            return "healthy", h
+        if remaining <= 0:
+            await _hack_start(context, hid)  # the lobby is overdue: start (or cancel) it now
+            return "resumed", "started"
+        _schedule_tournament_job(
+            jq, hack_lobby_close_callback, _hack_lobby_job_name(hid),
+            max(remaining, 1), h["chat_id"], {"hid": hid},
+        )
+        return "resumed", "timer"
+
+    # Active: a Hack has no timers - it simply waits for /guess - so it can't be stuck.
+    return "healthy", h
+
+
+async def resumehack_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Bot owner or the host only: if the hack is really stuck, it continues."""
+    chat = update.effective_chat
+    user = update.effective_user
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await update.message.reply_text("💻 Run /resumehack inside the group whose hack you want to continue.")
+        return
+    h = await asyncio.to_thread(db.hack_get_open_for_chat, chat.id)
+    if not h:
+        await update.message.reply_text("💻 There's no hack running in this group to resume (or it already finished).")
+        return
+    if not (is_owner(user.id) or user.id == h["host_id"]):
+        await update.message.reply_text("🚫 Only the host or the bot owner can resume this hack.")
+        return
+
+    code, data = await _hack_resume_one(context, h)
+    if code == "healthy":
+        if h["status"] == "lobby":
+            await update.message.reply_text("▶️ The Hack lobby is open - it will start on its own when the lobby closes.")
+        else:
+            await update.message.reply_text("▶️ The Hack is running normally - players can /guess the number.")
+    elif code == "none":
+        await update.message.reply_text(f"💻 {data}")
+    elif data == "timer":
+        await update.message.reply_text("▶️ Hack resumed - the lobby timer is running again.")
+    # 'started': the group has just received the start announcement.
+
+
+async def hack_restore_callback(context: ContextTypes.DEFAULT_TYPE):
+    hid = (context.job.data or {}).get("hid")
+    if hid is None:
+        return
+    try:
+        h = await asyncio.to_thread(db.hack_get, hid)
+        if h and h["status"] in ("lobby", "active"):
+            await _hack_resume_one(context, h, force=True)
+    except Exception:
+        logger.exception(f"hack {hid}: restore failed; the watchdog will retry")
+
+
+def restore_stale_hacks(job_queue):
+    """On startup: re-arm every open hack lobby (and nothing is lost for a
+    running game - it is all in the database)."""
+    if job_queue is None:
+        return
+    try:
+        open_games = db.hack_get_all_open()
+    except Exception:
+        logger.exception("could not load open hacks")
+        return
+    for h in open_games:
+        job_queue.run_once(
+            hack_restore_callback, 3, chat_id=h["chat_id"],
+            name=_hack_restore_job_name(h["id"]), data={"hid": h["id"]},
+        )
+
+
+async def _hack_watchdog_scan(context: ContextTypes.DEFAULT_TYPE):
+    """Backstop (runs inside the existing scramble watchdog): a lobby that
+    lost its timer is continued; a hack that has not moved for hours is
+    cancelled and fully refunded, so a group is never locked forever."""
+    jq = context.job_queue
+    if jq is None:
+        return
+    now = datetime.now()
+    for h in await asyncio.to_thread(db.hack_get_all_open):
+        hid = h["id"]
+        try:
+            stamps = [d for d in (_elim_parse_dt(h["last_activity"]), _elim_parse_dt(h["created_at"])) if d]
+            last = max(stamps) if stamps else now
+            if (now - last).total_seconds() > HACK_STALE_SECONDS:
+                logger.warning(f"watchdog: hack {hid} stuck for hours; cancelling and refunding")
+                await _hack_cancel_and_announce(
+                    context, hid, "Hack cancelled - it had been inactive for too long.", keep_host_fee=False
+                )
+                continue
+            if jq.get_jobs_by_name(_hack_restore_job_name(hid)):
+                continue
+            if h["status"] == "lobby":
+                await _hack_resume_one(context, h, force=False)
+        except Exception:
+            logger.exception(f"watchdog: hack {hid} check failed (will run again)")
 
 
 # =======================================================================
@@ -9615,6 +10213,10 @@ def _playgame_keyboard():
             InlineKeyboardButton("🤖 Automatic Mode", callback_data="pgm:auto"),
             InlineKeyboardButton("🏟️ Tournament", callback_data="pgm:tour"),
         ],
+        [
+            InlineKeyboardButton("🔥 Elimination", callback_data="pgm:elim"),
+            InlineKeyboardButton("💻 Hack", callback_data="pgm:hack"),
+        ],
     ])
 
 
@@ -9628,9 +10230,11 @@ async def playgame_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🎮 How do you want to play?\n\n"
         "🎮 Normal Mode - one Word Scramble round\n"
-        f"🐢 Slow Mode - a new round every {PLAYGAME_SLOWMODE_DEFAULT} (group admins)\n"
-        "🤖 Automatic Mode - rounds keep coming on their own (group admins)\n"
-        "🏟️ Tournament - open a tournament lobby",
+        f"🐢 Slow Mode - a new round every {PLAYGAME_SLOWMODE_DEFAULT}\n"
+        "🤖 Automatic Mode - rounds keep coming on their own\n"
+        "🏟️ Tournament - open a tournament lobby\n"
+        "🔥 Elimination - last player standing wins\n"
+        "💻 Hack - crack the hidden number",
         reply_markup=_playgame_keyboard(),
     )
 
@@ -9643,7 +10247,7 @@ async def playgame_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("🎮 Games are played in groups.", show_alert=True)
         return
     action = (query.data or "").split(":", 1)[-1]
-    if action not in ("normal", "slow", "auto", "tour"):
+    if action not in ("normal", "slow", "auto", "tour", "elim", "hack"):
         await query.answer()
         return
     await query.answer()
@@ -9674,6 +10278,12 @@ async def playgame_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "auto":
         context.args = ["on"]
         await scrambleautomaticmode_command(shim, context)
+    elif action == "elim":
+        context.args = []
+        await elimination_command(shim, context)
+    elif action == "hack":
+        context.args = [str(HACK_QUICK_FEE), str(HACK_QUICK_DIGITS)]
+        await hack_command(shim, context)
     else:
         context.args = []
         await tournament_command(shim, context)
@@ -11044,6 +11654,7 @@ FULLHELP_PAGES = (
     ("g", "🎮 Word Game"),
     ("s", "🔤 Word Scramble"),
     ("t", "🏟️ Tournaments"),
+    ("h", "💻 Hack"),
     ("p", "⭐ Premium & Cash"),
     ("o", "📚 Other"),
 )
@@ -11119,7 +11730,7 @@ def _fullhelp_tournament_page() -> str:
         f"Fee {TOURNAMENT_MIN_FEE:,}-{TOURNAMENT_MAX_FEE:,}, rounds {TOURNAMENT_MIN_ROUNDS}-{TOURNAMENT_MAX_ROUNDS}. "
         f"Difficulty: easy, easy3-easy6, medium, hard, off.\n"
         f"The host is NOT joined automatically and pays nothing until they /join like everyone else.\n\n"
-        f"🎮 Want a menu? /playgame (in a group) lets you start Normal Mode, Slow Mode, Automatic Mode or a Tournament with one tap.\n\n"
+        f"🎮 Want a menu? /playgame (in a group) lets you start Normal Mode, Slow Mode, Automatic Mode, a Tournament, an Elimination or a Hack with one tap.\n\n"
         f"🚪 <b>Lobby</b>\n"
         f"Players send /join. The lobby stays open for {TOURNAMENT_LOBBY_SECONDS} seconds, then the tournament starts on its own. "
         f"The host (or a bot admin) can send /starttournament to start early. With fewer than 2 players it is cancelled and refunded.\n\n"
@@ -11128,7 +11739,8 @@ def _fullhelp_tournament_page() -> str:
         f"Other Word Scramble rounds, Slow Mode and Automatic Mode wait in that group until the tournament ends.\n\n"
         f"🏆 <b>Prize</b>\n"
         f"Every entry fee plus one bonus entry fee from me: fee × (players + 1). The top score wins it all; a tie splits it; "
-        f"if nobody scores, everyone is refunded. Winnings also count in that group's \"in this chat\" Word Scramble board.\n\n"
+        f"if nobody scores, everyone is refunded. Winnings also count in that group's \"in this chat\" Word Scramble board. "
+        f"The winner's profile picture is attached to the winning message (a tie is text only).\n\n"
         f"🔥 <b>Elimination</b>\n"
         f"/elimination - instant one (fee {ELIM_QUICK_FEE}, {ELIM_QUICK_DIFFICULTY}, {ELIM_QUICK_COUNTDOWN}s)\n"
         f"/setelimination &lt;fee&gt; &lt;difficulty&gt; &lt;countdown&gt;s - e.g. /setelimination 100 easy 20s (fee {ELIM_MIN_FEE}+)\n"
@@ -11136,13 +11748,46 @@ def _fullhelp_tournament_page() -> str:
         f"fail to unscramble in time and you're out. After everyone has played, the countdown halves (never below 2s). "
         f"Last player standing wins the whole prize: fee × (players + 1). "
         f"The host (or the bot owner) can send /startelimination to start early. "
-        f"If I hang, anyone can send /resumeelimination to continue from the exact place it stopped. "
+        f"If I hang, the host or the bot owner can send /resumeelimination to continue from the exact place it stopped. "
         f"Not enough players = cancelled and refunded.\n\n"
         f"🛠️ <b>If something goes wrong</b>\n"
         f"/stoptournament - the host or a bot admin can cancel a lobby (or a paused tournament) and refund everyone.\n"
-        f"If I lose connection, the tournament pauses and entry fees stay safe. The host or a bot admin sends "
+        f"If I lose connection, the tournament pauses and entry fees stay safe. The host or the bot owner sends "
         f"/resumetournament to continue from the same round. A tournament left paused for over "
         f"{_format_duration_words(TOURNAMENT_PAUSED_MAX_SECONDS)} is refunded automatically."
+    )
+
+
+def _fullhelp_hack_page() -> str:
+    g = HACK_GUESSES_BY_DIGITS
+    return (
+        f"💻 <b>Hack</b>\n\n"
+        f"A number-cracking game inside a group: a secret number is hidden and everyone races to crack it.\n\n"
+        f"🚀 <b>Starting</b>\n"
+        f"/hack &lt;fee&gt; &lt;digits&gt; - e.g. /hack 3000 3\n"
+        f"Fee {HACK_MIN_FEE:,} or more, digits 3, 4, 5 or 6. Or tap 💻 Hack in /playgame "
+        f"(fee {HACK_QUICK_FEE}, {HACK_QUICK_DIGITS} digits).\n"
+        f"The host is NOT joined automatically and pays nothing until they /join like everyone else.\n\n"
+        f"🚪 <b>Lobby</b>\n"
+        f"Players send /join. The entry fee is taken from your Word Scramble balance first; only if that is too low "
+        f"it comes from your Word Game balance. The lobby stays open for {HACK_LOBBY_SECONDS} seconds, then the game "
+        f"starts on its own. With fewer than 2 players it is cancelled and everyone is refunded. "
+        f"The host (or the bot owner) can send /starthack to start early.\n\n"
+        f"🎯 <b>Playing</b>\n"
+        f"The hidden number uses the digits 1-9 only, no 0 and no repeated digit (e.g. 876). "
+        f"Send /guess &lt;number&gt; (e.g. /guess 563).\n"
+        f"🟩 Hacks = right digit in the right spot\n"
+        f"🟨 Glitches = the digit is in the number but in the wrong spot\n"
+        f"Every player has their own guesses: {g[3]} for 3 digits, {g[4]} for 4, {g[5]} for 5, {g[6]} for 6. "
+        f"An invalid guess does not use one up. Out of guesses? You can no longer guess, but you are not kicked.\n\n"
+        f"🏆 <b>Prize</b>\n"
+        f"The first player to crack the number wins the whole pool (every entry fee, no bonus); it also counts in that "
+        f"group's \"in this chat\" Word Scramble board, and the winner's profile picture is attached to the winning message. "
+        f"If nobody cracks it before every player runs out of guesses, the bot keeps the money.\n\n"
+        f"🛠️ <b>If something goes wrong</b>\n"
+        f"/stophack - the host or the bot owner cancels it; every other player is refunded (the host's own fee stays with the bot).\n"
+        f"/resumehack - the host or the bot owner continues a stuck Hack. A Hack that has not moved for 6 hours is refunded automatically.\n\n"
+        f"One game at a time: a Hack, Tournament, Elimination and a normal Word Scramble round can't run together in the same group."
     )
 
 
@@ -11198,7 +11843,7 @@ def _fullhelp_other_page() -> str:
         f"💝 <b>Support the bot</b>\n"
         f"/support - support the bot with Telegram Stars (quick amounts or a custom one; no in-game advantage). "
         f"/supporters - top supporters. /mysupport - your own total.\n\n"
-        f"🎮 <b>Start a game fast</b> - /playgame (groups): Normal Mode, Slow Mode, Automatic Mode or Tournament.\n\n"
+        f"🎮 <b>Start a game fast</b> - /playgame (groups): Normal Mode, Slow Mode, Automatic Mode, Tournament, Elimination or Hack.\n\n"
         f"🏆 <b>Leaderboards</b>\n"
         f"/leaderboard, /chattop, /globaltop, /topplayers, /topgroups - Word Game and combined rankings\n"
         f"/scrambleleaderboard, /scrambletopplayers, /scrambletopgroups - Word Scramble rankings\n\n"
@@ -11223,6 +11868,7 @@ _FULLHELP_BUILDERS = {
     "g": _fullhelp_game_page,
     "s": _fullhelp_scramble_page,
     "t": _fullhelp_tournament_page,
+    "h": _fullhelp_hack_page,
     "p": _fullhelp_premium_page,
     "o": _fullhelp_other_page,
 }
@@ -11240,8 +11886,8 @@ def _fullhelp_keyboard(user_id, current):
     labels = dict(FULLHELP_PAGES)
     return InlineKeyboardMarkup([
         [btn("g", labels["g"]), btn("s", labels["s"])],
-        [btn("t", labels["t"]), btn("p", labels["p"])],
-        [btn("o", labels["o"])],
+        [btn("t", labels["t"]), btn("h", labels["h"])],
+        [btn("p", labels["p"]), btn("o", labels["o"])],
     ])
 
 
@@ -11899,6 +12545,11 @@ def main():
     app.add_handler(CommandHandler("startelimination", startelimination_command))
     app.add_handler(CommandHandler("stopelimination", stopelimination_command))
     app.add_handler(CommandHandler("resumeelimination", resumeelimination_command))
+    app.add_handler(CommandHandler("hack", hack_command))
+    app.add_handler(CommandHandler("guess", guess_command))
+    app.add_handler(CommandHandler("starthack", starthack_command))
+    app.add_handler(CommandHandler("stophack", stophack_command))
+    app.add_handler(CommandHandler("resumehack", resumehack_command))
     app.add_handler(CommandHandler("boostrank", boostrank_command))
     app.add_handler(CommandHandler("boostlevel", boostlevel_command))
     app.add_handler(CommandHandler("editbuycashtext", editbuycashtext_command))
@@ -11917,12 +12568,12 @@ def main():
     # Specific callback patterns must be registered BEFORE the catch-all button handler.
     app.add_handler(CallbackQueryHandler(buypremium_button, pattern=r"^buypremium$"))
     app.add_handler(CallbackQueryHandler(support_button, pattern=r"^sup:(a:\d+|c)$"))
-    app.add_handler(CallbackQueryHandler(playgame_button, pattern=r"^pgm:(normal|slow|auto|tour)$"))
+    app.add_handler(CallbackQueryHandler(playgame_button, pattern=r"^pgm:(normal|slow|auto|tour|elim|hack)$"))
     app.add_handler(CallbackQueryHandler(premium_features_button, pattern=r"^pf:(show|back:\d+)$"))
     app.add_handler(CallbackQueryHandler(buydollar_button, pattern=r"^bd:\d+:\d+:\d+:\d+(:[crl])?$"))
     app.add_handler(CallbackQueryHandler(transfer_button, pattern=r"^tf:[yn]:[0-9a-f]+$"))
     app.add_handler(CallbackQueryHandler(request_button, pattern=r"^rq:[yn]:\d+$"))
-    app.add_handler(CallbackQueryHandler(fullhelp_button, pattern=r"^fh:\d+:[gstpo]$"))
+    app.add_handler(CallbackQueryHandler(fullhelp_button, pattern=r"^fh:\d+:[gstpoh]$"))
     app.add_handler(CallbackQueryHandler(premium_players_page_button, pattern=r"^spp:\d+$"))
     app.add_handler(CommandHandler("profile", profile_command))
     app.add_handler(CommandHandler("inviteandearn", inviteandearn_command))
@@ -11968,6 +12619,7 @@ def main():
         schedule_premium_reminder_job(app.job_queue)
         restore_stale_tournaments(app.job_queue)
         restore_stale_eliminations(app.job_queue)
+        restore_stale_hacks(app.job_queue)
         schedule_tournament_pause_check(app.job_queue)
         schedule_scramble_watchdog(app.job_queue)
 

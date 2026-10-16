@@ -606,6 +606,52 @@ def create_tables():
             "ON elimination_players (elimination_id, user_id)"
         )
 
+        # ---- Hack game (number-cracking) ------------------------------------
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS hacks (
+            id BIGSERIAL PRIMARY KEY,
+            chat_id BIGINT NOT NULL,
+            host_id BIGINT NOT NULL,
+            fee BIGINT NOT NULL,
+            digits INTEGER NOT NULL,
+            guesses_each INTEGER NOT NULL,
+            status TEXT DEFAULT 'lobby',
+            secret TEXT,
+            created_at TEXT,
+            started_at TEXT,
+            lobby_message_id BIGINT,
+            last_activity TEXT,
+            winner_id BIGINT
+        )
+        """)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS hack_players (
+            id BIGSERIAL PRIMARY KEY,
+            hack_id BIGINT NOT NULL,
+            user_id BIGINT NOT NULL,
+            name TEXT,
+            status TEXT DEFAULT 'staked',
+            source TEXT DEFAULT 'scramble',
+            guesses_left INTEGER DEFAULT 0,
+            guess_count INTEGER DEFAULT 0,
+            no_guess_notified BOOLEAN DEFAULT FALSE
+        )
+        """)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS hack_last_secret (
+            chat_id BIGINT PRIMARY KEY,
+            secret TEXT
+        )
+        """)
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_hacks_one_open_per_chat "
+            "ON hacks (chat_id) WHERE status IN ('lobby', 'active')"
+        )
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_hack_players_unique "
+            "ON hack_players (hack_id, user_id)"
+        )
+
         # ---- /support (Telegram Stars) -------------------------------------
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS support_payments (
@@ -5014,6 +5060,361 @@ def elim_cancel(elimination_id):
             """, (elimination_id,))
             conn.commit()
             return {"chat_id": chat_id, "fee": fee, "refunds": refunds}
+        except Exception:
+            conn.rollback()
+            raise
+    finally:
+        conn.close()
+
+
+# =======================================================================
+# HACK (number-cracking game)
+# Same safety model as the elimination: every money movement happens in the
+# same transaction as the status change that guards it.
+# =======================================================================
+
+_HACK_COLS = (
+    "id, chat_id, host_id, fee, digits, guesses_each, status, secret, created_at, "
+    "started_at, lobby_message_id, last_activity, winner_id"
+)
+_HACK_KEYS = [c.strip() for c in _HACK_COLS.split(",")]
+
+
+def _hack_row(row):
+    return dict(zip(_HACK_KEYS, row)) if row else None
+
+
+def hack_create(chat_id, host_id, fee, digits, guesses_each):
+    """Returns ('ok', hack_id) | ('exists', None). The lobby opens empty."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                INSERT INTO hacks (chat_id, host_id, fee, digits, guesses_each, status, created_at, last_activity)
+                SELECT %s, %s, %s, %s, %s, 'lobby', %s, %s
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM hacks WHERE chat_id=%s AND status IN ('lobby', 'active')
+                )
+                RETURNING id
+            """, (chat_id, host_id, fee, digits, guesses_each,
+                  datetime.now().isoformat(), datetime.now().isoformat(), chat_id))
+            row = cursor.fetchone()
+            if not row:
+                conn.rollback()
+                return "exists", None
+            conn.commit()
+            return "ok", row[0]
+        except Exception as e:
+            conn.rollback()
+            if getattr(e, "pgcode", None) == "23505":
+                return "exists", None
+            raise
+    finally:
+        conn.close()
+
+
+def hack_get(hack_id):
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT {_HACK_COLS} FROM hacks WHERE id=%s", (hack_id,))
+        return _hack_row(cursor.fetchone())
+    finally:
+        conn.close()
+
+
+def hack_get_open_for_chat(chat_id):
+    """The chat's lobby/active hack (at most one), or None."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"SELECT {_HACK_COLS} FROM hacks WHERE chat_id=%s AND status IN ('lobby', 'active')",
+            (chat_id,),
+        )
+        return _hack_row(cursor.fetchone())
+    finally:
+        conn.close()
+
+
+def hack_get_all_open():
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT {_HACK_COLS} FROM hacks WHERE status IN ('lobby', 'active')")
+        return [_hack_row(r) for r in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+def hack_get_players(hack_id):
+    """Join order. Rows: (user_id, name, status, guesses_left, guess_count)."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT user_id, name, status, guesses_left, guess_count FROM hack_players
+            WHERE hack_id=%s ORDER BY id ASC
+        """, (hack_id,))
+        return cursor.fetchall()
+    finally:
+        conn.close()
+
+
+def hack_set_lobby_message(hack_id, message_id):
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE hacks SET lobby_message_id=%s WHERE id=%s", (message_id, hack_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def hack_get_last_secret(chat_id):
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT secret FROM hack_last_secret WHERE chat_id=%s", (chat_id,))
+        row = cursor.fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def hack_join(hack_id, user_id, name):
+    """Returns ('ok', source, player_count) | ('closed', None, None)
+    | ('already', None, None) | ('insufficient', None, None). The fee comes
+    from whichever balance covers it (Scramble first, then Word Game)."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT status, fee, guesses_each FROM hacks WHERE id=%s FOR UPDATE", (hack_id,))
+            row = cursor.fetchone()
+            if not row or row[0] != "lobby":
+                conn.rollback()
+                return "closed", None, None
+            fee, guesses_each = row[1], row[2]
+
+            cursor.execute(
+                "SELECT 1 FROM hack_players WHERE hack_id=%s AND user_id=%s", (hack_id, user_id)
+            )
+            if cursor.fetchone():
+                conn.rollback()
+                return "already", None, None
+
+            new_balance, source = _tx_deduct_any(cursor, user_id, name, fee)
+            if new_balance is None:
+                conn.rollback()
+                return "insufficient", None, None
+
+            cursor.execute("""
+                INSERT INTO hack_players (hack_id, user_id, name, status, source, guesses_left, guess_count)
+                VALUES (%s, %s, %s, 'staked', %s, %s, 0)
+            """, (hack_id, user_id, name, source, guesses_each))
+            cursor.execute("SELECT COUNT(*) FROM hack_players WHERE hack_id=%s", (hack_id,))
+            count = cursor.fetchone()[0]
+            conn.commit()
+            return "ok", source, count
+        except Exception as e:
+            conn.rollback()
+            if getattr(e, "pgcode", None) == "23505":
+                return "already", None, None
+            raise
+    finally:
+        conn.close()
+
+
+def hack_activate(hack_id, secret):
+    """lobby -> active, exactly once, storing the hidden number. Needs 2+
+    staked players. Also remembers the number as this chat's previous one."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT status, chat_id FROM hacks WHERE id=%s FOR UPDATE", (hack_id,))
+            row = cursor.fetchone()
+            if not row or row[0] != "lobby":
+                conn.rollback()
+                return False
+            chat_id = row[1]
+            cursor.execute(
+                "SELECT COUNT(*) FROM hack_players WHERE hack_id=%s AND status='staked'", (hack_id,)
+            )
+            if cursor.fetchone()[0] < 2:
+                conn.rollback()
+                return False
+            now = datetime.now().isoformat()
+            cursor.execute("""
+                UPDATE hacks SET status='active', secret=%s, started_at=%s, last_activity=%s
+                WHERE id=%s
+            """, (secret, now, now, hack_id))
+            cursor.execute("""
+                INSERT INTO hack_last_secret (chat_id, secret) VALUES (%s, %s)
+                ON CONFLICT (chat_id) DO UPDATE SET secret = EXCLUDED.secret
+            """, (chat_id, secret))
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+    finally:
+        conn.close()
+
+
+def hack_guess(hack_id, user_id, guess):
+    """One atomic guess. The hack row is locked for the whole call, so two
+    quick guesses can never both pass at 1 guess left or both win.
+    Returns a dict whose 'kind' is one of:
+      'ignore'  - no active hack / not a player (stay silent)
+      'nomore'  - player has 0 guesses left ('first': True the first time only)
+      'invalid' - malformed guess (no guess used)
+      'guess'   - valid, not solved
+      'win'     - solved: pot paid to the winner (idempotent: status guard)
+      'over'    - that was the last guess anybody had: the bot keeps the pot"""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT status, secret, digits, fee, chat_id FROM hacks WHERE id=%s FOR UPDATE", (hack_id,)
+            )
+            row = cursor.fetchone()
+            if not row or row[0] != "active" or not row[1]:
+                conn.rollback()
+                return {"kind": "ignore"}
+            _status, secret, digits, fee, chat_id = row
+
+            cursor.execute("""
+                SELECT name, status, guesses_left, guess_count, no_guess_notified
+                FROM hack_players WHERE hack_id=%s AND user_id=%s FOR UPDATE
+            """, (hack_id, user_id))
+            p = cursor.fetchone()
+            if not p or p[1] != "staked":
+                conn.rollback()
+                return {"kind": "ignore"}
+            name, _pst, left, count, notified = p
+            left, count = left or 0, count or 0
+
+            if left <= 0:
+                first = not notified
+                if first:
+                    cursor.execute(
+                        "UPDATE hack_players SET no_guess_notified=TRUE WHERE hack_id=%s AND user_id=%s",
+                        (hack_id, user_id),
+                    )
+                conn.commit()
+                return {"kind": "nomore", "first": first}
+
+            if (len(guess) != digits or not guess.isascii() or not guess.isdigit()
+                    or "0" in guess or len(set(guess)) != digits):
+                conn.rollback()
+                return {"kind": "invalid", "digits": digits}
+
+            left -= 1
+            count += 1
+            hacks = sum(1 for a, b in zip(guess, secret) if a == b)
+            glitches = sum(1 for i, ch in enumerate(guess) if ch != secret[i] and ch in secret)
+            cursor.execute(
+                "UPDATE hack_players SET guesses_left=%s, guess_count=%s WHERE hack_id=%s AND user_id=%s",
+                (left, count, hack_id, user_id),
+            )
+            cursor.execute(
+                "UPDATE hacks SET last_activity=%s WHERE id=%s", (datetime.now().isoformat(), hack_id)
+            )
+            base = {"uid": user_id, "name": name, "guess": guess, "hacks": hacks, "glitches": glitches,
+                    "left": left, "count": count, "chat_id": chat_id, "secret": secret, "fee": fee}
+
+            cursor.execute(
+                "SELECT COUNT(*) FROM hack_players WHERE hack_id=%s AND status='staked'", (hack_id,)
+            )
+            players_n = cursor.fetchone()[0]
+            pot = fee * players_n
+
+            if hacks == digits:
+                balance = _tx_credit(cursor, user_id, name, pot)
+                _tx_credit_chat_scramble(cursor, user_id, chat_id, name, pot)
+                cursor.execute(
+                    "UPDATE hack_players SET status='won' WHERE hack_id=%s AND user_id=%s", (hack_id, user_id)
+                )
+                cursor.execute(
+                    "UPDATE hack_players SET status='lost' WHERE hack_id=%s AND status='staked'", (hack_id,)
+                )
+                cursor.execute(
+                    "UPDATE hacks SET status='finished', winner_id=%s WHERE id=%s", (user_id, hack_id)
+                )
+                conn.commit()
+                base.update({"kind": "win", "pot": pot, "balance": balance})
+                return base
+
+            cursor.execute("""
+                SELECT COUNT(*) FROM hack_players
+                WHERE hack_id=%s AND status='staked' AND COALESCE(guesses_left, 0) > 0
+            """, (hack_id,))
+            if cursor.fetchone()[0] == 0:
+                cursor.execute(
+                    "UPDATE hack_players SET status='lost' WHERE hack_id=%s AND status='staked'", (hack_id,)
+                )
+                cursor.execute("UPDATE hacks SET status='finished' WHERE id=%s", (hack_id,))
+                conn.commit()
+                base.update({"kind": "over", "pot": pot})
+                return base
+
+            conn.commit()
+            base["kind"] = "guess"
+            return base
+        except Exception:
+            conn.rollback()
+            raise
+    finally:
+        conn.close()
+
+
+def hack_cancel(hack_id, keep_host_fee=False):
+    """Cancels a lobby/active hack and refunds every staked player's fee to
+    the balance it came from. With keep_host_fee=True the host's own fee (if
+    the host joined as a player) is NOT refunded - the bot keeps it.
+    Idempotent. Returns {chat_id, fee, host_id, refunds: [(uid, name, fee, balance)],
+    kept: [(uid, name, fee)]} or None."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT status, fee, chat_id, host_id FROM hacks WHERE id=%s FOR UPDATE", (hack_id,)
+            )
+            row = cursor.fetchone()
+            if not row or row[0] not in ("lobby", "active"):
+                conn.rollback()
+                return None
+            _status, fee, chat_id, host_id = row
+
+            cursor.execute("""
+                SELECT user_id, name, COALESCE(source, 'scramble') FROM hack_players
+                WHERE hack_id=%s AND status='staked' ORDER BY id ASC
+            """, (hack_id,))
+            refunds, kept = [], []
+            for uid, name, source in cursor.fetchall():
+                if keep_host_fee and uid == host_id:
+                    cursor.execute("""
+                        UPDATE hack_players SET status='kept'
+                        WHERE hack_id=%s AND user_id=%s AND status='staked'
+                    """, (hack_id, uid))
+                    if cursor.rowcount == 1:
+                        kept.append((uid, name, fee))
+                    continue
+                cursor.execute("""
+                    UPDATE hack_players SET status='refunded'
+                    WHERE hack_id=%s AND user_id=%s AND status='staked'
+                """, (hack_id, uid))
+                if cursor.rowcount == 1:
+                    refunds.append((uid, name, fee, _tx_credit_source(cursor, uid, name, fee, source)))
+
+            cursor.execute("UPDATE hacks SET status='cancelled' WHERE id=%s", (hack_id,))
+            conn.commit()
+            return {"chat_id": chat_id, "fee": fee, "host_id": host_id, "refunds": refunds, "kept": kept}
         except Exception:
             conn.rollback()
             raise
