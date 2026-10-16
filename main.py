@@ -1912,11 +1912,14 @@ def _scrambleallcommands_text() -> str:
 /setelimination &lt;fee&gt; &lt;difficulty&gt; &lt;countdown&gt;s - start an Elimination lobby (e.g. /setelimination 100 easy 20s); fee 10 or more; players take turns, the timer halves every cycle, the last player standing wins the whole prize
 /startelimination - the host who opened the lobby or the bot owner: start the open Elimination right now instead of waiting for the 2-minute lobby
 /resumeelimination - host or bot owner only: continue a hung Elimination from the exact place it stopped
-/hack &lt;fee&gt; &lt;digits&gt; - start a Hack lobby in a group (e.g. /hack 3000 3); fee 10 or more, 3-6 digits; players /join (the host is NOT joined automatically), then race to /guess the hidden number (digits 1-9, all different); the first to crack it wins the whole pool, and if nobody does the bot keeps it
-/guess &lt;number&gt; - joined players only: guess the hidden Hack number (🟩 Hacks = right digit in the right spot, 🟨 Glitches = right digit in the wrong spot); you get 30/35/40/50 guesses for 3/4/5/6 digits
-/starthack - the host who opened the lobby or the bot owner: start the open Hack right now instead of waiting for the 2-minute lobby
-/stophack - the host who opened the Hack or the bot owner: cancel the lobby or running Hack; every other player is refunded (the host's own fee stays with the bot)
-/resumehack - host or bot owner only: continue a stuck Hack from the exact place it stopped
+/hack &lt;fee&gt; &lt;digits&gt; - start a Hack lobby in a group (e.g. /hack 3000 3); just /hack starts a quick game (fee 10, 3 digits); fee 10 or more, 3-6 digits; players /join (the host is NOT joined automatically), then take turns (random order) to /guess the hidden number (digits 1-9, all different); the first to crack it wins the whole pool, and if nobody does the bot keeps it
+/hackx - start a quick Hack X (fee 10, 3 digits): like Hack, but everybody guesses at the same time - no waiting for turns
+/sethackx &lt;fee&gt; &lt;digits&gt; - start a Hack X with your own fee and digits (e.g. /sethackx 500 4)
+/guess &lt;number&gt; - joined players only: guess the hidden Hack number - on your turn in a normal Hack (60 seconds, out after missing 2 turns), any time in Hack X; you can also just type the number without the command (🟩 Hacks = right digit in the right spot, 🟨 Glitches = right digit in the wrong spot); you get 30/35/40/50 guesses for 3/4/5/6 digits
+/g &lt;number&gt; - short version of /guess, works exactly the same
+/starthack - the host who opened the lobby or the bot owner: start the open Hack or Hack X right now instead of waiting for the 2-minute lobby
+/stophack - the host who opened the Hack or the bot owner: cancel the lobby or running Hack or Hack X; every other player is refunded (the host's own fee stays with the bot)
+/resumehack - host or bot owner only: continue a stuck Hack or Hack X from the exact place it stopped
 /support - support the bot with Telegram Stars (quick amounts or a custom amount; gives no in-game advantage; used in a group it moves you to my DM)
 /supporters - the top supporters leaderboard
 /mysupport - your own total support and number of contributions
@@ -4780,7 +4783,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /stopvote - vote to stop a stuck round (3 votes needed)
 /stopgame - admins can stop a round instantly
 /playgame - (groups) start Normal, Slow, Automatic Mode, a Tournament, Elimination or Hack from one menu
-/hack &lt;fee&gt; &lt;digits&gt; - (groups) open a Hack lobby: crack the hidden number, the winner takes all (see /fullhelp)
+/hack &lt;fee&gt; &lt;digits&gt; - (groups) open a Hack lobby: players take turns cracking the hidden number, the winner takes all; just /hack = quick game (see /fullhelp)
+/hackx - (groups) quick Hack X: same, but everybody guesses at the same time; /sethackx &lt;fee&gt; &lt;digits&gt; to choose the fee and digits
 /daily - claim your daily reward (in my DM)
 /support - support the bot with Telegram Stars
 /leaderboard - this chat's leaderboard
@@ -6970,11 +6974,14 @@ def _allcommands_text() -> str:
 /setelimination &lt;fee&gt; &lt;difficulty&gt; &lt;countdown&gt;s - start an Elimination lobby (e.g. /setelimination 100 easy 20s); fee 10 or more; players take turns, the timer halves every cycle, the last player standing wins the whole prize
 /startelimination - the host who opened the lobby or the bot owner: start the open Elimination right now instead of waiting for the 2-minute lobby
 /resumeelimination - host or bot owner only: continue a hung Elimination from the exact place it stopped
-/hack &lt;fee&gt; &lt;digits&gt; - start a Hack lobby in a group (e.g. /hack 3000 3); fee 10 or more, 3-6 digits; players /join (the host is NOT joined automatically), then race to /guess the hidden number (digits 1-9, all different); the first to crack it wins the whole pool, and if nobody does the bot keeps it
-/guess &lt;number&gt; - joined players only: guess the hidden Hack number (🟩 Hacks = right digit in the right spot, 🟨 Glitches = right digit in the wrong spot); you get 30/35/40/50 guesses for 3/4/5/6 digits
-/starthack - the host who opened the lobby or the bot owner: start the open Hack right now instead of waiting for the 2-minute lobby
-/stophack - the host who opened the Hack or the bot owner: cancel the lobby or running Hack; every other player is refunded (the host's own fee stays with the bot)
-/resumehack - host or bot owner only: continue a stuck Hack from the exact place it stopped
+/hack &lt;fee&gt; &lt;digits&gt; - start a Hack lobby in a group (e.g. /hack 3000 3); just /hack starts a quick game (fee 10, 3 digits); fee 10 or more, 3-6 digits; players /join (the host is NOT joined automatically), then take turns (random order) to /guess the hidden number (digits 1-9, all different); the first to crack it wins the whole pool, and if nobody does the bot keeps it
+/hackx - start a quick Hack X (fee 10, 3 digits): like Hack, but everybody guesses at the same time - no waiting for turns
+/sethackx &lt;fee&gt; &lt;digits&gt; - start a Hack X with your own fee and digits (e.g. /sethackx 500 4)
+/guess &lt;number&gt; - joined players only: guess the hidden Hack number - on your turn in a normal Hack (60 seconds, out after missing 2 turns), any time in Hack X; you can also just type the number without the command (🟩 Hacks = right digit in the right spot, 🟨 Glitches = right digit in the wrong spot); you get 30/35/40/50 guesses for 3/4/5/6 digits
+/g &lt;number&gt; - short version of /guess, works exactly the same
+/starthack - the host who opened the lobby or the bot owner: start the open Hack or Hack X right now instead of waiting for the 2-minute lobby
+/stophack - the host who opened the Hack or the bot owner: cancel the lobby or running Hack or Hack X; every other player is refunded (the host's own fee stays with the bot)
+/resumehack - host or bot owner only: continue a stuck Hack or Hack X from the exact place it stopped
 /support - support the bot with Telegram Stars (quick amounts or a custom amount; gives no in-game advantage; used in a group it moves you to my DM)
 /supporters - the top supporters leaderboard
 /mysupport - your own total support and number of contributions
@@ -8515,6 +8522,16 @@ HACK_QUICK_DIGITS = 3      # used by the /playgame "💻 Hack" button
 HACK_DIGIT_CHOICES = (3, 4, 5, 6)
 HACK_GUESSES_BY_DIGITS = {3: 30, 4: 35, 5: 40, 6: 50}  # guesses each player gets
 HACK_STALE_SECONDS = 6 * 3600  # a hack that has not moved for this long is cancelled and refunded
+HACKX_USAGE = (
+    "Usage: /sethackx <fee> <digits>\n"
+    "Example: /sethackx 500 4\n\n"
+    f"Fee: {HACK_MIN_FEE:,} or more • Digits: 3, 4, 5 or 6\n"
+    "For a quick game with the default fee and digits just send /hackx"
+)
+HACK_TURN_SECONDS = 60         # time a player has for their turn
+HACK_MAX_SKIPS = 2             # missing this many turns eliminates the player
+HACK_TURN_GRACE_SECONDS = 10
+HACK_IDLE_RESUME_SECONDS = 20
 HACK_USAGE = (
     "Usage: /hack <fee> <digits>\n"
     "Example: /hack 3000 3\n\n"
@@ -9303,6 +9320,11 @@ async def _elim_watchdog_scan(context: ContextTypes.DEFAULT_TYPE):
 # =======================================================================
 
 _HACK_LOCKS = defaultdict(asyncio.Lock)
+_HACK_TURN_LOCKS = defaultdict(asyncio.Lock)
+
+
+def _hack_turn_job_name(hid):
+    return f"hack_turn_{hid}"
 
 
 def _hack_lobby_job_name(hid):
@@ -9316,17 +9338,19 @@ def _hack_restore_job_name(hid):
 def _hack_cancel_jobs(job_queue, hid):
     if job_queue is None:
         return
-    for job in job_queue.get_jobs_by_name(_hack_lobby_job_name(hid)):
-        job.schedule_removal()
+    for name in (_hack_lobby_job_name(hid), _hack_turn_job_name(hid)):
+        for job in job_queue.get_jobs_by_name(name):
+            job.schedule_removal()
 
 
-def _parse_hack_args(args):
+def _parse_hack_args(args, usage=None):
     """Returns (fee, digits, error)."""
+    usage = usage or HACK_USAGE
     if len(args) != 2:
-        return None, None, HACK_USAGE
+        return None, None, usage
     fee_raw = args[0].replace(",", "")
     if not re.fullmatch(r"\d+", fee_raw) or not re.fullmatch(r"\d+", args[1]):
-        return None, None, HACK_USAGE
+        return None, None, usage
     fee = int(fee_raw)
     digits = int(args[1])
     if fee < HACK_MIN_FEE:
@@ -9334,7 +9358,7 @@ def _parse_hack_args(args):
     if fee > HACK_MAX_FEE_GUARD:
         return None, None, "❌ That entry fee is too large."
     if digits not in HACK_DIGIT_CHOICES:
-        return None, None, "❌ Digits must be 3, 4, 5 or 6.\n\n" + HACK_USAGE
+        return None, None, "❌ Digits must be 3, 4, 5 or 6.\n\n" + usage
     return fee, digits, None
 
 
@@ -9342,10 +9366,15 @@ def hack_lobby_text(h, players) -> str:
     """Empty lobby shows a 0 prize pool and no player line. Prize pool =
     entry fee x players (no bonus)."""
     n = len(players)
+    free = h.get("mode") == "free"
     lines = [
-        "💻 <b>HACK GAME</b> 💻",
+        "💻 <b>HACK X</b> 💻" if free else "💻 <b>HACK GAME</b> 💻",
         "",
         f"Crack the hidden {h['digits']}-digit number!",
+    ]
+    if free:
+        lines.append("⚡ Everyone guesses at the same time - no waiting for turns!")
+    lines += [
         "",
         f"💰 Prize pool: {DOLLAR}{fmt_coins(h['fee'] * n)}",
         f"💵 Entry fee: {fmt_coins(h['fee'])}",
@@ -9391,9 +9420,13 @@ async def _hack_post_lobby(context, hid):
 
 
 async def hack_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/hack <fee> <digits>  e.g. /hack 3000 3"""
+    """/hack <fee> <digits>  e.g. /hack 3000 3  - players guess one after the other.
+    Just /hack (no arguments) = the quick game: fixed fee and digits."""
     if update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         await update.message.reply_text("💻 Games are played in groups - add me to a group and start a Hack there!")
+        return
+    if not (context.args or []):
+        await _open_hack_lobby(update, context, HACK_QUICK_FEE, HACK_QUICK_DIGITS)
         return
     fee, digits, error = _parse_hack_args(context.args or [])
     if error:
@@ -9402,7 +9435,30 @@ async def hack_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _open_hack_lobby(update, context, fee, digits)
 
 
-async def _open_hack_lobby(update: Update, context: ContextTypes.DEFAULT_TYPE, fee, digits):
+async def hackx_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/hackx - quick Hack X (fixed fee and digits): everybody guesses at the same time."""
+    if update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await update.message.reply_text("💻 Games are played in groups - add me to a group and start a Hack X there!")
+        return
+    if context.args:
+        await update.message.reply_text(HACKX_USAGE)
+        return
+    await _open_hack_lobby(update, context, HACK_QUICK_FEE, HACK_QUICK_DIGITS, mode="free")
+
+
+async def sethackx_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/sethackx <fee> <digits>  e.g. /sethackx 500 4  - Hack X with your own fee and digits."""
+    if update.effective_chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await update.message.reply_text("💻 Games are played in groups - add me to a group and start a Hack X there!")
+        return
+    fee, digits, error = _parse_hack_args(context.args or [], usage=HACKX_USAGE)
+    if error:
+        await update.message.reply_text(error)
+        return
+    await _open_hack_lobby(update, context, fee, digits, mode="free")
+
+
+async def _open_hack_lobby(update: Update, context: ContextTypes.DEFAULT_TYPE, fee, digits, mode="turn"):
     chat = update.effective_chat
     user = update.effective_user
 
@@ -9442,7 +9498,7 @@ async def _open_hack_lobby(update: Update, context: ContextTypes.DEFAULT_TYPE, f
 
     # The host is NOT joined and NOT charged - they use /join like everyone else.
     status, hid = await asyncio.to_thread(
-        db.hack_create, chat.id, user.id, fee, digits, HACK_GUESSES_BY_DIGITS[digits]
+        db.hack_create, chat.id, user.id, fee, digits, HACK_GUESSES_BY_DIGITS[digits], mode
     )
     if status == "exists":
         await update.message.reply_text("💻 A hack game is already running (or open for joining) in this group.")
@@ -9528,28 +9584,163 @@ async def _hack_start_locked(context, hid):
 
     last = await asyncio.to_thread(db.hack_get_last_secret, chat_id)
     secret = _hack_new_secret(h["digits"], last)  # picked now, when the game starts
-    if not await asyncio.to_thread(db.hack_activate, hid, secret):
+    order = [p[0] for p in staked]
+    free = h.get("mode") == "free"
+    if not free:
+        random.SystemRandom().shuffle(order)  # turn order is NOT the join order
+    if not await asyncio.to_thread(db.hack_activate, hid, secret, order):
+        return
+    names = {p[0]: p[1] for p in staked}
+
+    example = "".join(str(i) for i in range(1, h["digits"] + 1))
+    if free:
+        text = (
+            "💻 <b>HACK X STARTS!</b> 💻\n\n"
+            f"🔢 Digits: {h['digits']} (1-9, no repeats)\n"
+            f"💰 Prize pool: {DOLLAR}{fmt_coins(h['fee'] * len(staked))}\n"
+            f"⏳ Guesses per player: {h['guesses_each']}\n"
+            f"👥 Players ({len(staked)}): " + ", ".join(_elim_mention(uid, names[uid]) for uid in order) + "\n\n"
+            f"⚡ Everyone guesses at the same time - no turns! Just send your number "
+            f"(or use /guess &lt;number&gt; or /g &lt;number&gt;) - e.g. {example}"
+        )
+        try:
+            await safe_send(context.bot, chat_id, text=text, parse_mode="HTML")
+        except Exception:
+            logger.exception(f"hack {hid}: start announcement failed; the game carries on")
         return
 
-    names = ", ".join(_elim_mention(p[0], p[1]) for p in staked)
-    example = "".join(str(i) for i in range(1, h["digits"] + 1))
-    text = (
-        "💻 <b>HACK GAME STARTS!</b> 💻\n\n"
-        f"🔢 Digits: {h['digits']} (1-9, no repeats)\n"
-        f"💰 Prize pool: {DOLLAR}{fmt_coins(h['fee'] * len(staked))}\n"
-        f"⏳ Guesses per player: {h['guesses_each']}\n"
-        f"👥 Players ({len(staked)}): {names}\n\n"
-        f"Crack the number with /guess &lt;number&gt; - e.g. /guess {example}"
-    )
+    lines = [
+        "💻 <b>HACK GAME STARTS!</b> 💻",
+        "",
+        f"🔢 Digits: {h['digits']} (1-9, no repeats)",
+        f"💰 Prize pool: {DOLLAR}{fmt_coins(h['fee'] * len(staked))}",
+        f"⏳ Guesses per player: {h['guesses_each']}",
+        f"⏱️ Each turn: {HACK_TURN_SECONDS}s - miss {HACK_MAX_SKIPS} turns and you're out",
+        "👥 Play order:",
+    ]
+    lines += [f"{i}. {_elim_mention(uid, names[uid])}" for i, uid in enumerate(order, start=1)]
+    lines += ["", f"On your turn just send your number (or /guess &lt;number&gt; or /g &lt;number&gt;) - e.g. {example}"]
     try:
-        await safe_send(context.bot, chat_id, text=text, parse_mode="HTML")
+        await safe_send(context.bot, chat_id, text="\n".join(lines), parse_mode="HTML")
     except Exception:
         logger.exception(f"hack {hid}: start announcement failed; the game carries on")
 
+    await _hack_run_next(context, hid)
+
+
+def _hack_turn_text(uid, name, left, header=None) -> str:
+    body = (
+        f"👉 {_elim_mention(uid, name)}, your turn!\n"
+        f"Send /guess &lt;number&gt; within {HACK_TURN_SECONDS}s\n"
+        f"⏳ Guesses left: {left}"
+    )
+    return f"{header}\n\n{body}" if header else body
+
+
+def _hack_over_text(res) -> str:
+    return (
+        "💻 <b>Hack Game over</b>\n\n"
+        f"🔓 The number was {esc(res['secret'])}\n"
+        f"Nobody cracked it, so the {DOLLAR}{fmt_coins(res['pot'])} stays with the bot."
+    )
+
+
+async def _hack_run_next(context, hid):
+    """Starts the next player's turn (or ends the game if nobody can guess)."""
+    async with _HACK_TURN_LOCKS[hid]:
+        res = await asyncio.to_thread(db.hack_next_turn, hid, HACK_TURN_SECONDS)
+        kind = res.get("kind")
+        if kind in ("none", "busy"):
+            return
+        h = await asyncio.to_thread(db.hack_get, hid)
+        chat_id = h["chat_id"] if h else res.get("chat_id")
+        if kind == "over":
+            try:
+                await safe_send(context.bot, chat_id, text=_hack_over_text(res), parse_mode="HTML")
+            except Exception:
+                logger.exception(f"hack {hid}: game-over announcement failed")
+            return
+        try:
+            await safe_send(
+                context.bot, chat_id, text=_hack_turn_text(res["uid"], res["name"], res["left"]),
+                parse_mode="HTML",
+            )
+        except Exception:
+            logger.exception(f"hack {hid}: turn announcement failed; the timer still runs")
+        _schedule_tournament_job(
+            context.job_queue, hack_turn_timeout_callback, _hack_turn_job_name(hid),
+            HACK_TURN_SECONDS, chat_id, {"hid": hid, "uid": res["uid"], "started": res["started"]},
+        )
+
+
+async def hack_turn_timeout_callback(context: ContextTypes.DEFAULT_TYPE):
+    data = context.job.data or {}
+    hid = data.get("hid")
+    if hid is None:
+        return
+    try:
+        res = await asyncio.to_thread(
+            db.hack_turn_timeout, hid, data.get("uid"), data.get("started"), HACK_MAX_SKIPS
+        )
+        if not res:
+            return
+        chat_id = res["chat_id"]
+        mention = _elim_mention(res["uid"], res["name"])
+        if res["eliminated"]:
+            text = f"🚫 {mention} missed their turn again and is eliminated from the Hack."
+        else:
+            text = f"⏭️ {mention} ran out of time and was skipped ({res['skips']}/{HACK_MAX_SKIPS} skips)."
+        try:
+            await safe_send(context.bot, chat_id, text=text, parse_mode="HTML")
+        except Exception:
+            logger.exception(f"hack {hid}: skip notice failed; continuing anyway")
+        if res["over"]:
+            try:
+                await safe_send(context.bot, chat_id, text=_hack_over_text(res), parse_mode="HTML")
+            except Exception:
+                logger.exception(f"hack {hid}: game-over announcement failed")
+            return
+        await _hack_run_next(context, hid)
+    except Exception:
+        logger.exception(f"hack {hid}: turn timeout handling failed; re-arming")
+        _schedule_tournament_job(
+            context.job_queue, hack_advance_callback, f"hack_advance_{hid}", 5,
+            getattr(context.job, "chat_id", None), {"hid": hid},
+        )
+
+
+async def hack_advance_callback(context: ContextTypes.DEFAULT_TYPE):
+    hid = (context.job.data or {}).get("hid")
+    if hid is None:
+        return
+    try:
+        await _hack_run_next(context, hid)
+    except Exception:
+        logger.exception(f"hack {hid}: advancing failed; the watchdog will retry")
+
 
 async def guess_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/guess <number> - only joined players of the running Hack count;
-    everyone else is ignored silently."""
+    """/guess <number> (and the short /g <number>) - only joined players of the
+    running Hack count; everyone else is ignored silently."""
+    raw = ((context.args or [""])[0] or "").strip()
+    await _hack_process_guess(update, context, raw, from_text=False)
+
+
+async def hack_text_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """A plain message that is only digits counts as a guess from a joined
+    player - same as /guess. Anything that is not a digits-only message of the
+    right length, and anyone who is not playing, is ignored silently so normal
+    chatting is never disturbed."""
+    message = update.message
+    if not message or not message.text:
+        return
+    raw = message.text.strip()
+    if not raw.isascii() or not raw.isdigit():
+        return
+    await _hack_process_guess(update, context, raw, from_text=True)
+
+
+async def _hack_process_guess(update: Update, context: ContextTypes.DEFAULT_TYPE, raw, from_text=False):
     chat = update.effective_chat
     user = update.effective_user
     message = update.message
@@ -9559,8 +9750,9 @@ async def guess_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     h = await asyncio.to_thread(db.hack_get_open_for_chat, chat.id)
     if not h or h["status"] != "active":
         return
+    if from_text and len(raw) != h["digits"]:
+        return  # just a number in normal chat, not an attempt
 
-    raw = ((context.args or [""])[0] or "").strip()
     res = await asyncio.to_thread(db.hack_guess, h["id"], user.id, raw)
     kind = res.get("kind")
 
@@ -9570,11 +9762,16 @@ async def guess_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if res.get("first"):
             await message.reply_text("⏳ You have no guesses left.")
         return
+    if kind == "notturn":
+        if not from_text:  # a plain number out of turn is just ignored
+            await message.reply_text("⏳ It's not your turn yet - wait for your turn, then /guess.")
+        return
     if kind == "invalid":
         example = "".join(str(i) for i in range(1, res["digits"] + 1))
         await message.reply_text(f"❌ The numbers must be unique and can't include 0, example {example}")
         return
 
+    _hack_cancel_jobs(context.job_queue, h["id"])  # the valid guess ended this turn
     mention = _elim_mention(res["uid"], res["name"])
     text = (
         "💻 <b>Hack Game</b>\n\n"
@@ -9605,15 +9802,19 @@ async def guess_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             logger.exception(f"hack {h['id']}: winner announcement failed (the prize was already paid)")
     elif kind == "over":
-        over_text = (
-            "💻 <b>Hack Game over</b>\n\n"
-            f"🔓 The number was {esc(res['secret'])}\n"
-            f"Nobody cracked it, so the {DOLLAR}{fmt_coins(res['pot'])} stays with the bot."
-        )
         try:
-            await safe_send(context.bot, chat.id, text=over_text, parse_mode="HTML")
+            await safe_send(context.bot, chat.id, text=_hack_over_text(res), parse_mode="HTML")
         except Exception:
             logger.exception(f"hack {h['id']}: game-over announcement failed")
+    elif h.get("mode") != "free":  # 'guess' in a normal Hack: on to the next player (Hack X has no turns)
+        try:
+            await _hack_run_next(context, h["id"])
+        except Exception:
+            logger.exception(f"hack {h['id']}: moving to the next turn failed; re-arming")
+            _schedule_tournament_job(
+                context.job_queue, hack_advance_callback, f"hack_advance_{h['id']}", 3,
+                chat.id, {"hid": h["id"]},
+            )
 
 
 async def _hack_cancel_and_announce(context, hid, headline, keep_host_fee=False):
@@ -9679,7 +9880,7 @@ async def stophack_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _hack_cancel_and_announce(context, h["id"], "Hack stopped.", keep_host_fee=True)
 
 
-async def _hack_resume_one(context, h, force=False):
+async def _hack_resume_one(context, h, force=False, header=None):
     """Makes a stuck Hack continue from the exact place it stopped. Only acts
     if it is really stuck (the lobby lost its timer); otherwise it is healthy.
     Returns (code, data) with code 'resumed' | 'healthy' | 'none'."""
@@ -9704,8 +9905,49 @@ async def _hack_resume_one(context, h, force=False):
         )
         return "resumed", "timer"
 
-    # Active: a Hack has no timers - it simply waits for /guess - so it can't be stuck.
-    return "healthy", h
+    # Active Hack X: everybody guesses at any time - no timers, nothing can be stuck.
+    if h.get("mode") == "free":
+        return "healthy", h
+
+    # Active: continue from the exact place it stopped (same player, nobody loses time).
+    chat_id = h["chat_id"]
+    if h.get("current_player_id"):
+        started_dt = _elim_parse_dt(h["turn_started_at"])
+        age = (datetime.now() - started_dt).total_seconds() if started_dt else 10 ** 9
+        secs = h.get("turn_seconds") or HACK_TURN_SECONDS
+        has_job = bool(jq is not None and jq.get_jobs_by_name(_hack_turn_job_name(hid)))
+        if not (force or not has_job or age > secs + HACK_TURN_GRACE_SECONDS):
+            return "healthy", h
+        async with _HACK_TURN_LOCKS[hid]:
+            started = await asyncio.to_thread(db.hack_restart_turn_clock, hid)
+            if not started:
+                return "healthy", h
+            players = await asyncio.to_thread(db.hack_get_players, hid)
+            me = next((p for p in players if p[0] == h["current_player_id"]), None)
+            pname, pleft = (me[1], me[3]) if me else ("Player", 0)
+            try:
+                await safe_send(
+                    context.bot, chat_id,
+                    text=_hack_turn_text(h["current_player_id"], pname, pleft,
+                                         header=header or "▶️ <b>Hack resumed!</b>"),
+                    parse_mode="HTML",
+                )
+            except Exception as ex:
+                logger.error(f"hack {hid}: resume post failed: {ex}")
+            _schedule_tournament_job(
+                jq, hack_turn_timeout_callback, _hack_turn_job_name(hid),
+                secs, chat_id, {"hid": hid, "uid": h["current_player_id"], "started": started},
+            )
+        return "resumed", "turn"
+
+    # Between turns: advance if nothing is queued.
+    idle_dt = _elim_parse_dt(h["last_activity"])
+    idle = (datetime.now() - idle_dt).total_seconds() if idle_dt else 10 ** 9
+    has_adv = bool(jq is not None and jq.get_jobs_by_name(f"hack_advance_{hid}"))
+    if not force and (has_adv or idle < HACK_IDLE_RESUME_SECONDS):
+        return "healthy", h
+    await _hack_run_next(context, hid)
+    return "resumed", "turn"
 
 
 async def resumehack_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -9728,7 +9970,19 @@ async def resumehack_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if h["status"] == "lobby":
             await update.message.reply_text("▶️ The Hack lobby is open - it will start on its own when the lobby closes.")
         else:
-            await update.message.reply_text("▶️ The Hack is running normally - players can /guess the number.")
+            cur = h.get("current_player_id")
+            if h.get("mode") == "free":
+                await update.message.reply_text("▶️ The Hack X is running normally - players can send their guesses any time.")
+                return
+            if cur:
+                players = await asyncio.to_thread(db.hack_get_players, h["id"])
+                me = next((p for p in players if p[0] == cur), None)
+                if me:
+                    await update.message.reply_html(
+                        f"▶️ The Hack is running normally - it's {_elim_mention(me[0], me[1])}'s turn."
+                    )
+                    return
+            await update.message.reply_text("▶️ The Hack is running normally - the next turn is about to start.")
     elif code == "none":
         await update.message.reply_text(f"💻 {data}")
     elif data == "timer":
@@ -9743,7 +9997,10 @@ async def hack_restore_callback(context: ContextTypes.DEFAULT_TYPE):
     try:
         h = await asyncio.to_thread(db.hack_get, hid)
         if h and h["status"] in ("lobby", "active"):
-            await _hack_resume_one(context, h, force=True)
+            await _hack_resume_one(
+                context, h, force=True,
+                header="⚙️ <b>I'm back!</b> The Hack continues - nobody lost time.",
+            )
     except Exception:
         logger.exception(f"hack {hid}: restore failed; the watchdog will retry")
 
@@ -9786,8 +10043,7 @@ async def _hack_watchdog_scan(context: ContextTypes.DEFAULT_TYPE):
                 continue
             if jq.get_jobs_by_name(_hack_restore_job_name(hid)):
                 continue
-            if h["status"] == "lobby":
-                await _hack_resume_one(context, h, force=False)
+            await _hack_resume_one(context, h, force=False)
         except Exception:
             logger.exception(f"watchdog: hack {hid} check failed (will run again)")
 
@@ -11765,8 +12021,9 @@ def _fullhelp_hack_page() -> str:
         f"A number-cracking game inside a group: a secret number is hidden and everyone races to crack it.\n\n"
         f"🚀 <b>Starting</b>\n"
         f"/hack &lt;fee&gt; &lt;digits&gt; - e.g. /hack 3000 3\n"
-        f"Fee {HACK_MIN_FEE:,} or more, digits 3, 4, 5 or 6. Or tap 💻 Hack in /playgame "
-        f"(fee {HACK_QUICK_FEE}, {HACK_QUICK_DIGITS} digits).\n"
+        f"Fee {HACK_MIN_FEE:,} or more, digits 3, 4, 5 or 6.\n"
+        f"Too lazy to type? Just send /hack - it starts a quick game (fee {HACK_QUICK_FEE}, {HACK_QUICK_DIGITS} digits). "
+        f"The 💻 Hack button in /playgame does the same.\n"
         f"The host is NOT joined automatically and pays nothing until they /join like everyone else.\n\n"
         f"🚪 <b>Lobby</b>\n"
         f"Players send /join. The entry fee is taken from your Word Scramble balance first; only if that is too low "
@@ -11775,15 +12032,21 @@ def _fullhelp_hack_page() -> str:
         f"The host (or the bot owner) can send /starthack to start early.\n\n"
         f"🎯 <b>Playing</b>\n"
         f"The hidden number uses the digits 1-9 only, no 0 and no repeated digit (e.g. 876). "
-        f"Send /guess &lt;number&gt; (e.g. /guess 563).\n"
+        f"Players take turns in a random order (NOT the order they joined). On your turn you have {HACK_TURN_SECONDS} seconds "
+        f"to send one /guess &lt;number&gt; (e.g. /guess 563). Miss your turn and you are skipped; miss {HACK_MAX_SKIPS} turns and you are "
+        f"eliminated (your fee stays in the pool). You don't have to type /guess: just send the number, or use the short /g.\n"
         f"🟩 Hacks = right digit in the right spot\n"
         f"🟨 Glitches = the digit is in the number but in the wrong spot\n"
         f"Every player has their own guesses: {g[3]} for 3 digits, {g[4]} for 4, {g[5]} for 5, {g[6]} for 6. "
-        f"An invalid guess does not use one up. Out of guesses? You can no longer guess, but you are not kicked.\n\n"
+        f"An invalid guess does not use one up. Out of guesses? Your turns are skipped automatically, but you are not kicked.\n\n"
         f"🏆 <b>Prize</b>\n"
         f"The first player to crack the number wins the whole pool (every entry fee, no bonus); it also counts in that "
         f"group's \"in this chat\" Word Scramble board, and the winner's profile picture is attached to the winning message. "
-        f"If nobody cracks it before every player runs out of guesses, the bot keeps the money.\n\n"
+        f"If nobody cracks it before every player runs out of guesses (or is eliminated), the bot keeps the money.\n\n"
+        f"⚡ <b>Hack X</b>\n"
+        f"/hackx - quick game ({HACK_QUICK_FEE} fee, {HACK_QUICK_DIGITS} digits). /sethackx &lt;fee&gt; &lt;digits&gt; - your own fee and digits "
+        f"(e.g. /sethackx 500 4). Same rules, but there are NO turns: everybody guesses at the same time, as fast as they like, "
+        f"each with their own guesses. /starthack, /stophack and /resumehack work for Hack X too.\n\n"
         f"🛠️ <b>If something goes wrong</b>\n"
         f"/stophack - the host or the bot owner cancels it; every other player is refunded (the host's own fee stays with the bot).\n"
         f"/resumehack - the host or the bot owner continues a stuck Hack. A Hack that has not moved for 6 hours is refunded automatically.\n\n"
@@ -12546,7 +12809,9 @@ def main():
     app.add_handler(CommandHandler("stopelimination", stopelimination_command))
     app.add_handler(CommandHandler("resumeelimination", resumeelimination_command))
     app.add_handler(CommandHandler("hack", hack_command))
-    app.add_handler(CommandHandler("guess", guess_command))
+    app.add_handler(CommandHandler(["guess", "g"], guess_command))
+    app.add_handler(CommandHandler("hackx", hackx_command))
+    app.add_handler(CommandHandler("sethackx", sethackx_command))
     app.add_handler(CommandHandler("starthack", starthack_command))
     app.add_handler(CommandHandler("stophack", stophack_command))
     app.add_handler(CommandHandler("resumehack", resumehack_command))
@@ -12597,6 +12862,13 @@ def main():
         filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND,
         scramble_group_router,
     ), group=1)
+
+    # Hack: a plain digits-only message from a joined player counts as a guess.
+    # Own handler group, so it runs next to (and never blocks) the handlers above.
+    app.add_handler(MessageHandler(
+        filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND & filters.Regex(r"^\s*\d{3,6}\s*$"),
+        hack_text_guess,
+    ), group=2)
 
     if app.job_queue is not None:
         # A timer that fires even 1-2 seconds late (event loop briefly busy)
