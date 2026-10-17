@@ -1689,8 +1689,55 @@ async def scramblesetreward_command(update: Update, context: ContextTypes.DEFAUL
     await update.message.reply_text(f"✅ Word Scramble win reward set to {DOLLAR}{fmt_coins(amount)}. Takes effect immediately.")
 
 
-@owner_only
 async def gamedifficulty_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """The bot owner keeps everything (all groups at once, or one named group).
+    Group admins can manage the difficulty of THEIR OWN group only."""
+    user = update.effective_user
+    chat = update.effective_chat
+    if not user:
+        return
+    if is_owner(user.id):
+        await _gamedifficulty_owner_command(update, context)
+        return
+
+    if chat.type == ChatType.PRIVATE:
+        await update.message.reply_text(
+            "🚫 Group admins: run /gamedifficulty inside your own group. In my DM it is for the bot owner."
+        )
+        return
+    if not await is_chat_admin(update, context):
+        await update.message.reply_text("❌ Only group admins (or the bot owner) can use /gamedifficulty.")
+        return
+
+    valid = _DIFFICULTY_LABELS
+    if not context.args or context.args[0].lower() not in valid:
+        current = await asyncio.to_thread(db.get_effective_game_difficulty, chat.id)
+        await update.message.reply_html(
+            "Usage:\n"
+            "<code>/gamedifficulty easy</code> — mix of 3/4/5/6-letter words\n"
+            "<code>/gamedifficulty easy3</code> (or easy4/easy5/easy6) — that exact length only\n"
+            "<code>/gamedifficulty medium</code> — words of 8+ letters, compounds excluded\n"
+            "<code>/gamedifficulty hard</code> — words of 11+ letters, compounds included\n"
+            "<code>/gamedifficulty off</code> — use the full word pool\n\n"
+            "Add <b>x</b> to any mode (<code>easyx</code>, <code>easy3x</code>/easy4x/easy5x/easy6x, "
+            "<code>mediumx</code>, <code>hardx</code>, <code>offx</code>) for the same thing, but the scrambled "
+            "letters are shown in lowercase so the first letter isn't given away.\n\n"
+            "This changes the difficulty of <b>this group</b> only (Word Game and Word Scramble share it).\n\n"
+            f"Current for this group: <b>{esc(current)}</b>"
+        )
+        return
+    if len(context.args) > 1:
+        await update.message.reply_text(
+            "❌ Group admins can only change this group's difficulty - just send /gamedifficulty <mode>."
+        )
+        return
+
+    label = context.args[0].lower()
+    await asyncio.to_thread(db.set_group_game_difficulty_override, chat.id, label)
+    await update.message.reply_html(f"✅ Difficulty for this group set to <b>{label}</b>.")
+
+
+async def _gamedifficulty_owner_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     valid = _DIFFICULTY_LABELS
 
     if not context.args or context.args[0].lower() not in valid:
@@ -1935,14 +1982,14 @@ def _scrambleallcommands_text() -> str:
 /scrambleautomaticmode on|off - group admins (or the owner) can manually control Automatic Mode here (blocked while Slow Mode is on in that chat). The bot never turns this on by itself anymore.
 /slowmode on &lt;time&gt;|off - group admins (or the owner) can control Slow Mode here; next round is sent exactly &lt;time&gt; after the previous one ends (e.g. /slowmode on 2m or /slowmode on 30s; seconds 1-60s, or m/h/d). Every round still lasts a maximum of 2 minutes, and turning this on also turns Automatic Mode off in this chat.
 /deleterequestprompt off|on [&lt;1-9&gt;s|m] - group admins (or the owner) can control whether resolved /request prompts are deleted here and after how long (default on, 30 seconds; no args shows the current setting)
+/gamedifficulty easy|easy3-6|medium|hard|off - group admins (or the owner) can choose which word lengths get picked in this group (shared with Word Game); the owner can also add a group, or leave it out to apply to ALL groups at once (and new groups)
+/gamedifficulty easyx|easy3x-6x|mediumx|hardx|offx - same as the modes above, but the scrambled letters are shown in lowercase so the first letter isn't given away
 
 <b>👑 Owner Commands</b>
 /scramblestats - Word Scramble bot-wide statistics
 /scramblesetreward &lt;amount&gt; - set the win reward
 /scramblereloadwords - reload the word pool from medium_words_raw.py
 /shufflewords - reshuffle the shared word pool (Word Game and Word Scramble both draw from it)
-/gamedifficulty easy|easy3-6|medium|hard|off [group] - control which word lengths get picked (shared with Word Game); with no group it applies to ALL groups at once (and new groups)
-/gamedifficulty easyx|easy3x-6x|mediumx|hardx|offx [group] - same as the modes above, but the scrambled letters are shown in lowercase so the first letter isn't given away
 /scrambleforceend [Chat ID] - force-end a stuck round in one chat
 /scramblestopallgroups - force-end the active round in EVERY chat at once and pause new ones (until /scramblemaintenance off)
 /scramblemaintenance on|off - pause new Word Scramble rounds only (Word Game unaffected)
@@ -4789,6 +4836,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /playgame - (groups) start Normal, Slow, Automatic Mode, a Tournament, Elimination or Hack from one menu
 /hack &lt;fee&gt; &lt;digits&gt; - (groups) open a Hack lobby: players take turns cracking the hidden number, the winner takes all; just /hack = quick game (see /fullhelp)
 /hackx - (groups) quick Hack X: same, but everybody guesses at the same time; /sethackx &lt;fee&gt; &lt;digits&gt; to choose the fee and digits
+/gamedifficulty &lt;mode&gt; - (group admins) choose which word lengths this group's Word Game and Word Scramble use: easy, easy3-6, medium, hard, off (add x, e.g. easyx, for lowercase letters)
 /daily - claim your daily reward (in my DM)
 /support - support the bot with Telegram Stars
 /leaderboard - this chat's leaderboard
@@ -7011,8 +7059,8 @@ def _allcommands_text() -> str:
 /slowmode on &lt;time&gt;|off - group admins (or the owner) can control Slow Mode here (e.g. /slowmode on 2m or /slowmode on 30s; seconds 1-60s, or m/h/d)
 /deleterequestprompt off|on [&lt;1-9&gt;s|m] - group admins (or the owner) can control whether resolved /request prompts are deleted here and after how long (default on, 30 seconds; no args shows the current setting)
 /groupadminmode on|off &lt;group ID or @username&gt; - owner/Bot Admins only, works from my DM: require (or not) that I'm an admin here before games can start, overriding the global /adminmode default
-/gamedifficulty easy|easy3-6|medium|hard|off [group] - owner only: control which word lengths get picked; add a group to target just that group, or leave it out to apply to ALL groups at once (and new groups)
-/gamedifficulty easyx|easy3x-6x|mediumx|hardx|offx [group] - owner only: same as the modes above, but the scrambled letters are shown in lowercase so the first letter isn't given away
+/gamedifficulty easy|easy3-6|medium|hard|off - group admins (or the owner) can choose which word lengths get picked in this group (shared with Word Game); the owner can also add a group, or leave it out to apply to ALL groups at once (and new groups)
+/gamedifficulty easyx|easy3x-6x|mediumx|hardx|offx - same as the modes above, but the scrambled letters are shown in lowercase so the first letter isn't given away
 
 <b>👑 Owner Commands</b>
 /stats - bot-wide statistics
@@ -7075,7 +7123,7 @@ def _allcommands_text() -> str:
 /changesponsoredad &lt;text, link, @username, or 'label | link'&gt; - owner only: replace the Sponsored Ad content (or 'clear' to reset)
 /showgamemedal on|off - owner/Bot Admins only: toggle the 🥇🥈🥉 medal prefix on Word Game names (global, no args shows current status)
 
-<i>Note: banuser/unbanuser/bangroup/unbangroup/broadcast/maintenance/addadmanager/changeadmanager/removeadmanager/admanager/adminmode/prompt/editprompt/groupadminmode can also be used by Bot Admins. /ad on|off, /botgroups, /botusers, /addwords, /removewords, /shufflewords, and /gamedifficulty are owner-only. /autodelete's bare on/off form works for group admins too; its explicit-group and allgroups forms are owner-only. This list and /scrambleallcommands are visible to the bot owner, Bot Admins, and each group's own Telegram creator. The owner is alerted in DM whenever someone buys Premium, gifts Premium, buys 💵 cash or boosts their rank/level. Word Scramble has its own command list - see /scrambleallcommands (includes /scramblestopallgroups). The 🎁 Daily Reward always credits the Word Game balance, and every player's Balance/Level/Rank on /start combines their Word Game + Word Scramble balances automatically.</i>
+<i>Note: banuser/unbanuser/bangroup/unbangroup/broadcast/maintenance/addadmanager/changeadmanager/removeadmanager/admanager/adminmode/prompt/editprompt/groupadminmode can also be used by Bot Admins. /ad on|off, /botgroups, /botusers, /addwords, /removewords and /shufflewords are owner-only. /gamedifficulty works for group admins in their own group; only the owner can target another group or all groups at once. /autodelete's bare on/off form works for group admins too; its explicit-group and allgroups forms are owner-only. This list and /scrambleallcommands are visible to the bot owner, Bot Admins, and each group's own Telegram creator. The owner is alerted in DM whenever someone buys Premium, gifts Premium, buys 💵 cash or boosts their rank/level. Word Scramble has its own command list - see /scrambleallcommands (includes /scramblestopallgroups). The 🎁 Daily Reward always credits the Word Game balance, and every player's Balance/Level/Rank on /start combines their Word Game + Word Scramble balances automatically.</i>
 """
 
 
@@ -9664,6 +9712,10 @@ async def _hack_run_next(context, hid):
             except Exception:
                 logger.exception(f"hack {hid}: game-over announcement failed")
             return
+        _schedule_tournament_job(
+            context.job_queue, hack_turn_timeout_callback, _hack_turn_job_name(hid),
+            HACK_TURN_SECONDS, chat_id, {"hid": hid, "uid": res["uid"], "started": res["started"]},
+        )
         try:
             await safe_send(
                 context.bot, chat_id, text=_hack_turn_text(res["uid"], res["name"], res["left"]),
@@ -9671,10 +9723,6 @@ async def _hack_run_next(context, hid):
             )
         except Exception:
             logger.exception(f"hack {hid}: turn announcement failed; the timer still runs")
-        _schedule_tournament_job(
-            context.job_queue, hack_turn_timeout_callback, _hack_turn_job_name(hid),
-            HACK_TURN_SECONDS, chat_id, {"hid": hid, "uid": res["uid"], "started": res["started"]},
-        )
 
 
 async def hack_turn_timeout_callback(context: ContextTypes.DEFAULT_TYPE):
@@ -9926,18 +9974,8 @@ async def _hack_resume_one(context, h, force=False, header=None):
             started = await asyncio.to_thread(db.hack_restart_turn_clock, hid)
             if not started:
                 return "healthy", h
-            players = await asyncio.to_thread(db.hack_get_players, hid)
-            me = next((p for p in players if p[0] == h["current_player_id"]), None)
-            pname, pleft = (me[1], me[3]) if me else ("Player", 0)
-            try:
-                await safe_send(
-                    context.bot, chat_id,
-                    text=_hack_turn_text(h["current_player_id"], pname, pleft,
-                                         header=header or "▶️ <b>Hack resumed!</b>"),
-                    parse_mode="HTML",
-                )
-            except Exception as ex:
-                logger.error(f"hack {hid}: resume post failed: {ex}")
+            # Silent: the player was already tagged for this turn, so nothing is posted
+            # (no "resumed" message and no second tag) - only the timer is re-armed.
             _schedule_tournament_job(
                 jq, hack_turn_timeout_callback, _hack_turn_job_name(hid),
                 secs, chat_id, {"hid": hid, "uid": h["current_player_id"], "started": started},
@@ -9991,6 +10029,8 @@ async def resumehack_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text(f"💻 {data}")
     elif data == "timer":
         await update.message.reply_text("▶️ Hack resumed - the lobby timer is running again.")
+    elif data == "turn":
+        await update.message.reply_text("✅ Done - the Hack is moving again.")
     # 'started': the group has just received the start announcement.
 
 
@@ -10001,10 +10041,7 @@ async def hack_restore_callback(context: ContextTypes.DEFAULT_TYPE):
     try:
         h = await asyncio.to_thread(db.hack_get, hid)
         if h and h["status"] in ("lobby", "active"):
-            await _hack_resume_one(
-                context, h, force=True,
-                header="⚙️ <b>I'm back!</b> The Hack continues - nobody lost time.",
-            )
+            await _hack_resume_one(context, h, force=True)
     except Exception:
         logger.exception(f"hack {hid}: restore failed; the watchdog will retry")
 
@@ -12121,6 +12158,8 @@ def _fullhelp_other_page() -> str:
         f"Balance, level and rank combine your Word Game and Word Scramble earnings.\n"
         f"/ranks - the full rank ladder and what each level needs.\n\n"
         f"🧹 <b>Group admin tools</b>\n"
+        f"/gamedifficulty &lt;mode&gt; - group admins can choose which word lengths this group's Word Game and Word Scramble use: "
+        f"easy, easy3-easy6, medium, hard, off (add an x, e.g. easyx, to show the scrambled letters in lowercase). Run it in your own group; with no mode it shows the current setting.\n"
         f"/autodelete on|off [interval] - group admins can have me clean up my own messages in the group; "
         f"add a number + s/m/h/d (e.g. 9m) for periodic cleanup instead of round-based.\n"
         f"/stopgame and /scramblestopgame - stop a live round. /slowmode (now also in seconds, e.g. /slowmode on 30s) and /scrambleautomaticmode - see the Word Scramble page.\n\n"
@@ -12221,7 +12260,7 @@ _COMMANDS_MENU = (
     ("sc", "Scramble commands", "🔤 Scramble commands",
      ("wordscramble", "scramblehelp", "scrambleleaderboard", "scrambletopplayers", "scrambletopgroups",
       "ranks", "playgame", "bal", "balance", "scramblestopgame", "scrambleautomaticmode", "slowmode",
-      "deleterequestprompt"), True),
+      "deleterequestprompt", "gamedifficulty"), True),
     ("hk", "Hack commands", "💻 Hack commands",
      ("hack", "hackx", "sethackx", "guess", "g", "join", "starthack", "stophack", "resumehack"), False),
     ("el", "Elimination commands", "🔥 Elimination commands",
@@ -12230,7 +12269,8 @@ _COMMANDS_MENU = (
      ("tournament", "settournament", "join"), False),
     ("wg", "Word Game commands", "🎮 Word Game commands",
      ("start", "help", "wordgame", "hint", "stopvote", "stopgame", "autodelete", "leaderboard", "chattop",
-      "globaltop", "topplayers", "topgroups", "claimdailyreward", "settings", "autolead", "bal", "balance"), False),
+      "globaltop", "topplayers", "topgroups", "claimdailyreward", "settings", "autolead", "bal", "balance",
+      "gamedifficulty"), False),
 )
 _COMMANDS_OWNER_ONLY_DESC = re.compile(r"\s*(owner only|owner/bot admins|bot admins only)", re.IGNORECASE)
 
