@@ -1923,6 +1923,10 @@ def _scrambleallcommands_text() -> str:
 /support - support the bot with Telegram Stars (quick amounts or a custom amount; gives no in-game advantage; used in a group it moves you to my DM)
 /supporters - the top supporters leaderboard
 /mysupport - your own total support and number of contributions
+/bal - your total global balance (Word Game + Word Scramble); reply to someone's message with /bal to see theirs
+/balance - same as /bal
+/command - my DM only: browse the commands by category (Scramble, Hack, Elimination, Tournament, Word Game) with buttons
+/commands - same as /command
 /searchcommand &lt;text&gt; - search the command list by name or description (only shows commands you're allowed to see)
 /fullhelp - a complete, paged guide to the bot: games, tournaments, premium, cash and more
 
@@ -6985,6 +6989,10 @@ def _allcommands_text() -> str:
 /support - support the bot with Telegram Stars (quick amounts or a custom amount; gives no in-game advantage; used in a group it moves you to my DM)
 /supporters - the top supporters leaderboard
 /mysupport - your own total support and number of contributions
+/bal - your total global balance (Word Game + Word Scramble); reply to someone's message with /bal to see theirs
+/balance - same as /bal
+/command - my DM only: browse the commands by category (Scramble, Hack, Elimination, Tournament, Word Game) with buttons
+/commands - same as /command
 /searchcommand &lt;text&gt; - search the command list by name or description (only shows commands you're allowed to see)
 /fullhelp - a complete, paged guide to the bot: games, tournaments, premium, cash and more
 
@@ -9629,11 +9637,7 @@ async def _hack_start_locked(context, hid):
 
 
 def _hack_turn_text(uid, name, left, header=None) -> str:
-    body = (
-        f"👉 {_elim_mention(uid, name)}, your turn!\n"
-        f"Send /guess &lt;number&gt; within {HACK_TURN_SECONDS}s\n"
-        f"⏳ Guesses left: {left}"
-    )
+    body = f"👉 {_elim_mention(uid, name)}, your turn!"
     return f"{header}\n\n{body}" if header else body
 
 
@@ -12122,6 +12126,8 @@ def _fullhelp_other_page() -> str:
         f"/stopgame and /scramblestopgame - stop a live round. /slowmode (now also in seconds, e.g. /slowmode on 30s) and /scrambleautomaticmode - see the Word Scramble page.\n\n"
         f"🔎 <b>Finding commands</b>\n"
         f"/searchcommand &lt;text&gt; - search commands by name or description.\n"
+        f"/command or /commands (in my DM) - browse the commands by category with buttons.\n"
+        f"/bal or /balance - your total balance (Word Game + Word Scramble); reply to someone's message to see theirs.\n"
         f"/help and /scramblehelp - the short how-to-play guides.\n"
         f"/fullhelp - this guide."
     )
@@ -12185,6 +12191,151 @@ async def fullhelp_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except BadRequest:
         pass  # same page tapped again - nothing to change
+
+
+async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/bal and /balance - total global balance (Word Game + Word Scramble).
+    Reply to someone's message with it to see that person's balance."""
+    user = update.effective_user
+    message = update.message
+    if not user or not message:
+        return
+    target = user
+    reply_msg = message.reply_to_message
+    if (
+        reply_msg is not None
+        and reply_msg.from_user is not None
+        and not reply_msg.from_user.is_bot
+        and not getattr(reply_msg, "forum_topic_created", None)  # forum topics auto-set a "reply" to the topic root
+    ):
+        target = reply_msg.from_user
+    total = await asyncio.to_thread(db.get_combined_balance, target.id)
+    title = "Your balance" if target.id == user.id else f"{esc_name(target.first_name)}'s balance"
+    await message.reply_html(f"💰 <b>{title}</b>\n\n{DOLLAR}{fmt_coins(total)}")
+
+
+# ------------------------------- /command, /commands -------------------------------
+
+_COMMANDS_MENU = (
+    # key, button label, title, command names, read the Word Scramble list first?
+    ("sc", "Scramble commands", "🔤 Scramble commands",
+     ("wordscramble", "scramblehelp", "scrambleleaderboard", "scrambletopplayers", "scrambletopgroups",
+      "ranks", "playgame", "bal", "balance", "scramblestopgame", "scrambleautomaticmode", "slowmode",
+      "deleterequestprompt"), True),
+    ("hk", "Hack commands", "💻 Hack commands",
+     ("hack", "hackx", "sethackx", "guess", "g", "join", "starthack", "stophack", "resumehack"), False),
+    ("el", "Elimination commands", "🔥 Elimination commands",
+     ("elimination", "setelimination", "join", "startelimination", "resumeelimination"), False),
+    ("to", "Tournament commands", "🏟️ Tournament commands",
+     ("tournament", "settournament", "join"), False),
+    ("wg", "Word Game commands", "🎮 Word Game commands",
+     ("start", "help", "wordgame", "hint", "stopvote", "stopgame", "autodelete", "leaderboard", "chattop",
+      "globaltop", "topplayers", "topgroups", "claimdailyreward", "settings", "autolead", "bal", "balance"), False),
+)
+_COMMANDS_OWNER_ONLY_DESC = re.compile(r"\s*(owner only|owner/bot admins|bot admins only)", re.IGNORECASE)
+
+
+def _commands_menu_text(key) -> str:
+    """The commands of one category for players and group admins, read from the
+    SAME text /allcommands and /scrambleallcommands send (so it never goes
+    stale). Owner sections and owner-only commands are never included."""
+    cat = next((c for c in _COMMANDS_MENU if c[0] == key), _COMMANDS_MENU[0])
+    _k, _label, title, names, scramble_first = cat
+    texts = (
+        (_scrambleallcommands_text(), _allcommands_text()) if scramble_first
+        else (_allcommands_text(), _scrambleallcommands_text())
+    )
+    players, admins, seen = [], [], set()
+    for text in texts:
+        section = None
+        for raw in text.split("\n"):
+            line = raw.strip()
+            heading = re.fullmatch(r"<b>(.*)</b>", line)
+            if heading:
+                t = heading.group(1)
+                section = "owner" if "Owner" in t else ("admin" if "Group Admin" in t else "player")
+                continue
+            if section in (None, "owner") or not line.startswith("/"):
+                continue
+            head, _sep, desc = line.partition(" - ")
+            found = re.findall(r"/([A-Za-z0-9_]+)", html_lib.unescape(head))
+            if not found or found[0].lower() not in names:
+                continue
+            if _COMMANDS_OWNER_ONLY_DESC.match(html_lib.unescape(desc)):
+                continue
+            if (found[0].lower(), head) in seen:
+                continue
+            seen.add((found[0].lower(), head))
+            (admins if section == "admin" else players).append(line)
+    out = [f"<b>{title}</b>", ""]
+    if players:
+        out += ["👥 <b>Players</b>"] + players + [""]
+    if admins:
+        out += ["🛡️ <b>Group admins</b>"] + admins + [""]
+    if not players and not admins:
+        out.append("No commands found.")
+    return "\n".join(out).rstrip()
+
+
+def _commands_menu_keyboard(user_id, current=None):
+    def btn(c):
+        shown = f"• {c[1]}" if c[0] == current else c[1]
+        return InlineKeyboardButton(shown, callback_data=f"cmd:{user_id}:{c[0]}")
+    b = {c[0]: btn(c) for c in _COMMANDS_MENU}
+    return InlineKeyboardMarkup([[b["sc"], b["hk"]], [b["el"], b["to"]], [b["wg"]]])
+
+
+def _split_text_parts(text, limit=3800):
+    parts, cur = [], ""
+    for line in text.split("\n"):
+        if cur and len(cur) + len(line) + 1 > limit:
+            parts.append(cur)
+            cur = line
+        else:
+            cur = f"{cur}\n{line}" if cur else line
+    if cur:
+        parts.append(cur)
+    return parts or [text]
+
+
+async def commands_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/command and /commands - only in the bot's DM."""
+    if update.effective_chat.type != ChatType.PRIVATE:
+        await update.message.reply_text("📖 Please use /commands in my DM (private chat) to browse the commands.")
+        return
+    await update.message.reply_html(
+        "📖 <b>Commands</b>\n\nPick a category to see its commands:",
+        reply_markup=_commands_menu_keyboard(update.effective_user.id),
+    )
+
+
+async def commands_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    try:
+        _p, owner_id, key = query.data.split(":")
+        owner_id = int(owner_id)
+    except ValueError:
+        await query.answer()
+        return
+    if query.from_user.id != owner_id:
+        await query.answer("Send /commands yourself to browse the commands.", show_alert=True)
+        return
+    text = await asyncio.to_thread(_commands_menu_text, key)
+    parts = _split_text_parts(text)
+    await query.answer()
+    try:
+        await query.edit_message_text(
+            parts[0], parse_mode="HTML",
+            reply_markup=_commands_menu_keyboard(owner_id, key),
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+        )
+    except BadRequest:
+        return  # same category tapped again - nothing to change
+    for extra in parts[1:]:
+        try:
+            await safe_send(context.bot, query.message.chat_id, text=extra, parse_mode="HTML")
+        except Exception:
+            logger.exception("commands menu: extra part not delivered")
 
 
 async def premiumstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -12823,6 +12974,8 @@ def main():
     app.add_handler(CommandHandler("request", request_command))
     app.add_handler(CommandHandler("deleterequestprompt", deleterequestprompt_command))
     app.add_handler(CommandHandler("searchcommand", searchcommand_command))
+    app.add_handler(CommandHandler(["bal", "balance"], balance_command))
+    app.add_handler(CommandHandler(["command", "commands"], commands_command))
     app.add_handler(CommandHandler("fullhelp", fullhelp_command))
     app.add_handler(CommandHandler("setpremium", setpremium_command))
     app.add_handler(CommandHandler("seepremiumplayers", seepremiumplayers_command))
@@ -12839,6 +12992,7 @@ def main():
     app.add_handler(CallbackQueryHandler(transfer_button, pattern=r"^tf:[yn]:[0-9a-f]+$"))
     app.add_handler(CallbackQueryHandler(request_button, pattern=r"^rq:[yn]:\d+$"))
     app.add_handler(CallbackQueryHandler(fullhelp_button, pattern=r"^fh:\d+:[gstpoh]$"))
+    app.add_handler(CallbackQueryHandler(commands_menu_button, pattern=r"^cmd:\d+:(sc|hk|el|to|wg)$"))
     app.add_handler(CallbackQueryHandler(premium_players_page_button, pattern=r"^spp:\d+$"))
     app.add_handler(CommandHandler("profile", profile_command))
     app.add_handler(CommandHandler("inviteandearn", inviteandearn_command))
