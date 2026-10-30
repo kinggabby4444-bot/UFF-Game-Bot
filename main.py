@@ -19,7 +19,7 @@ try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    pass
+    main().run_polling()
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReactionTypeEmoji, LinkPreviewOptions, LabeledPrice
 from telegram.constants import ChatType
@@ -13600,4 +13600,4 @@ def main():
 
 
 if __name__ == "__main__":
-    pass
+    main().run_polling()
