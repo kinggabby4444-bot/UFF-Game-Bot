@@ -727,8 +727,10 @@ async def removewords_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 # =======================================================================
 
 SCRAMBLE_ROUND_SECONDS = 120
-DEFAULT_SCRAMBLE_REWARD = 5
-SCRAMBLE_STREAK_MILESTONES = {3: 5, 5: 10, 10: 25, 20: 50}
+DEFAULT_SCRAMBLE_REWARD = 1
+# Win streaks were removed: no milestone bonuses are paid any more. (Existing
+# current_streak / best_streak values stay in the database untouched.)
+SCRAMBLE_STREAK_MILESTONES = {}
 
 
 def get_scramble_reward() -> int:
@@ -779,15 +781,19 @@ def scramble_random_word(chat_id):
     if not pool:
         return None
 
-    used = db.scramble_get_used_words(chat_id)
-    choices = [w for w in pool if w not in used]
+    # One lock per chat across get -> choose -> mark, so two simultaneous
+    # picks in the same chat can't choose the same word (the used-word
+    # history is cached in memory - see database.py).
+    with db.used_words_lock("sc", chat_id):
+        used = db.scramble_get_used_words(chat_id)
+        choices = [w for w in pool if w not in used]
 
-    if not choices:
-        db.scramble_reset_used_words(chat_id)
-        choices = list(pool)
+        if not choices:
+            db.scramble_reset_used_words(chat_id)
+            choices = list(pool)
 
-    word = random.choice(choices)
-    db.scramble_mark_word_used(chat_id, word)
+        word = random.choice(choices)
+        db.scramble_mark_word_used(chat_id, word)
     return word
 
 
@@ -1390,16 +1396,7 @@ async def _scramble_handle_win_after_claim(context: ContextTypes.DEFAULT_TYPE, c
     if winner_is_premium:
         reward *= 2
 
-    await asyncio.to_thread(db.scramble_reset_all_streaks_in_chat, chat.id, user.id)
-    new_streak = await asyncio.to_thread(db.scramble_record_win, user.id, chat.id, user.first_name, reward)
-
-    bonus = SCRAMBLE_STREAK_MILESTONES.get(new_streak)
-    if bonus and winner_is_premium:
-        bonus *= 2
-    total = reward
-    if bonus:
-        await asyncio.to_thread(db.scramble_add_bonus, user.id, chat.id, user.first_name, bonus)
-        total += bonus
+    await asyncio.to_thread(db.scramble_record_win, user.id, chat.id, user.first_name, reward)
 
     medal = await medal_prefix_if_enabled(user.id, "show_scramble_medal")
     badge = await level_badge_html(user.id)
@@ -1410,9 +1407,6 @@ async def _scramble_handle_win_after_claim(context: ContextTypes.DEFAULT_TYPE, c
         f"{medal}{name_html}{badge}",
         f"Got it, <b>{esc(word)}</b>! +{DOLLAR}{fmt_coins(reward)}",
     ]
-    if bonus:
-        lines.append(f"🔥 {new_streak}-win streak! Bonus: +{DOLLAR}{fmt_coins(bonus)}")
-        lines.append(f"Total: {DOLLAR}{fmt_coins(total)}")
 
     slow = await asyncio.to_thread(db.get_scramble_slowmode, chat.id)
     slow_enabled = bool(slow and slow[1])
@@ -1496,13 +1490,6 @@ def scramble_help_text() -> str:
 3️⃣ First correct answer within 2 minutes wins {DOLLAR}{fmt_coins(reward)}.
 4️⃣ Close but not quite? I'll react with 👀. Got it exactly right? 🎉
 
-🔥 <b>Win Streaks</b> - win rounds back-to-back in the same chat for bonus 💵:
-3 in a row: +{DOLLAR}5
-5 in a row: +{DOLLAR}10
-10 in a row: +{DOLLAR}25
-20 in a row: +{DOLLAR}50
-Your streak resets if someone else wins a round before you do.
-
 📚 Words never repeat until every word in the pool has been used - tracked separately for every group and every DM, so nobody's progress affects anyone else's.
 
 ⚙️ Only one round can be active per chat at a time - if one's already running, guess it or wait for it to end.
@@ -1512,9 +1499,9 @@ Your streak resets if someone else wins a round before you do.
 /scrambletopplayers - top 15, this chat or global
 /scrambletopgroups - the most active groups
 
-💡 Word Scramble's rewards and rankings are completely separate from the Word Game's - winning one never affects your stats in the other.
+💡 Word Scramble keeps its own wins and rankings, but the 💵 you earn in Word Scramble and Word Game count together as one combined balance for game fees (Word Scramble money is spent first), /transfer, /request and /leaderboard.
 
-⭐ <b>Premium</b>: /buypremium ({_premium_price} ⭐ for {_format_duration_words(_premium_dur)}) doubles your {DOLLAR} rewards here (streak bonuses too). Check /premiumstatus.
+⭐ <b>Premium</b>: /buypremium ({_premium_price} ⭐ for {_format_duration_words(_premium_dur)}) doubles your {DOLLAR} rewards here. Check /premiumstatus.
 """
 
 
@@ -1532,7 +1519,7 @@ def format_scramble_board(rows, title, position_info=None, requester_name=None) 
         for i, (name, wins, earned, streak) in enumerate(rows, start=1):
             prefix = medals.get(i, f"{i}.")
             display_name = truncate_name(name)
-            streak_display = f" 🔥{streak}" if streak and streak > 1 else ""
+            streak_display = ""  # win streaks removed
             text += f"{prefix} {display_name}\t{DOLLAR}{fmt_coins(earned)}{streak_display}\n"
 
     if position_info:
@@ -1576,7 +1563,7 @@ def format_scramble_top_players(rows, title, position_info, requester_name, posi
             prefix = medals.get(i, f"{i}.")
             if len(row) == 4:
                 name, wins, earned, streak = row
-                streak_display = f" 🔥{streak}" if streak and streak > 1 else ""
+                streak_display = ""  # win streaks removed
             else:
                 name, wins, earned = row
                 streak_display = ""
@@ -1936,6 +1923,7 @@ def _scrambleallcommands_text() -> str:
 /wordscramble - start a round (works in groups and DM)
 /scramblehelp - how to play
 /scrambleleaderboard - this chat's leaderboard
+/leaderboard - everyone ranked by combined balance (Word Game + Word Scramble money)
 /ranks - the full rank/level ladder and what balance unlocks each one (shared with Word Game)
 /scrambletopplayers - top 15, this chat or global
 /scrambletopgroups - the most active groups
@@ -1947,20 +1935,21 @@ def _scrambleallcommands_text() -> str:
 /buycash - premium only: buy 💵 cash with Telegram Stars; it increases your balance, level and rank (pack sizes and prices are shown live; used in a group it moves you to my DM)
 /boostrank - premium only: same as /buycash - buy 💵 cash to boost your rank
 /boostlevel - premium only: same as /buycash - buy 💵 cash to boost your level
-/transfer &lt;@username|id&gt; &lt;amount&gt; - premium only: send 💵 from your Word Scramble balance to another player (or reply to their message with /transfer &lt;amount&gt;)
+/transfer &lt;@username|id&gt; &lt;amount&gt; - premium only: send 💵 from your combined balance (Word Scramble money first, then Word Game money) to another player; they receive it in this chat (or reply to their message with /transfer &lt;amount&gt;)
 /request &lt;@username|id&gt; &lt;amount&gt; - premium only: ask another player for 💵; they get Yes/No buttons (or reply to their message with /request &lt;amount&gt;) Nothing is sent if the other player doesn't have that amount.
 /settournament &lt;fee&gt; &lt;difficulty&gt; &lt;rounds&gt;rounds - host a Word Scramble tournament in a group (e.g. /settournament 2000 Medium 3rounds); everyone (the host too, with /join) pays the entry fee from their Word Scramble or Word Game balance and the winner takes the pot
 /tournament - quick-start a tournament instantly: same as /settournament 5 easy 20rounds (the host is not joined automatically - everyone, host included, uses /join)
-/join - join the Tournament, Elimination or Hack lobby that's open in this group (the host is NOT joined automatically - they use /join too; the fee comes from your Word Scramble or Word Game balance)
-/daily - claim today's daily reward (works only in my DM; premium members get 💵100, everyone else 💵50)
+/join - join the Tournament, Elimination or Hack lobby that's open in this group (the host is NOT joined automatically - they use /join too; the fee comes from your combined balance: Word Scramble money first, then Word Game money for the rest; if the total is too low nothing is taken)
+/daily - claim today's daily reward (works only in my DM; premium members get 💵100, everyone else 💵10)
 /getcash - same as /buycash: premium only, buy 💵 cash with Telegram Stars
-/playgame - groups only: pick Normal Mode, Slow Mode, Automatic Mode, Tournament, Elimination or Hack and start it with one tap
+/playgame - groups only: pick Normal Mode, Slow Mode, 🎰 Jackpot, Tournament, Elimination or Hack and start it with one tap (Automatic Mode is still available through /scrambleautomaticmode)
+/jackpot - groups only: 🎰 Jackpot - pay the entry fee and guess the secret number within 2 minutes to win the prize; one try per day across all groups (also /l, /luckyspin, /spin, /tryyourluck, /lottery, /luckynumber)
 /elimination - quick-start an Elimination: same as /setelimination 10 easy 60s (the host is not joined automatically - use /join)
 /setelimination &lt;fee&gt; &lt;difficulty&gt; &lt;countdown&gt;s - start an Elimination lobby (e.g. /setelimination 100 easy 20s); fee 10 or more; players take turns, the timer halves every cycle, the last player standing wins the whole prize
 /startelimination - the host who opened the lobby or the bot owner: start the open Elimination right now instead of waiting for the 2-minute lobby
 /resumeelimination - host or bot owner only: continue a hung Elimination from the exact place it stopped
-/hack &lt;fee&gt; &lt;digits&gt; - start a Hack lobby in a group (e.g. /hack 3000 3); just /hack starts a quick game (fee 10, 3 digits); fee 10 or more, 3-6 digits; players /join (the host is NOT joined automatically), then take turns (random order) to /guess the hidden number (digits 1-9, all different); the first to crack it wins the whole pool, and if nobody does the bot keeps it
-/hackx - start a quick Hack X (fee 10, 3 digits): like Hack, but everybody guesses at the same time - no waiting for turns
+/hack &lt;fee&gt; &lt;digits&gt; - start a Hack lobby in a group (e.g. /hack 3000 3); just /hack starts a quick game (fee 100, 3 digits); fee 100 or more, 3-6 digits; players /join (the host is NOT joined automatically), then take turns (random order) to /guess the hidden number (digits 1-9, all different); the first to crack it wins the whole pool, and if nobody does the bot keeps it
+/hackx - start a quick Hack X (fee 100, 3 digits): like Hack, but everybody guesses at the same time - no waiting for turns
 /sethackx &lt;fee&gt; &lt;digits&gt; - start a Hack X with your own fee and digits (e.g. /sethackx 500 4)
 /guess &lt;number&gt; - joined players only: guess the hidden Hack number - on your turn in a normal Hack (60 seconds, out after missing 2 turns), any time in Hack X; you can also just type the number without the command (🟩 Hacks = right digit in the right spot, 🟨 Glitches = right digit in the wrong spot); you get 30/35/40/50 guesses for 3/4/5/6 digits
 /g &lt;number&gt; - short version of /guess, works exactly the same
@@ -1979,6 +1968,8 @@ def _scrambleallcommands_text() -> str:
 
 <b>🛡️ Group Admin Commands</b>
 /scramblestopgame - group admins (or the owner) can stop an active round instantly
+/setjackpot &lt;fee&gt; - group admins (or the owner) can set this group's Jackpot entry fee (100-5,000); the prize becomes 10x the fee (also /setl &lt;fee&gt;)
+/editjackpot &lt;fee&gt; &lt;prize&gt; - group admins (or the owner) can set a custom Jackpot fee and prize here (e.g. /editjackpot 500 5000)
 /scrambleautomaticmode on|off - group admins (or the owner) can manually control Automatic Mode here (blocked while Slow Mode is on in that chat). The bot never turns this on by itself anymore.
 /slowmode on &lt;time&gt;|off - group admins (or the owner) can control Slow Mode here; next round is sent exactly &lt;time&gt; after the previous one ends (e.g. /slowmode on 2m or /slowmode on 30s; seconds 1-60s, or m/h/d). Every round still lasts a maximum of 2 minutes, and turning this on also turns Automatic Mode off in this chat.
 /deleterequestprompt off|on [&lt;1-9&gt;s|m] - group admins (or the owner) can control whether resolved /request prompts are deleted here and after how long (default on, 30 seconds; no args shows the current setting)
@@ -2621,16 +2612,18 @@ def _invalidate_difficulty_cache():
 def random_word(chat_id, exclude=None):
     difficulty = db.get_effective_game_difficulty(chat_id)
     pool = _get_difficulty_pool("wordgame", WORDS, difficulty)
-    used = db.get_used_words(chat_id)
+    # One lock per chat across get -> choose -> mark (see scramble_random_word).
+    with db.used_words_lock("wg", chat_id):
+        used = db.get_used_words(chat_id)
 
-    choices = [w for w in pool if w not in used and w != exclude]
+        choices = [w for w in pool if w not in used and w != exclude]
 
-    if not choices:
-        db.reset_used_words(chat_id)
-        choices = [w for w in pool if w != exclude] or pool
+        if not choices:
+            db.reset_used_words(chat_id)
+            choices = [w for w in pool if w != exclude] or pool
 
-    word = random.choice(choices)
-    db.mark_word_used(chat_id, word)
+        word = random.choice(choices)
+        db.mark_word_used(chat_id, word)
     return word
 
 
@@ -3370,9 +3363,6 @@ async def claimdailyreward_command(update: Update, context: ContextTypes.DEFAULT
     await asyncio.to_thread(db.add_user, user.id, user.first_name)
 
     result, amount = await _claim_daily_for(user)
-
-    if result[0]:
-        apply_chat_credit_for_global_earning(user.id, user.first_name, amount)
 
     await update.message.reply_html(format_daily_reward_text(result, amount))
 
@@ -4711,10 +4701,9 @@ async def group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         leader_display = sanitize_display_name(leader_name)
 
         result_text = (
-            f"🎉 {winner_medal}{winner_display} found the word!\n\n"
-            f"📝 Word: {secret_word}\n\n"
-            f"{DOLLAR} {winner_medal}{winner_display} +{fmt_coins(winner_reward)}\n"
-            f"🎤 {leader_medal}{leader_display} +{fmt_coins(leader_reward)}\n"
+            f"🎉 {winner_medal}{winner_display} got it! {secret_word}\n\n"
+            f"🙋{winner_medal}{winner_display} +{fmt_coins(winner_reward)} {DOLLAR}\n"
+            f"🎤 {leader_medal}{leader_display} +{fmt_coins(leader_reward)} {DOLLAR}\n"
         )
 
         if auto_lead:
@@ -4833,13 +4822,15 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /hint - see the leader's clues so far
 /stopvote - vote to stop a stuck round (3 votes needed)
 /stopgame - admins can stop a round instantly
-/playgame - (groups) start Normal, Slow, Automatic Mode, a Tournament, Elimination or Hack from one menu
+/playgame - (groups) start Normal, Slow, 🎰 Jackpot, a Tournament, Elimination or Hack from one menu
+/jackpot - (groups) 🎰 guess the secret number, win the prize - one try a day (also /l /spin /lottery /luckyspin /tryyourluck /luckynumber)
 /hack &lt;fee&gt; &lt;digits&gt; - (groups) open a Hack lobby: players take turns cracking the hidden number, the winner takes all; just /hack = quick game (see /fullhelp)
 /hackx - (groups) quick Hack X: same, but everybody guesses at the same time; /sethackx &lt;fee&gt; &lt;digits&gt; to choose the fee and digits
 /gamedifficulty &lt;mode&gt; - (group admins) choose which word lengths this group's Word Game and Word Scramble use: easy, easy3-6, medium, hard, off (add x, e.g. easyx, for lowercase letters)
 /daily - claim your daily reward (in my DM)
 /support - support the bot with Telegram Stars
-/leaderboard - this chat's leaderboard
+/leaderboard - everyone ranked by combined balance (Word Game + Word Scramble money)
+/wordgameleaderboard - this chat's Word Game leaderboard (with a Global switch)
 /chattop - top players in this chat
 /globaltop - top players across all chats
 /topplayers - top 15 players, this chat or global
@@ -4889,6 +4880,21 @@ def leaderboard_keyboard():
 
 
 async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/leaderboard: everyone ranked by COMBINED balance (Word Game + Word Scramble
+    money) - the same definition the game fees use. The old Word Game board is
+    now /wordgameleaderboard."""
+    user = update.effective_user
+    rows = await asyncio.to_thread(db.get_combined_global_leaderboard)
+    position_info = await asyncio.to_thread(db.get_combined_global_position, user.id)
+    await update.message.reply_html(
+        format_board(rows, "Leaderboard - Combined Balance", position_info, user.first_name),
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+    )
+
+
+async def wordgameleaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/wordgameleaderboard: the Word Game leaderboard (was /leaderboard) - same
+    board, same In-This-Chat / Global buttons."""
     chat_id = update.effective_chat.id
     user = update.effective_user
     rows = await asyncio.to_thread(db.get_chat_leaderboard, chat_id)
@@ -6758,7 +6764,7 @@ async def forceleader_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     chat_id = update.effective_chat.id
 
     cancel_explain_timeout(context, chat_id)
-    word = random_word(chat_id)
+    word = await asyncio.to_thread(random_word, chat_id)
     await asyncio.to_thread(db.set_leader, chat_id, target_id, target_name, word)
     await asyncio.to_thread(db.set_explaining_started, chat_id, False)
     await asyncio.to_thread(db.start_explain_log, chat_id, target_id)
@@ -7002,32 +7008,34 @@ def _allcommands_text() -> str:
 <b>👥 Public Commands</b>
 /start - open the main menu (reply to someone's message with /start to see that player's profile)
 /help - how to play
-/leaderboard - this chat's leaderboard (with a Global switch)
+/leaderboard - everyone ranked by combined balance (Word Game + Word Scramble money)
+/wordgameleaderboard - this chat's Word Game leaderboard (with a Global switch)
 /chattop - top players in this chat
 /globaltop - top players across all chats
 /topplayers - top 15 players, this chat or global
 /topgroups - the 10 most active groups
 /ranks - the full rank/level ladder and what balance unlocks each one
-/claimdailyreward - claim today's daily reward (premium members get 💵100, everyone else 💵50)
+/claimdailyreward - claim today's daily reward (premium members get 💵100, everyone else 💵10)
 /buypremium - premium doubles your 💵 rewards in Word Game and Word Scramble (paid with Telegram Stars; used in a group it moves you to my DM, and the invoice has a ➡️ Premium features button)
 /premiumstatus - see whether premium is active and how much time is left
 /buycash - premium only: buy 💵 cash with Telegram Stars; it increases your balance, level and rank (pack sizes and prices are shown live; used in a group it moves you to my DM)
 /boostrank - premium only: same as /buycash - buy 💵 cash to boost your rank
 /boostlevel - premium only: same as /buycash - buy 💵 cash to boost your level
-/transfer &lt;@username|id&gt; &lt;amount&gt; - premium only: send 💵 from your Word Scramble balance to another player (or reply to their message with /transfer &lt;amount&gt;)
+/transfer &lt;@username|id&gt; &lt;amount&gt; - premium only: send 💵 from your combined balance (Word Scramble money first, then Word Game money) to another player; they receive it in this chat (or reply to their message with /transfer &lt;amount&gt;)
 /request &lt;@username|id&gt; &lt;amount&gt; - premium only: ask another player for 💵; they get Yes/No buttons (or reply to their message with /request &lt;amount&gt;) Nothing is sent if the other player doesn't have that amount.
 /settournament &lt;fee&gt; &lt;difficulty&gt; &lt;rounds&gt;rounds - host a Word Scramble tournament in a group (e.g. /settournament 2000 Medium 3rounds); everyone (the host too, with /join) pays the entry fee from their Word Scramble or Word Game balance and the winner takes the pot
 /tournament - quick-start a tournament instantly: same as /settournament 5 easy 20rounds (the host is not joined automatically - everyone, host included, uses /join)
-/join - join the Tournament, Elimination or Hack lobby that's open in this group (the host is NOT joined automatically - they use /join too; the fee comes from your Word Scramble or Word Game balance)
-/daily - claim today's daily reward (works only in my DM; premium members get 💵100, everyone else 💵50)
+/join - join the Tournament, Elimination or Hack lobby that's open in this group (the host is NOT joined automatically - they use /join too; the fee comes from your combined balance: Word Scramble money first, then Word Game money for the rest; if the total is too low nothing is taken)
+/daily - claim today's daily reward (works only in my DM; premium members get 💵100, everyone else 💵10)
 /getcash - same as /buycash: premium only, buy 💵 cash with Telegram Stars
-/playgame - groups only: pick Normal Mode, Slow Mode, Automatic Mode, Tournament, Elimination or Hack and start it with one tap
+/playgame - groups only: pick Normal Mode, Slow Mode, 🎰 Jackpot, Tournament, Elimination or Hack and start it with one tap (Automatic Mode is still available through /scrambleautomaticmode)
+/jackpot - groups only: 🎰 Jackpot - pay the entry fee and guess the secret number within 2 minutes to win the prize; one try per day across all groups (also /l, /luckyspin, /spin, /tryyourluck, /lottery, /luckynumber)
 /elimination - quick-start an Elimination: same as /setelimination 10 easy 60s (the host is not joined automatically - use /join)
 /setelimination &lt;fee&gt; &lt;difficulty&gt; &lt;countdown&gt;s - start an Elimination lobby (e.g. /setelimination 100 easy 20s); fee 10 or more; players take turns, the timer halves every cycle, the last player standing wins the whole prize
 /startelimination - the host who opened the lobby or the bot owner: start the open Elimination right now instead of waiting for the 2-minute lobby
 /resumeelimination - host or bot owner only: continue a hung Elimination from the exact place it stopped
-/hack &lt;fee&gt; &lt;digits&gt; - start a Hack lobby in a group (e.g. /hack 3000 3); just /hack starts a quick game (fee 10, 3 digits); fee 10 or more, 3-6 digits; players /join (the host is NOT joined automatically), then take turns (random order) to /guess the hidden number (digits 1-9, all different); the first to crack it wins the whole pool, and if nobody does the bot keeps it
-/hackx - start a quick Hack X (fee 10, 3 digits): like Hack, but everybody guesses at the same time - no waiting for turns
+/hack &lt;fee&gt; &lt;digits&gt; - start a Hack lobby in a group (e.g. /hack 3000 3); just /hack starts a quick game (fee 100, 3 digits); fee 100 or more, 3-6 digits; players /join (the host is NOT joined automatically), then take turns (random order) to /guess the hidden number (digits 1-9, all different); the first to crack it wins the whole pool, and if nobody does the bot keeps it
+/hackx - start a quick Hack X (fee 100, 3 digits): like Hack, but everybody guesses at the same time - no waiting for turns
 /sethackx &lt;fee&gt; &lt;digits&gt; - start a Hack X with your own fee and digits (e.g. /sethackx 500 4)
 /guess &lt;number&gt; - joined players only: guess the hidden Hack number - on your turn in a normal Hack (60 seconds, out after missing 2 turns), any time in Hack X; you can also just type the number without the command (🟩 Hacks = right digit in the right spot, 🟨 Glitches = right digit in the wrong spot); you get 30/35/40/50 guesses for 3/4/5/6 digits
 /g &lt;number&gt; - short version of /guess, works exactly the same
@@ -7055,6 +7063,8 @@ def _allcommands_text() -> str:
 
 <b>🛡️ Group Admin Commands</b>
 /stopgame - group admins (or the owner) can stop a round instantly
+/setjackpot &lt;fee&gt; - group admins (or the owner) can set this group's Jackpot entry fee (100-5,000); the prize becomes 10x the fee (also /setl &lt;fee&gt;)
+/editjackpot &lt;fee&gt; &lt;prize&gt; - group admins (or the owner) can set a custom Jackpot fee and prize here (e.g. /editjackpot 500 5000)
 /autodelete on|off [interval] - group admins (or the owner) can enable cleanup of the bot's own messages here; add a number+s/m/h/d (e.g. 9m) for periodic cleanup instead of round-based
 /slowmode on &lt;time&gt;|off - group admins (or the owner) can control Slow Mode here (e.g. /slowmode on 2m or /slowmode on 30s; seconds 1-60s, or m/h/d)
 /deleterequestprompt off|on [&lt;1-9&gt;s|m] - group admins (or the owner) can control whether resolved /request prompts are deleted here and after how long (default on, 30 seconds; no args shows the current setting)
@@ -7109,10 +7119,11 @@ def _allcommands_text() -> str:
 /removeadmin &lt;@user or ID&gt; - revoke a Bot Admin
 /admins - list current Bot Admins
 /allcommands - this list
+/ownerallcommands - owner only: the list of commands only the owner can use
 /adminmode on|off - owner/Bot Admins only: require the bot to be a group admin before games can start, everywhere that hasn't set its own /groupadminmode override
 /sendgroupmessage &lt;group ID or @username&gt;|allgroups &lt;message&gt; - send a message to one group or every group, as the bot
-/prompt on|off - owner/Bot Admins only: toggle the welcome message sent when the bot joins a new group
-/editprompt &lt;text&gt; - owner/Bot Admins only: change that welcome message
+/prompt on|off - owner only: toggle the welcome message sent when the bot joins a new group
+/editprompt &lt;text&gt; - owner only: change that welcome message
 /claimeddailyreward [YYYY-MM-DD] - who claimed the daily reward
 /addadmanager &lt;@username&gt; - assign the Advertisement Manager
 /changeadmanager &lt;@username&gt; - replace the Advertisement Manager
@@ -7123,8 +7134,59 @@ def _allcommands_text() -> str:
 /changesponsoredad &lt;text, link, @username, or 'label | link'&gt; - owner only: replace the Sponsored Ad content (or 'clear' to reset)
 /showgamemedal on|off - owner/Bot Admins only: toggle the 🥇🥈🥉 medal prefix on Word Game names (global, no args shows current status)
 
-<i>Note: banuser/unbanuser/bangroup/unbangroup/broadcast/maintenance/addadmanager/changeadmanager/removeadmanager/admanager/adminmode/prompt/editprompt/groupadminmode can also be used by Bot Admins. /ad on|off, /botgroups, /botusers, /addwords, /removewords and /shufflewords are owner-only. /gamedifficulty works for group admins in their own group; only the owner can target another group or all groups at once. /autodelete's bare on/off form works for group admins too; its explicit-group and allgroups forms are owner-only. This list and /scrambleallcommands are visible to the bot owner, Bot Admins, and each group's own Telegram creator. The owner is alerted in DM whenever someone buys Premium, gifts Premium, buys 💵 cash or boosts their rank/level. Word Scramble has its own command list - see /scrambleallcommands (includes /scramblestopallgroups). The 🎁 Daily Reward always credits the Word Game balance, and every player's Balance/Level/Rank on /start combines their Word Game + Word Scramble balances automatically.</i>
+<i>Note: banuser/unbanuser/bangroup/unbangroup/broadcast/maintenance/addadmanager/changeadmanager/removeadmanager/admanager/adminmode/groupadminmode can also be used by Bot Admins. /ad on|off, /prompt, /editprompt, /ownerallcommands, /botgroups, /botusers, /addwords, /removewords and /shufflewords are owner-only. /gamedifficulty works for group admins in their own group; only the owner can target another group or all groups at once. /autodelete's bare on/off form works for group admins too; its explicit-group and allgroups forms are owner-only. This list and /scrambleallcommands are visible to the bot owner, Bot Admins, and each group's own Telegram creator. The owner is alerted in DM whenever someone buys Premium, gifts Premium, buys 💵 cash or boosts their rank/level. Word Scramble has its own command list - see /scrambleallcommands (includes /scramblestopallgroups). The 🎁 Daily Reward always credits the Word Game balance, and every player's Balance/Level/Rank on /start combines their Word Game + Word Scramble balances automatically.</i>
 """
+
+
+# ------------------------- /ownerallcommands -----------------------------
+# Commands that ONLY the bot owner can run. Derived from the real permission
+# checks in this file (the @owner_only decorator, or an inline
+# "if not user or not is_owner(user.id): ... return" guard with no other role
+# allowed). Commands that members, group admins, Bot Admins, hosts or Premium
+# members can also use are deliberately NOT in here. A test re-derives this set
+# from the source, so it cannot silently drift from the code.
+OWNER_ONLY_COMMANDS = frozenset({
+    "ad", "addadmin", "addpayment", "addwords", "admins", "botgroups", "botsgroups", "botusers",
+    "changesponsoredad", "claimeddailyreward", "controlgroup", "editbuycashtext", "editprompt",
+    "extendlobby", "forceend", "forceleader", "groups", "invitereward", "ownerallcommands", "paymentmethods",
+    "prompt", "reloadwords", "removeadmin", "removepayment", "removewords", "scrambleforceend",
+    "scramblemode", "scramblereloadwords", "scramblesetreward", "scramblestats", "scramblestopallgroups",
+    "scrambletopup", "scrambletopupspecific", "scrambleusers", "seepremiumplayers", "sendgroupmessage",
+    "setdollarpack", "setpremium", "setreward", "setsupport", "share", "shufflewords", "sponsoredad",
+    "starbalance", "stats", "stopelimination", "supportstats", "topup", "users", "withdraw",
+})
+
+
+def _ownerallcommands_text() -> str:
+    """Owner-only commands, with the SAME descriptions /allcommands and
+    /scrambleallcommands show (so the wording never goes stale)."""
+    found = {}
+    for text in (_allcommands_text(), _scrambleallcommands_text()):
+        for raw in text.split("\n"):
+            line = raw.strip()
+            if not line.startswith("/"):
+                continue
+            head = html_lib.unescape(line.partition(" - ")[0])
+            m = re.match(r"/([A-Za-z0-9_]+)", head)
+            if m and m.group(1).lower() in OWNER_ONLY_COMMANDS and m.group(1).lower() not in found:
+                found[m.group(1).lower()] = line
+    covered = "\n".join(found.values())
+    out = ["👑 <b>Owner-only Commands</b>", ""]
+    for name in sorted(OWNER_ONLY_COMMANDS):
+        if name in found:
+            continue
+        if re.search(r"/%s\b" % re.escape(name), covered):   # an alias already shown on its main line
+            continue
+        found[name] = f"/{name}"
+    out += [found[n] for n in sorted(found)]
+    out += ["", "<i>Commands that members, group admins or Bot Admins can also use are not listed here - see /allcommands.</i>"]
+    return "\n".join(out)
+
+
+@owner_only
+async def ownerallcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await reply_html_in_parts(update.message, _ownerallcommands_text())
+
 
 
 async def allcommands_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7336,6 +7398,19 @@ TOURNAMENT_PAUSED_BLOCK_TEXT = (
     "The host or the bot owner can send /resumetournament to continue it (or /stoptournament to cancel and refund)."
 )
 DAILY_GETCASH_HINT = "Use /daily to claim daily reward or use /getcash to get cash"
+
+
+_INSUFFICIENT_NOTICE_LAST = {}   # (request id, user id) -> last time a "not enough cash" notice was posted
+
+
+def insufficient_cash_text(user_id, name) -> str:
+    """HTML message for "not enough money": clickable mention of the affected
+    player + the standard guidance line. Use for fee/money shortfalls only."""
+    return (
+        f"❌ {_mention(user_id, name)}, you don't have enough cash!\n"
+        f"👇 {DAILY_GETCASH_HINT}"
+    )
+
 TOURNAMENT_USAGE = (
     "Usage: /settournament <fee> <difficulty> <rounds>rounds\n"
     "Example: /settournament 2000 Medium 3rounds\n"
@@ -7391,14 +7466,15 @@ def tournament_random_word(chat_id, difficulty):
     if not pool:
         return None
 
-    used = db.scramble_get_used_words(chat_id)
-    choices = [w for w in pool if w not in used]
-    if not choices:
-        db.scramble_reset_used_words(chat_id)
-        choices = list(pool)
+    with db.used_words_lock("sc", chat_id):
+        used = db.scramble_get_used_words(chat_id)
+        choices = [w for w in pool if w not in used]
+        if not choices:
+            db.scramble_reset_used_words(chat_id)
+            choices = list(pool)
 
-    word = random.choice(choices)
-    db.scramble_mark_word_used(chat_id, word)
+        word = random.choice(choices)
+        db.scramble_mark_word_used(chat_id, word)
     return word
 
 
@@ -7606,10 +7682,7 @@ async def join_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif status == "already":
         await update.message.reply_text("✅ You've already joined this tournament.")
     elif status == "insufficient":
-        await update.message.reply_text(
-            f"❌ Your Word Scramble balance is below the entry fee ({DOLLAR}{fmt_coins(t['fee'])}).\n\n"
-            f"{DAILY_GETCASH_HINT}"
-        )
+        await update.message.reply_html(insufficient_cash_text(user.id, user.first_name))
     else:
         await safe_react(context.bot, chat.id, update.message.message_id, "👍")
         await _tournament_announce_join(context, chat.id, user)
@@ -8571,9 +8644,9 @@ ELIM_STALE_SECONDS = 6 * 3600  # an elimination that has not moved for this long
 
 # ---- Hack game constants (number-cracking game) -------------------------
 HACK_LOBBY_SECONDS = 120
-HACK_MIN_FEE = 10
+HACK_MIN_FEE = 100
 HACK_MAX_FEE_GUARD = 9_000_000_000_000_000_000  # only guards the BIGINT column; there is no real maximum
-HACK_QUICK_FEE = 10        # used by the /playgame "💻 Hack" button
+HACK_QUICK_FEE = 100       # quick /hack, /hackx and the /playgame "💻 Hack" button (must be >= HACK_MIN_FEE)
 HACK_QUICK_DIGITS = 3      # used by the /playgame "💻 Hack" button
 HACK_DIGIT_CHOICES = (3, 4, 5, 6)
 HACK_GUESSES_BY_DIGITS = {3: 30, 4: 35, 5: 40, 6: 50}  # guesses each player gets
@@ -8842,10 +8915,7 @@ async def _elimination_join(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     elif status == "already":
         await update.message.reply_text("✅ You've already joined this elimination.")
     elif status == "insufficient":
-        await update.message.reply_text(
-            f"❌ You don't have enough cash to join ({DOLLAR}{fmt_coins(e['fee'])} needed).\n\n"
-            f"{DAILY_GETCASH_HINT}"
-        )
+        await update.message.reply_html(insufficient_cash_text(user.id, user.first_name))
     else:
         await _elim_post_lobby(context, e["id"])  # edits the lobby message: prize + player list
         await safe_send(
@@ -9518,6 +9588,12 @@ async def _open_hack_lobby(update: Update, context: ContextTypes.DEFAULT_TYPE, f
     chat = update.effective_chat
     user = update.effective_user
 
+    # Safety net for every Hack variant (/hack, /hackx, /sethackx, quick
+    # games, the /playgame button): never open a lobby below the minimum fee.
+    if fee < HACK_MIN_FEE:
+        await update.message.reply_text(f"❌ The entry fee must be at least {DOLLAR}{HACK_MIN_FEE}.")
+        return
+
     if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         await update.message.reply_text("💻 Games are played in groups - add me to a group and start a Hack there!")
         return
@@ -9582,10 +9658,7 @@ async def _hack_join(update: Update, context: ContextTypes.DEFAULT_TYPE, h):
     elif status == "already":
         await update.message.reply_text("✅ You've already joined this hack.")
     elif status == "insufficient":
-        await update.message.reply_text(
-            f"❌ You don't have enough cash to join ({DOLLAR}{fmt_coins(h['fee'])} needed).\n\n"
-            f"{DAILY_GETCASH_HINT}"
-        )
+        await update.message.reply_html(insufficient_cash_text(user.id, user.first_name))
     else:
         await _hack_post_lobby(context, h["id"])  # edits the lobby message: prize + player list
         await safe_send(
@@ -10493,7 +10566,9 @@ async def setsupport_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # permission check and "already running" check is exactly the same:
 #   Normal Mode    -> /wordscramble            (one Word Scramble round)
 #   Slow Mode      -> /slowmode on 2m          (group admins / owner, like the command)
-#   Automatic Mode -> /scrambleautomaticmode on (group admins / owner, like the command)
+#   Jackpot        -> joins the Jackpot (same flow as /jackpot; pays the fee if affordable)
+#   (Automatic Mode's button was replaced by Jackpot, but the feature and its
+#    /scrambleautomaticmode command are unchanged; old menus' pgm:auto buttons still work.)
 #   Tournament     -> /tournament              (the instant 5 / easy / 20 rounds lobby)
 
 PLAYGAME_CALLBACK_PREFIX = "pgm:"
@@ -10507,7 +10582,7 @@ def _playgame_keyboard():
             InlineKeyboardButton("🐢 Slow Mode", callback_data="pgm:slow"),
         ],
         [
-            InlineKeyboardButton("🤖 Automatic Mode", callback_data="pgm:auto"),
+            InlineKeyboardButton("🎰 Jackpot", callback_data="pgm:jackpot"),
             InlineKeyboardButton("🏟️ Tournament", callback_data="pgm:tour"),
         ],
         [
@@ -10524,16 +10599,9 @@ async def playgame_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=add_to_group_keyboard(context),
         )
         return
-    await update.message.reply_text(
-        "🎮 How do you want to play?\n\n"
-        "🎮 Normal Mode - one Word Scramble round\n"
-        f"🐢 Slow Mode - a new round every {PLAYGAME_SLOWMODE_DEFAULT}\n"
-        "🤖 Automatic Mode - rounds keep coming on their own\n"
-        "🏟️ Tournament - open a tournament lobby\n"
-        "🔥 Elimination - last player standing wins\n"
-        "💻 Hack - crack the hidden number",
-        reply_markup=_playgame_keyboard(),
-    )
+    # Telegram will not send a message with buttons and no text, so one short
+    # line stays; the old explanatory list above the buttons is gone.
+    await update.message.reply_text("🎮 Choose a game 👇", reply_markup=_playgame_keyboard())
 
 
 async def playgame_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -10544,7 +10612,7 @@ async def playgame_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("🎮 Games are played in groups.", show_alert=True)
         return
     action = (query.data or "").split(":", 1)[-1]
-    if action not in ("normal", "slow", "auto", "tour", "elim", "hack"):
+    if action not in ("normal", "slow", "auto", "tour", "elim", "hack", "jackpot"):
         await query.answer()
         return
     await query.answer()
@@ -10581,9 +10649,374 @@ async def playgame_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "hack":
         context.args = [str(HACK_QUICK_FEE), str(HACK_QUICK_DIGITS)]
         await hack_command(shim, context)
+    elif action == "jackpot":
+        await _jackpot_join(context, chat, user)   # same safe flow as /jackpot
     else:
         context.args = []
         await tournament_command(shim, context)
+
+
+# ------------------------------- JACKPOT ---------------------------------
+# /jackpot (+ /l /luckyspin /spin /tryyourluck /lottery /luckynumber, any
+# letter case) and the /playgame "🎰 Jackpot" button all call _jackpot_join().
+# Rules: pay the fee (combined balance) -> secret number is DMed ONLY to the
+# owner (OWNER_ID) -> the player gets ONE valid guess within 2 minutes -> the
+# game is settled exactly once (database row lock) and the number is revealed.
+# One attempt per player per UTC day across every group (jackpot_daily PK).
+# Fee/prize are per group (jackpot_settings) and persist across restarts.
+
+JACKPOT_MIN_FEE = 100
+JACKPOT_MAX_FEE = 5000
+JACKPOT_MAX_REWARD = 100_000           # sanity cap on a custom prize (default prize is fee x 10)
+JACKPOT_SECONDS = 120
+JACKPOT_TICK_AT = (60, 20)             # edit the start message when this many seconds remain (2 edits/game)
+JACKPOT_CONFIG_ADMIN_ONLY = True       # /setjackpot /setl /editjackpot: group admins + owner (False = any member)
+JACKPOT_COMMANDS = ["jackpot", "l", "luckyspin", "spin", "tryyourluck", "lottery", "luckynumber"]  # case-insensitive in PTB
+JACKPOT_SETTERS = ["setjackpot", "setl"]
+JACKPOT_TIME_FMT = "%Y-%m-%d %H:%M:%S"  # UTC, fixed width so string comparison is chronological
+
+_JACKPOT_ACTIVE = {}   # (chat_id, user_id) -> game dict; lets the guess handler ignore everyone else with NO database read
+
+
+def _jackpot_now():
+    return datetime.now(timezone.utc)
+
+
+def _jackpot_fmt(dt) -> str:
+    return dt.strftime(JACKPOT_TIME_FMT)
+
+
+def _jackpot_parse_int(text):
+    """'200' / '1,000' -> int; anything else (decimals, negatives, text) -> None."""
+    text = (text or "").strip()
+    if not re.fullmatch(r"[0-9]{1,3}(,[0-9]{3})+|[0-9]+", text):
+        return None
+    return int(text.replace(",", ""))
+
+
+def jackpot_fee_error(fee):
+    if fee is None or not (JACKPOT_MIN_FEE <= fee <= JACKPOT_MAX_FEE):
+        return f"❌ The Jackpot fee must be a whole number from {JACKPOT_MIN_FEE:,} to {JACKPOT_MAX_FEE:,}."
+    return None
+
+
+def jackpot_reward_error(reward, fee):
+    if reward is None or reward <= 0:
+        return "❌ The prize must be a positive whole number."
+    if reward < fee:
+        return f"❌ The prize can't be smaller than the fee ({fee:,})."
+    if reward > JACKPOT_MAX_REWARD:
+        return f"❌ The prize can't be more than {JACKPOT_MAX_REWARD:,}."
+    return None
+
+
+def jackpot_start_text(game, seconds_left=None) -> str:
+    time_line = (
+        "⏳ You have 2 minutes. One guess only!" if seconds_left is None
+        else f"⏳ {seconds_left} seconds left. One guess only!"
+    )
+    return (
+        "🎰 <b>JACKPOT</b>\n"
+        f"👤 {_mention(game['user_id'], game['user_name'])} joined!\n"
+        f"💵 Entry fee: {fmt_coins(game['fee'])}\n"
+        f"🏆 Prize: {fmt_coins(game['reward'])}\n"
+        f"🔢 Guess a number from 1–{game['range_max']}.\n"
+        f"{time_line}"
+    )
+
+
+def jackpot_result_text(res) -> str:
+    who = _mention(res["user_id"], res["user_name"])
+    if res["outcome"] == "won":
+        return (
+            f"🎉🏆 {who} WON THE JACKPOT!\n"
+            f"🎯 Lucky number: {res['secret']}\n"
+            f"💵 Prize: {fmt_coins(res['reward'])}\n"
+            f"💰 New balance: {fmt_coins(res['balance'])}"
+        )
+    title = f"❌ {who} lost the Jackpot!" if res["outcome"] == "lost" else f"⏰ {who} ran out of time!"
+    return (
+        f"{title}\n"
+        f"🎯 Lucky number: {res['secret']}\n"
+        f"💸 Lost: {fmt_coins(res['fee'])}\n"
+        f"💰 New balance: {fmt_coins(res['balance'])}"
+    )
+
+
+def _jackpot_job_names(gid):
+    return [f"jackpot_timeout_{gid}"] + [f"jackpot_tick_{gid}_{left}" for left in JACKPOT_TICK_AT]
+
+
+def _jackpot_cancel_jobs(job_queue, gid):
+    if job_queue is None:
+        return
+    for name in _jackpot_job_names(gid):
+        for job in job_queue.get_jobs_by_name(name):
+            job.schedule_removal()
+
+
+def _jackpot_forget(job_queue, gid):
+    for key in [k for k, g in _JACKPOT_ACTIVE.items() if g["id"] == gid]:
+        _JACKPOT_ACTIVE.pop(key, None)
+    _jackpot_cancel_jobs(job_queue, gid)
+
+
+def _jackpot_schedule(job_queue, gid, remaining):
+    """Timeout job (+ the two countdown edits that still lie ahead)."""
+    if job_queue is None:
+        return
+    job_queue.run_once(_jackpot_timeout_job, max(remaining, 1), name=f"jackpot_timeout_{gid}",
+                       data={"gid": gid, "attempt": 0})
+    for left in JACKPOT_TICK_AT:
+        if remaining > left:
+            job_queue.run_once(_jackpot_tick_job, remaining - left, name=f"jackpot_tick_{gid}_{left}",
+                               data={"gid": gid, "left": left})
+
+
+async def _jackpot_announce(context, res):
+    text = jackpot_result_text(res)
+    if res["outcome"] == "won":
+        # Same winner-photo announcement the Hack uses (falls back to plain text
+        # when there is no photo / privacy hides it / anything fails).
+        await send_winner_message(context.bot, res["chat_id"], text, winner_uid=res["user_id"], headline=text)
+    else:
+        await safe_send(context.bot, res["chat_id"], text=text, parse_mode="HTML")
+
+
+async def _jackpot_settle(context, gid, guess):
+    """True if THIS call settled the game. The DB guarantees only one caller can."""
+    res = await asyncio.to_thread(db.jackpot_settle, gid, guess, _jackpot_fmt(_jackpot_now()))
+    if res is None:
+        return False
+    _jackpot_forget(context.job_queue, gid)
+    await _jackpot_announce(context, res)
+    return True
+
+
+async def _jackpot_timeout_job(context: ContextTypes.DEFAULT_TYPE):
+    data = context.job.data
+    gid = data["gid"]
+    try:
+        await _jackpot_settle(context, gid, None)
+    except Exception:
+        logger.exception(f"jackpot {gid}: timeout settle failed")
+        if data.get("attempt", 0) < 5 and context.job_queue is not None:
+            # Database hiccup: the game is still 'active' (nothing was changed), so try again shortly.
+            context.job_queue.run_once(_jackpot_timeout_job, 15, name=f"jackpot_timeout_{gid}",
+                                       data={"gid": gid, "attempt": data.get("attempt", 0) + 1})
+
+
+async def _jackpot_tick_job(context: ContextTypes.DEFAULT_TYPE):
+    """Countdown: edits the ONE start message (no database access, no new messages)."""
+    gid, left = context.job.data["gid"], context.job.data["left"]
+    game = next((g for g in _JACKPOT_ACTIVE.values() if g["id"] == gid), None)
+    if not game or not game.get("message_id"):
+        return
+    try:
+        await context.bot.edit_message_text(
+            chat_id=game["chat_id"], message_id=game["message_id"],
+            text=jackpot_start_text(game, left), parse_mode="HTML",
+        )
+    except Exception as ex:
+        logger.debug(f"jackpot {gid}: countdown edit skipped ({ex})")
+
+
+async def _jackpot_dm_owner(context, game, chat, user):
+    """The secret goes to the configured bot owner ONLY - never to the group, not even
+    as a fallback. If the DM can't be delivered (the owner never pressed Start in a
+    private chat with the bot) it is only logged."""
+    text = (
+        f"🎰 Jackpot #{game['id']}\n"
+        f"👤 {esc(game['user_name'])} ({user.id})\n"
+        f"💬 {esc(getattr(chat, 'title', None) or chat.id)} ({chat.id})\n"
+        f"🎯 Secret number: {game['secret']} (range 1–{game['range_max']})\n"
+        f"🔒 Keep it secret until the game ends."
+    )
+    try:
+        await context.bot.send_message(chat_id=OWNER_ID, text=text, parse_mode="HTML")
+    except Exception as ex:
+        logger.warning(
+            f"jackpot {game['id']}: could not DM the secret number to the owner ({ex}). "
+            f"The owner must open a private chat with the bot and press Start once. "
+            f"The number was NOT shown anywhere else."
+        )
+
+
+async def _jackpot_join(context, chat, user):
+    bot = context.bot
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        await safe_send(bot, chat.id, text="🎰 Jackpot is played in groups - add me to a group and try your luck there!")
+        return
+
+    # Same gates as the other money games.
+    if await asyncio.to_thread(db.is_tournament_banned, "group", chat.id):
+        await safe_send(bot, chat.id, text="🚫 This group isn't allowed to run tournaments, eliminations, hacks or jackpots.")
+        return
+    if await asyncio.to_thread(db.is_tournament_banned, "user", user.id):
+        await safe_send(bot, chat.id, text="🚫 You're banned from tournaments, eliminations, hacks and jackpots.")
+        return
+    if await asyncio.to_thread(db.get_config, "scramble_maintenance_mode", "0") == "1":
+        await safe_send(bot, chat.id, text="🛠️ Word Scramble is currently under maintenance. Please try again later.")
+        return
+
+    name = user.first_name or user.username or "Player"
+    now = _jackpot_now()
+    try:
+        status, info = await asyncio.to_thread(
+            db.jackpot_start, chat.id, user.id, name, now.strftime("%Y-%m-%d"),
+            _jackpot_fmt(now), _jackpot_fmt(now + timedelta(seconds=JACKPOT_SECONDS)),
+        )
+    except Exception:
+        logger.exception("jackpot_start failed")
+        await safe_send(bot, chat.id, text="⚠️ Something went wrong starting the Jackpot. Please try again in a moment.")
+        return
+
+    if status == "already_played":
+        await safe_send(
+            bot, chat.id, parse_mode="HTML",
+            text=f"🎰 {_mention(user.id, name)}, you've already played the Jackpot today - one try per day "
+                 f"across all groups. It resets at 00:00 UTC.",
+        )
+        return
+    if status == "active":
+        await safe_send(bot, chat.id, parse_mode="HTML",
+                        text=f"🎰 {_mention(user.id, name)}, your Jackpot game is still running!")
+        return
+    if status == "insufficient":
+        await safe_send(bot, chat.id, text=insufficient_cash_text(user.id, name), parse_mode="HTML")
+        return
+
+    game = info
+    _JACKPOT_ACTIVE[(chat.id, user.id)] = game
+    _jackpot_schedule(context.job_queue, game["id"], JACKPOT_SECONDS)
+
+    msg = await safe_send(bot, chat.id, text=jackpot_start_text(game), parse_mode="HTML")
+    if msg is not None:
+        game["message_id"] = msg.message_id
+        try:
+            await asyncio.to_thread(db.jackpot_attach_message, game["id"], msg.message_id)
+        except Exception:
+            logger.exception(f"jackpot {game['id']}: could not store the start message id")
+    await _jackpot_dm_owner(context, game, chat, user)
+
+
+async def jackpot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _jackpot_join(context, update.effective_chat, update.effective_user)
+
+
+async def jackpot_text_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """A plain number from the player whose Jackpot is running. Everyone else's
+    messages return immediately (no database access)."""
+    msg, user, chat = update.effective_message, update.effective_user, update.effective_chat
+    if not msg or not user or not chat:
+        return
+    game = _JACKPOT_ACTIVE.get((chat.id, user.id))
+    if not game:
+        return
+    text = (msg.text or "").strip()
+    if not re.fullmatch(r"[0-9]{1,4}", text):
+        return
+    number = int(text)
+    if not (1 <= number <= game["range_max"]):
+        # An invalid number does NOT use up the guess.
+        await safe_send(
+            context.bot, chat.id, parse_mode="HTML",
+            text=f"🔢 {_mention(user.id, game['user_name'])}, pick a whole number from 1–{game['range_max']}. "
+                 f"That one doesn't count - you still have your guess!",
+        )
+        return
+    try:
+        await _jackpot_settle(context, game["id"], number)
+    except Exception:
+        logger.exception(f"jackpot {game['id']}: settling the guess failed")
+        await safe_send(context.bot, chat.id, text="⚠️ Couldn't process that guess - please send it again.")
+
+
+def restore_jackpots(job_queue):
+    """At startup: re-register every unsettled game. One that ran out of time while
+    the bot was down is settled as a timeout right away (the fee was already paid
+    when the game started, so nothing is ever charged or paid a second time)."""
+    now = _jackpot_now()
+    for g in db.jackpot_get_active():
+        _JACKPOT_ACTIVE[(g["chat_id"], g["user_id"])] = g
+        try:
+            expires = datetime.strptime(g["expires_at"], JACKPOT_TIME_FMT).replace(tzinfo=timezone.utc)
+            remaining = (expires - now).total_seconds()
+        except (TypeError, ValueError):
+            remaining = 1
+        _jackpot_schedule(job_queue, g["id"], remaining)
+
+
+async def _jackpot_can_configure(update, context) -> bool:
+    if not JACKPOT_CONFIG_ADMIN_ONLY:
+        return True
+    return is_owner(update.effective_user.id) or await is_chat_admin(update, context)
+
+
+async def _jackpot_config_gate(update, context):
+    """Shared checks for the setting commands. Returns the chat id, or None after replying."""
+    chat = update.effective_chat
+    if chat.type == ChatType.PRIVATE:
+        await update.message.reply_text("🎰 Run this inside the group you want to configure.")
+        return None
+    if not await _jackpot_can_configure(update, context):
+        await update.message.reply_text("❌ Only group admins (or the bot owner) can change the Jackpot settings.")
+        return None
+    return chat.id
+
+
+async def setjackpot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/setjackpot <fee>  (also /setl <fee>): sets the fee; the prize becomes fee x 10."""
+    chat_id = await _jackpot_config_gate(update, context)
+    if chat_id is None:
+        return
+    fee_now, reward_now = await asyncio.to_thread(db.jackpot_get_settings, chat_id)
+    usage = (
+        "Usage: /setjackpot <fee>  (e.g. /setjackpot 200)\n"
+        f"Fee: {JACKPOT_MIN_FEE:,}-{JACKPOT_MAX_FEE:,} • the prize is {db.JACKPOT_REWARD_MULTIPLIER}x the fee\n"
+        "Want a custom prize? /editjackpot <fee> <prize>\n\n"
+        f"Currently: fee {fee_now:,}, prize {reward_now:,}"
+    )
+    if len(context.args or []) != 1:
+        await update.message.reply_text(usage)
+        return
+    fee = _jackpot_parse_int(context.args[0])
+    err = jackpot_fee_error(fee)
+    if err:
+        await update.message.reply_text(err + "\n\n" + usage)
+        return
+    reward = fee * db.JACKPOT_REWARD_MULTIPLIER
+    await asyncio.to_thread(db.jackpot_set_settings, chat_id, fee, reward, _jackpot_fmt(_jackpot_now()))
+    await update.message.reply_text(
+        f"🎰 Jackpot updated for this group\n💵 Entry fee: {fee:,}\n🏆 Prize: {reward:,}"
+    )
+
+
+async def editjackpot_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/editjackpot <fee> <prize>: custom fee AND prize (kept until changed again)."""
+    chat_id = await _jackpot_config_gate(update, context)
+    if chat_id is None:
+        return
+    fee_now, reward_now = await asyncio.to_thread(db.jackpot_get_settings, chat_id)
+    usage = (
+        "Usage: /editjackpot <fee> <prize>  (e.g. /editjackpot 500 5000)\n"
+        f"Fee: {JACKPOT_MIN_FEE:,}-{JACKPOT_MAX_FEE:,} • Prize: at least the fee, at most {JACKPOT_MAX_REWARD:,}\n\n"
+        f"Currently: fee {fee_now:,}, prize {reward_now:,}"
+    )
+    if len(context.args or []) != 2:
+        await update.message.reply_text(usage)
+        return
+    fee = _jackpot_parse_int(context.args[0])
+    reward = _jackpot_parse_int(context.args[1])
+    err = jackpot_fee_error(fee) or jackpot_reward_error(reward, fee or 0)
+    if err:
+        await update.message.reply_text(err + "\n\n" + usage)
+        return
+    await asyncio.to_thread(db.jackpot_set_settings, chat_id, fee, reward, _jackpot_fmt(_jackpot_now()))
+    await update.message.reply_text(
+        f"🎰 Jackpot updated for this group\n💵 Entry fee: {fee:,}\n🏆 Prize: {reward:,}"
+    )
+
 
 
 # =======================================================================
@@ -10681,10 +11114,10 @@ def premium_features_text(price, dur) -> str:
     return (
         f"⭐ <b>Premium features</b>\n\n"
         f"💵 <b>Doubled rewards</b> - every {DOLLAR} you earn from Word Game wins (as the guesser AND as the "
-        f"leader) and Word Scramble wins is doubled, and Word Scramble win-streak bonuses are doubled too.\n\n"
+        f"leader) and Word Scramble wins is doubled.\n\n"
         f"🚀 <b>Buy cash</b> - /buycash, /boostrank and /boostlevel let you buy {DOLLAR} with Telegram Stars "
         f"to increase your balance, level and rank.\n\n"
-        f"🔁 <b>Send cash</b> - /transfer sends {DOLLAR} from your Word Scramble balance to another player.\n\n"
+        f"🔁 <b>Send cash</b> - /transfer sends {DOLLAR} from your combined Word Scramble + Word Game balance to another player.\n\n"
         f"🙏 <b>Ask for cash</b> - /request asks another player for {DOLLAR} (they get Yes/No buttons).\n\n"
         f"🎁 <b>Gift Premium</b> - /giftpremium lets you give Premium to another player "
         f"(you pay the Stars for their gift).\n\n"
@@ -11415,7 +11848,7 @@ async def _do_transfer(chat_id, sender_id, sender_name, target_id, target_name, 
         logger.error(f"transfer {sender_id}->{target_id} {amount} failed: {e}", exc_info=True)
         return False, "⚠️ Something went wrong and nothing was moved. Please try again."
     if code == "insufficient":
-        return False, f"❌ Not enough balance - you have {DOLLAR}{fmt_coins(a)} and tried to send {DOLLAR}{fmt_coins(amount)}."
+        return False, insufficient_cash_text(sender_id, sender_name)
     return True, f"✅ {_mention(sender_id, sender_name)} sent {DOLLAR}{fmt_coins(amount)} to {_mention(target_id, target_name)}"
 
 
@@ -11697,11 +12130,12 @@ async def request_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
 
     # The person being asked must be able to cover it (they pay from their
-    # Word Scramble balance). Their exact balance is never revealed.
-    target_balance = await asyncio.to_thread(db.scramble_get_global_earned, target_id)
+    # combined Word Scramble + Word Game balance). Their exact balance is never revealed.
+    target_balance = await asyncio.to_thread(db.get_spendable_balance, target_id)
     if (target_balance or 0) < amount:
-        await update.message.reply_text(
-            f"❌ {target_name} doesn't have {DOLLAR}{fmt_coins(amount)}, so the request wasn't sent."
+        await update.message.reply_html(
+            f"❌ {_mention(target_id, target_name)} doesn't have {DOLLAR}{fmt_coins(amount)}, "
+            f"so the request wasn't sent.\n👇 {DAILY_GETCASH_HINT}"
         )
         return
 
@@ -11785,11 +12219,22 @@ async def request_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("⚠️ Something went wrong and nothing was moved. Please try again.", show_alert=True)
             return
         if code == "insufficient":
+            # A popup alert can't hold a link, so it carries the exact guidance as plain text;
+            # a clickable-mention message follows in the chat (at most once a minute per
+            # request, so repeated taps can't spam the group).
             await query.answer(
-                f"You don't have enough {DOLLAR} - your balance is {DOLLAR}{fmt_coins(extra)}. "
+                f"❌ You don't have enough cash! 👇 {DAILY_GETCASH_HINT}\n"
                 f"The request stays open until it expires.",
                 show_alert=True,
             )
+            notice_key = (rid, user.id)
+            now_ts = time.monotonic()
+            if query.message is not None and now_ts - _INSUFFICIENT_NOTICE_LAST.get(notice_key, -1e9) > 60:
+                _INSUFFICIENT_NOTICE_LAST[notice_key] = now_ts
+                if len(_INSUFFICIENT_NOTICE_LAST) > 500:
+                    _INSUFFICIENT_NOTICE_LAST.clear()
+                await safe_send(context.bot, query.message.chat_id,
+                                text=insufficient_cash_text(user.id, user.first_name), parse_mode="HTML")
             return
         if code == "paid":
             _cancel_request_expiry(context.job_queue, rid)
@@ -11952,6 +12397,7 @@ FULLHELP_PAGES = (
     ("s", "🔤 Word Scramble"),
     ("t", "🏟️ Tournaments"),
     ("h", "💻 Hack"),
+    ("j", "🎰 Jackpot"),
     ("p", "⭐ Premium & Cash"),
     ("o", "📚 Other"),
 )
@@ -11991,17 +12437,13 @@ def _fullhelp_game_page() -> str:
 def _fullhelp_scramble_page() -> str:
     reward = get_scramble_reward()
     mins = SCRAMBLE_ROUND_SECONDS // 60
-    streak_lines = "\n".join(
-        f"{n} in a row: +{DOLLAR}{fmt_coins(bonus)}" for n, bonus in sorted(SCRAMBLE_STREAK_MILESTONES.items())
-    )
     return (
         f"🔤 <b>Word Scramble</b>\n\n"
         f"1️⃣ Run /wordscramble (groups and my DM).\n"
         f"2️⃣ I show a scrambled word - just type your guess as a normal message.\n"
         f"3️⃣ The first correct answer within {mins} minute{'s' if mins != 1 else ''} wins {DOLLAR}{fmt_coins(reward)}.\n"
         f"4️⃣ Close guess: 👀. Exactly right: 🎉.\n\n"
-        f"🔥 <b>Win streaks</b> - win back-to-back rounds in the same chat for a bonus:\n{streak_lines}\n"
-        f"Your streak resets when someone else wins a round.\n\n"
+        f"\n"
         f"⚙️ <b>Group settings</b> (group admins)\n"
         f"/scrambleautomaticmode on|off - a new round starts right after each one ends and keeps going non-stop. "
         f"It only switches itself off after 3 rounds in a row nobody answers, and can't be turned on while Slow Mode is on.\n"
@@ -12027,7 +12469,7 @@ def _fullhelp_tournament_page() -> str:
         f"Fee {TOURNAMENT_MIN_FEE:,}-{TOURNAMENT_MAX_FEE:,}, rounds {TOURNAMENT_MIN_ROUNDS}-{TOURNAMENT_MAX_ROUNDS}. "
         f"Difficulty: easy, easy3-easy6, medium, hard, off.\n"
         f"The host is NOT joined automatically and pays nothing until they /join like everyone else.\n\n"
-        f"🎮 Want a menu? /playgame (in a group) lets you start Normal Mode, Slow Mode, Automatic Mode, a Tournament, an Elimination or a Hack with one tap.\n\n"
+        f"🎮 Want a menu? /playgame (in a group) lets you start Normal Mode, Slow Mode, a 🎰 Jackpot, a Tournament, an Elimination or a Hack with one tap.\n\n"
         f"🚪 <b>Lobby</b>\n"
         f"Players send /join. The lobby stays open for {TOURNAMENT_LOBBY_SECONDS} seconds, then the tournament starts on its own. "
         f"The host (or a bot admin) can send /starttournament to start early. With fewer than 2 players it is cancelled and refunded.\n\n"
@@ -12067,8 +12509,8 @@ def _fullhelp_hack_page() -> str:
         f"The 💻 Hack button in /playgame does the same.\n"
         f"The host is NOT joined automatically and pays nothing until they /join like everyone else.\n\n"
         f"🚪 <b>Lobby</b>\n"
-        f"Players send /join. The entry fee is taken from your Word Scramble balance first; only if that is too low "
-        f"it comes from your Word Game balance. The lobby stays open for {HACK_LOBBY_SECONDS} seconds, then the game "
+        f"Players send /join. The entry fee comes from your combined balance: Word Scramble money first, then Word Game money "
+        f"for the rest (if the total is too low, nothing is taken). The lobby stays open for {HACK_LOBBY_SECONDS} seconds, then the game "
         f"starts on its own. With fewer than 2 players it is cancelled and everyone is refunded. "
         f"The host (or the bot owner) can send /starthack to start early.\n\n"
         f"🎯 <b>Playing</b>\n"
@@ -12095,6 +12537,33 @@ def _fullhelp_hack_page() -> str:
     )
 
 
+def _fullhelp_jackpot_page() -> str:
+    return (
+        f"🎰 <b>Jackpot / Lucky Number</b>\n\n"
+        f"Guess the secret number and win the prize.\n\n"
+        f"🚀 <b>Starting</b>\n"
+        f"/jackpot - or /l, /luckyspin, /spin, /tryyourluck, /lottery, /luckynumber (or the 🎰 Jackpot button in /playgame). Groups only.\n"
+        f"Joining pays the entry fee straight away. Default: fee {db.JACKPOT_DEFAULT_FEE:,}, prize "
+        f"{db.JACKPOT_DEFAULT_FEE * db.JACKPOT_REWARD_MULTIPLIER:,} (the prize is {db.JACKPOT_REWARD_MULTIPLIER}x the fee unless a custom prize is set).\n\n"
+        f"🔢 <b>The number</b>\n"
+        f"Fee below {db.JACKPOT_BIG_FEE_THRESHOLD:,}: a number from 1 to {db.JACKPOT_SMALL_RANGE_MAX}. "
+        f"Fee {db.JACKPOT_BIG_FEE_THRESHOLD:,} or more: 1 to {db.JACKPOT_BIG_RANGE_MAX}. It stays secret until the game ends.\n\n"
+        f"⏳ <b>Playing</b>\n"
+        f"You have {JACKPOT_SECONDS // 60} minutes and ONE guess: just send the number. A number outside the range doesn't count - "
+        f"you can try again. A correct guess wins the prize (with your profile picture); a wrong guess or running out of time "
+        f"loses the fee, with no refund. The lucky number is revealed when the game ends, with your new balance.\n\n"
+        f"📅 <b>One try a day</b>\n"
+        f"Each player can play once per day across ALL groups (it resets at 00:00 UTC). Other players can still play the same day. "
+        f"A failed join (not enough cash) doesn't use up your try.\n\n"
+        f"💵 <b>Paying</b>\n"
+        f"The fee comes from your combined balance: Word Scramble money first, then Word Game money for the rest. "
+        f"If the total is too low nothing is taken. Need cash? /daily or /getcash.\n\n"
+        f"⚙️ <b>Settings</b> (group admins or the owner, per group)\n"
+        f"/setjackpot &lt;fee&gt; (or /setl &lt;fee&gt;) - fee {JACKPOT_MIN_FEE:,}-{JACKPOT_MAX_FEE:,}, prize becomes {db.JACKPOT_REWARD_MULTIPLIER}x the fee.\n"
+        f"/editjackpot &lt;fee&gt; &lt;prize&gt; - custom prize (at least the fee, at most {JACKPOT_MAX_REWARD:,}); kept until changed."
+    )
+
+
 def _fullhelp_premium_page() -> str:
     price, dur = get_premium_settings()
     packs = get_dollar_packs()
@@ -12106,7 +12575,7 @@ def _fullhelp_premium_page() -> str:
         f"/buypremium - {price} ⭐ for {_format_duration_words(dur)} (paid with Telegram Stars; buying again while active extends it). "
         f"Used in a group, it moves you to my DM to pay. Tap <b>➡️ Premium features</b> on the invoice to see everything Premium gives.\n"
         f"/premiumstatus - see if it's active and how much time is left.\n"
-        f"It doubles the {DOLLAR} you earn from Word Game and Word Scramble wins (streak bonuses too). "
+        f"It doubles the {DOLLAR} you earn from Word Game and Word Scramble wins "
         f"It does not double purchased cash, the daily reward or tournament prizes. "
         f"Premium members do get a bigger daily reward: {DOLLAR}{fmt_coins(db.get_config('reward_daily_premium', db.DAILY_REWARD_PREMIUM))} instead of {DOLLAR}{fmt_coins(db.get_config('reward_daily', db.DAILY_REWARD))}.\n"
         f"/getcash - same as /buycash.\n\n"
@@ -12119,7 +12588,7 @@ def _fullhelp_premium_page() -> str:
         f"/boostrank and /boostlevel - do exactly the same as /buycash.\n"
         f"Used in a group, all three move you to my DM.\n"
         f"{pack_lines}\n\n"
-        f"🔁 <b>Sending cash</b> (Premium, Word Scramble balance)\n"
+        f"🔁 <b>Sending cash</b> (Premium, combined Word Scramble + Word Game balance)\n"
         f"/transfer &lt;@username|id&gt; &lt;amount&gt; - or reply to their message with /transfer &lt;amount&gt;. "
         f"Minimum {DOLLAR}{fmt_coins(MIN_TRANSFER_AMOUNT)}; amounts of {DOLLAR}{fmt_coins(threshold)} or more ask you to confirm first "
         f"({TRANSFER_CONFIRM_SECONDS} seconds).\n"
@@ -12147,9 +12616,9 @@ def _fullhelp_other_page() -> str:
         f"💝 <b>Support the bot</b>\n"
         f"/support - support the bot with Telegram Stars (quick amounts or a custom one; no in-game advantage). "
         f"/supporters - top supporters. /mysupport - your own total.\n\n"
-        f"🎮 <b>Start a game fast</b> - /playgame (groups): Normal Mode, Slow Mode, Automatic Mode, Tournament, Elimination or Hack.\n\n"
+        f"🎮 <b>Start a game fast</b> - /playgame (groups): Normal Mode, Slow Mode, 🎰 Jackpot, Tournament, Elimination or Hack.\n\n"
         f"🏆 <b>Leaderboards</b>\n"
-        f"/leaderboard, /chattop, /globaltop, /topplayers, /topgroups - Word Game and combined rankings\n"
+        f"/leaderboard (combined balance), /wordgameleaderboard (Word Game), /chattop, /globaltop, /topplayers, /topgroups - rankings\n"
         f"/scrambleleaderboard, /scrambletopplayers, /scrambletopgroups - Word Scramble rankings\n\n"
         f"👤 <b>Profile</b>\n"
         f"/start - the main menu with your balance, level and rank; works in my DM and in groups. "
@@ -12177,6 +12646,7 @@ _FULLHELP_BUILDERS = {
     "s": _fullhelp_scramble_page,
     "t": _fullhelp_tournament_page,
     "h": _fullhelp_hack_page,
+    "j": _fullhelp_jackpot_page,
     "p": _fullhelp_premium_page,
     "o": _fullhelp_other_page,
 }
@@ -12195,7 +12665,8 @@ def _fullhelp_keyboard(user_id, current):
     return InlineKeyboardMarkup([
         [btn("g", labels["g"]), btn("s", labels["s"])],
         [btn("t", labels["t"]), btn("h", labels["h"])],
-        [btn("p", labels["p"]), btn("o", labels["o"])],
+        [btn("j", labels["j"]), btn("p", labels["p"])],
+        [btn("o", labels["o"])],
     ])
 
 
@@ -12258,7 +12729,7 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 _COMMANDS_MENU = (
     # key, button label, title, command names, read the Word Scramble list first?
     ("sc", "Scramble commands", "🔤 Scramble commands",
-     ("wordscramble", "scramblehelp", "scrambleleaderboard", "scrambletopplayers", "scrambletopgroups",
+     ("wordscramble", "scramblehelp", "scrambleleaderboard", "leaderboard", "scrambletopplayers", "scrambletopgroups",
       "ranks", "playgame", "bal", "balance", "scramblestopgame", "scrambleautomaticmode", "slowmode",
       "deleterequestprompt", "gamedifficulty"), True),
     ("hk", "Hack commands", "💻 Hack commands",
@@ -12267,8 +12738,10 @@ _COMMANDS_MENU = (
      ("elimination", "setelimination", "join", "startelimination", "resumeelimination"), False),
     ("to", "Tournament commands", "🏟️ Tournament commands",
      ("tournament", "settournament", "join"), False),
+    ("jp", "Jackpot commands", "🎰 Jackpot commands",
+     ("jackpot", "setjackpot", "setl", "editjackpot", "playgame"), False),
     ("wg", "Word Game commands", "🎮 Word Game commands",
-     ("start", "help", "wordgame", "hint", "stopvote", "stopgame", "autodelete", "leaderboard", "chattop",
+     ("start", "help", "wordgame", "hint", "stopvote", "stopgame", "autodelete", "leaderboard", "wordgameleaderboard", "chattop",
       "globaltop", "topplayers", "topgroups", "claimdailyreward", "settings", "autolead", "bal", "balance",
       "gamedifficulty"), False),
 )
@@ -12322,7 +12795,7 @@ def _commands_menu_keyboard(user_id, current=None):
         shown = f"• {c[1]}" if c[0] == current else c[1]
         return InlineKeyboardButton(shown, callback_data=f"cmd:{user_id}:{c[0]}")
     b = {c[0]: btn(c) for c in _COMMANDS_MENU}
-    return InlineKeyboardMarkup([[b["sc"], b["hk"]], [b["el"], b["to"]], [b["wg"]]])
+    return InlineKeyboardMarkup([[b["sc"], b["hk"]], [b["el"], b["to"]], [b["wg"], b["jp"]]])
 
 
 def _split_text_parts(text, limit=3800):
@@ -12815,6 +13288,14 @@ def main():
     db.create_tables()
     print("GAME BOT: database tables created", flush=True)
 
+    # One-time: bring any stored Scramble/daily reward override in line with
+    # the current rules (Scramble 1, daily 10). Premium daily is untouched.
+    try:
+        for _k, _old, _new in db.apply_reward_defaults_v1():
+            print(f"GAME BOT: reward config {_k}: {_old} -> {_new}", flush=True)
+    except Exception as e:
+        print(f"GAME BOT: reward default reconciliation failed (will retry next start): {e}", flush=True)
+
     # One-time migration: anything still sitting in the old file-based
     # OWNER_ADDED storage (from before /addwords was moved to the database)
     # gets copied into custom_words now, so it isn't lost. Safe to run every
@@ -12914,6 +13395,7 @@ def main():
     app.add_handler(CommandHandler("scrambleusers", scrambleusers_command))
     app.add_handler(CommandHandler("hint", hint_command))
     app.add_handler(CommandHandler("leaderboard", leaderboard_command))
+    app.add_handler(CommandHandler("wordgameleaderboard", wordgameleaderboard_command))
     app.add_handler(CommandHandler("chattop", chat_top))
     app.add_handler(CommandHandler("globaltop", global_top))
     app.add_handler(CommandHandler("topgroups", topgroups_command))
@@ -12958,6 +13440,7 @@ def main():
     app.add_handler(CommandHandler("removeadmin", removeadmin_command))
     app.add_handler(CommandHandler("admins", admins_command))
     app.add_handler(CommandHandler("allcommands", allcommands_command))
+    app.add_handler(CommandHandler("ownerallcommands", ownerallcommands_command))
     app.add_handler(CommandHandler("claimeddailyreward", claimeddailyreward_command))
     app.add_handler(CommandHandler("addadmanager", addadmanager_command))
     app.add_handler(CommandHandler("changeadmanager", changeadmanager_command))
@@ -13002,6 +13485,9 @@ def main():
     app.add_handler(CommandHandler("hack", hack_command))
     app.add_handler(CommandHandler(["guess", "g"], guess_command))
     app.add_handler(CommandHandler("hackx", hackx_command))
+    app.add_handler(CommandHandler(JACKPOT_COMMANDS, jackpot_command))
+    app.add_handler(CommandHandler(JACKPOT_SETTERS, setjackpot_command))
+    app.add_handler(CommandHandler("editjackpot", editjackpot_command))
     app.add_handler(CommandHandler("sethackx", sethackx_command))
     app.add_handler(CommandHandler("starthack", starthack_command))
     app.add_handler(CommandHandler("stophack", stophack_command))
@@ -13026,13 +13512,13 @@ def main():
     # Specific callback patterns must be registered BEFORE the catch-all button handler.
     app.add_handler(CallbackQueryHandler(buypremium_button, pattern=r"^buypremium$"))
     app.add_handler(CallbackQueryHandler(support_button, pattern=r"^sup:(a:\d+|c)$"))
-    app.add_handler(CallbackQueryHandler(playgame_button, pattern=r"^pgm:(normal|slow|auto|tour|elim|hack)$"))
+    app.add_handler(CallbackQueryHandler(playgame_button, pattern=r"^pgm:(normal|slow|auto|tour|elim|hack|jackpot)$"))
     app.add_handler(CallbackQueryHandler(premium_features_button, pattern=r"^pf:(show|back:\d+)$"))
     app.add_handler(CallbackQueryHandler(buydollar_button, pattern=r"^bd:\d+:\d+:\d+:\d+(:[crl])?$"))
     app.add_handler(CallbackQueryHandler(transfer_button, pattern=r"^tf:[yn]:[0-9a-f]+$"))
     app.add_handler(CallbackQueryHandler(request_button, pattern=r"^rq:[yn]:\d+$"))
-    app.add_handler(CallbackQueryHandler(fullhelp_button, pattern=r"^fh:\d+:[gstpoh]$"))
-    app.add_handler(CallbackQueryHandler(commands_menu_button, pattern=r"^cmd:\d+:(sc|hk|el|to|wg)$"))
+    app.add_handler(CallbackQueryHandler(fullhelp_button, pattern=r"^fh:\d+:[gstpohj]$"))
+    app.add_handler(CallbackQueryHandler(commands_menu_button, pattern=r"^cmd:\d+:(sc|hk|el|to|wg|jp)$"))
     app.add_handler(CallbackQueryHandler(premium_players_page_button, pattern=r"^spp:\d+$"))
     app.add_handler(CommandHandler("profile", profile_command))
     app.add_handler(CommandHandler("inviteandearn", inviteandearn_command))
@@ -13064,6 +13550,13 @@ def main():
         hack_text_guess,
     ), group=2)
 
+    # Jackpot: a plain 1-4 digit number from the player whose Jackpot is running.
+    # Its own handler group; messages from anyone else return before any database access.
+    app.add_handler(MessageHandler(
+        filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND & filters.Regex(r"^\s*[0-9]{1,4}\s*$"),
+        jackpot_text_guess,
+    ), group=3)
+
     if app.job_queue is not None:
         # A timer that fires even 1-2 seconds late (event loop briefly busy)
         # is DROPPED by APScheduler under its default 1-second grace window.
@@ -13086,6 +13579,10 @@ def main():
         restore_stale_tournaments(app.job_queue)
         restore_stale_eliminations(app.job_queue)
         restore_stale_hacks(app.job_queue)
+        try:
+            restore_jackpots(app.job_queue)
+        except Exception as e:
+            logger.error(f"restore_jackpots failed: {e}")
         schedule_tournament_pause_check(app.job_queue)
         schedule_scramble_watchdog(app.job_queue)
 
