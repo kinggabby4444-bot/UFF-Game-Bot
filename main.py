@@ -19,7 +19,7 @@ try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    main().run_polling()
+    pass
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReactionTypeEmoji, LinkPreviewOptions, LabeledPrice
 from telegram.constants import ChatType
@@ -3363,9 +3363,6 @@ async def claimdailyreward_command(update: Update, context: ContextTypes.DEFAULT
     await asyncio.to_thread(db.add_user, user.id, user.first_name)
 
     result, amount = await _claim_daily_for(user)
-
-    if result[0]:
-        apply_chat_credit_for_global_earning(user.id, user.first_name, amount)
 
     await update.message.reply_html(format_daily_reward_text(result, amount))
 
@@ -13600,4 +13597,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main().run_polling()
+    pass
