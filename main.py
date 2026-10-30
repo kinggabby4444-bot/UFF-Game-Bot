@@ -3364,6 +3364,9 @@ async def claimdailyreward_command(update: Update, context: ContextTypes.DEFAULT
 
     result, amount = await _claim_daily_for(user)
 
+    if result[0]:
+        apply_chat_credit_for_global_earning(user.id, user.first_name, amount)
+
     await update.message.reply_html(format_daily_reward_text(result, amount))
 
 

@@ -927,90 +927,45 @@ def award_global_coins(user_id, name, amount):
 
 
 def claim_daily_reward(user_id, name, username=None, premium=False):
-    """Claim and credit the daily reward in ONE PostgreSQL transaction.
-
-    The user row is locked before checking the 24-hour cooldown. The claim
-    timestamp, Word Game credit, and audit-log row commit together, so a crash
-    cannot consume a claim without paying it (or pay it without recording it).
-    Concurrent /daily requests for the same user serialize on the users row.
-    """
     conn = connect()
     try:
         cursor = conn.cursor()
-        now = datetime.now()
-        now_text = now.isoformat()
-
-        # Normally /start has already created this row. Ensure it exists so a
-        # missing users row cannot accidentally allow unlimited unrecorded
-        # claims. ON CONFLICT does not overwrite an existing profile.
-        cursor.execute(
-            "INSERT INTO users (id, name, username, last_active) VALUES (%s, %s, %s, %s) "
-            "ON CONFLICT (id) DO NOTHING",
-            (user_id, name, username, now_text),
-        )
-        cursor.execute(
-            "SELECT last_daily_claim FROM users WHERE id=%s FOR UPDATE",
-            (user_id,),
-        )
+        cursor.execute("SELECT last_daily_claim FROM users WHERE id=%s", (user_id,))
         row = cursor.fetchone()
         last_claim = row[0] if row else None
+        now = datetime.now()
         if last_claim:
             last_claim_dt = datetime.fromisoformat(last_claim)
-            elapsed = now - last_claim_dt
-            if elapsed < timedelta(hours=24):
-                remaining = timedelta(hours=24) - elapsed
-                conn.rollback()
+            if now - last_claim_dt < timedelta(hours=24):
+                remaining = timedelta(hours=24) - (now - last_claim_dt)
                 return False, remaining
-
-        amount = int(
-            get_config("reward_daily_premium", DAILY_REWARD_PREMIUM)
-            if premium else get_config("reward_daily", DAILY_REWARD)
-        )
-        if amount < 0:
-            raise ValueError("Daily reward amount cannot be negative")
-
-        cursor.execute(
-            "UPDATE users SET last_daily_claim=%s WHERE id=%s",
-            (now_text, user_id),
-        )
-        # Daily reward belongs to the Word Game/global balance, as before.
-        _tx_credit_global(cursor, user_id, name, amount)
-
-        # Preserve the existing "earned in the last group" chat leaderboard
-        # behavior, but keep it inside this same transaction as the global
-        # credit. A DM claim is attributed to the user's last known group.
-        reward_chat_id = _tx_chat_for_credit(cursor, user_id, None)
-        if reward_chat_id is not None:
-            cursor.execute("""
-                INSERT INTO chat_scores (user_id, chat_id, name, coins)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (user_id, chat_id) DO UPDATE SET
-                    coins = chat_scores.coins + EXCLUDED.coins,
-                    name = EXCLUDED.name
-            """, (user_id, reward_chat_id, name, amount))
-
-        cursor.execute("""
-            INSERT INTO bot_stats (key, value) VALUES ('total_rewards_given', %s)
-            ON CONFLICT (key) DO UPDATE SET value = bot_stats.value + EXCLUDED.value
-        """, (amount,))
-        cursor.execute("""
-            INSERT INTO daily_reward_log (user_id, name, username, amount, claim_date, claimed_at)
-            VALUES (%s, %s, %s, %s, %s, %s)
-        """, (
-            user_id, name, username, amount,
-            now.strftime("%Y-%m-%d"), now_text,
-        ))
-        balance = _tx_combined_total(cursor, user_id)
-        conn.commit()
-        return True, balance
-    except Exception:
-        try:
+        # Compare-and-set: only claim if last_daily_claim is STILL what we just
+        # read. Two simultaneous /daily taps both pass the 24h check above, but
+        # only one of them can win this UPDATE - the other gets "already claimed".
+        if last_claim:
+            cursor.execute(
+                "UPDATE users SET last_daily_claim=%s WHERE id=%s AND last_daily_claim=%s",
+                (now.isoformat(), user_id, last_claim)
+            )
+        else:
+            cursor.execute(
+                "UPDATE users SET last_daily_claim=%s WHERE id=%s AND last_daily_claim IS NULL",
+                (now.isoformat(), user_id)
+            )
+        if row is not None and cursor.rowcount == 0:
             conn.rollback()
-        except Exception:
-            pass
-        raise
+            return False, timedelta(hours=24)
+        conn.commit()
     finally:
         conn.close()
+
+    if premium:
+        amount = int(get_config("reward_daily_premium", DAILY_REWARD_PREMIUM))
+    else:
+        amount = int(get_config("reward_daily", DAILY_REWARD))
+    award_global_coins(user_id, name, amount)
+    log_daily_claim(user_id, name, username, amount)
+    return True, get_combined_balance(user_id)
 
 
 def log_daily_claim(user_id, name, username, amount):
