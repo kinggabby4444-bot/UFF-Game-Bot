@@ -23,7 +23,7 @@ except ImportError:
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReactionTypeEmoji, LinkPreviewOptions, LabeledPrice
 from telegram.constants import ChatType
-from telegram.error import Forbidden, BadRequest, TimedOut, NetworkError, RetryAfter
+from telegram.error import Forbidden, BadRequest, TimedOut, NetworkError, RetryAfter, ChatMigrated
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -276,7 +276,7 @@ SAFE_SEND_MAX_FLOOD_WAITS = 6
 SAFE_SEND_MAX_FLOOD_SLEEP = 90
 
 
-async def safe_send(bot, chat_id, retries=2, delay=2, **kwargs):
+async def safe_send(bot, chat_id, retries=2, delay=2, raise_permanent=False, **kwargs):
     attempt = 0
     flood_waits = 0
     while True:
@@ -298,6 +298,19 @@ async def safe_send(bot, chat_id, retries=2, delay=2, **kwargs):
             wait = min(float(wait), SAFE_SEND_MAX_FLOOD_SLEEP) + 1
             logger.warning(f"send_message to {chat_id}: flood control, waiting {wait:.0f}s")
             await asyncio.sleep(wait)
+        except BadRequest as e:
+            _m = str(e).lower()
+            if any(s in _m for s in ("not enough rights", "no rights to send", "chat_write_forbidden", "chat_send_plain_forbidden")):
+                # Permanent: the bot is muted/restricted there. Don't retry like a network blip.
+                if raise_permanent:
+                    raise Forbidden(str(e))
+                logger.error(f"send_message to {chat_id} failed: {e}")
+                return None
+            if attempt >= retries:
+                logger.error(f"send_message to {chat_id} failed after retries: {e}")
+                return None
+            attempt += 1
+            await asyncio.sleep(delay)
         except (TimedOut, NetworkError) as e:
             if attempt >= retries:
                 logger.error(f"send_message to {chat_id} failed after retries: {e}")
@@ -1161,7 +1174,7 @@ async def scramble_send_retry_callback(context: ContextTypes.DEFAULT_TYPE):
 
     try:
         result = await start_scramble_round(context, chat)
-    except (Forbidden,) as e:
+    except (Forbidden, ChatMigrated) as e:
         logger.error(f"scramble send retry: bot can't post in {chat_id} ({e}); turning Automatic Mode off there")
         if kind == "auto":
             try:
@@ -1280,6 +1293,7 @@ async def _start_scramble_round_locked(context: ContextTypes.DEFAULT_TYPE, chat)
         sent = await safe_send(
             context.bot,
             chat.id,
+            raise_permanent=True,
             text=(
                 f"🎮 <b>WORD SCRAMBLE</b> 🎮\n\n"
                 f"Unscramble this word:\n\n"
@@ -2086,7 +2100,12 @@ async def slowmode_next_round_callback(context: ContextTypes.DEFAULT_TYPE):
         return
 
     await asyncio.to_thread(db.scramble_clear_next_round_due, chat_id)
-    result = await start_scramble_round(context, chat)
+    try:
+        result = await start_scramble_round(context, chat)
+    except (Forbidden, ChatMigrated) as e:
+        logger.error(f"Slowmode: chat {chat_id} unusable ({e}); turning Slow Mode off there")
+        await apply_slowmode_off(context.job_queue, chat_id)
+        return
     if result == "send_failed":
         # Word never reached the group: retry shortly (same callback) instead
         # of waiting a whole slowmode interval; due-time is kept near-term.
@@ -4939,6 +4958,21 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+_THROTTLE_SEEN = {}
+
+
+def _throttle(key, seconds):
+    """True if `key` was not handled within the last `seconds` (and marks it handled now)."""
+    now = time.monotonic()
+    last = _THROTTLE_SEEN.get(key)
+    if last is not None and now - last < seconds:
+        return False
+    if len(_THROTTLE_SEEN) > 20000:
+        _THROTTLE_SEEN.clear()
+    _THROTTLE_SEEN[key] = now
+    return True
+
+
 async def pre_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat = update.effective_chat
@@ -4984,12 +5018,13 @@ async def pre_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
             raise ApplicationHandlerStop
 
-        await asyncio.to_thread(
-            db.register_group,
-            chat.id,
-            chat.title or str(chat.id),
-            getattr(chat, "username", None),
-        )
+        if _throttle(("grp", chat.id), 300):
+            await asyncio.to_thread(
+                db.register_group,
+                chat.id,
+                chat.title or str(chat.id),
+                getattr(chat, "username", None),
+            )
 
     maintenance_mode = await asyncio.to_thread(db.get_config, "maintenance_mode", "0")
     if not is_bot_admin_or_owner(user.id) and maintenance_mode == "1":
@@ -5015,12 +5050,14 @@ async def pre_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
         raise ApplicationHandlerStop
 
-    await asyncio.to_thread(db.add_user, user.id, user.first_name, user.username)
+    if _throttle(("usr", user.id), 300):
+        await asyncio.to_thread(db.add_user, user.id, user.first_name, user.username)
 
     # Any DM activity proves this user has the bot open in private (/botusers).
     if chat is not None and chat.type == ChatType.PRIVATE and update.my_chat_member is None:
         try:
-            await asyncio.to_thread(db.mark_user_bot_started, user.id)
+            if _throttle(("dm", user.id), 300):
+                await asyncio.to_thread(db.mark_user_bot_started, user.id)
         except Exception:
             logger.exception("Failed to record DM start for /botusers")
 
@@ -8104,7 +8141,8 @@ async def _scramble_watchdog_scan(context: ContextTypes.DEFAULT_TYPE):
         logger.warning(f"watchdog: Automatic Mode in {chat_id} was idle {idle:.0f}s with no round; restarting it")
         try:
             result = await start_scramble_round(context, chat)
-        except Forbidden:
+        except (Forbidden, ChatMigrated) as e:
+            logger.warning(f"watchdog: chat {chat_id} unusable ({e}); turning Automatic Mode off there")
             await asyncio.to_thread(db.scramble_set_auto_enabled, chat_id, False)
             continue
         except Exception:
@@ -13609,4 +13647,9 @@ def main():
 
 
 if __name__ == "__main__":
-    pass
+    # In production this file is imported by server.py (webhook mode) and must NOT
+    # start polling itself. Render's Start Command must be:  python server.py
+    if os.environ.get("RENDER"):
+        raise SystemExit("main.py is not the entry point. Set Render's Start Command to: python server.py")
+    # Local testing only (long polling):
+    main().run_polling(allowed_updates=Update.ALL_TYPES)

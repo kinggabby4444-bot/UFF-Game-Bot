@@ -79,18 +79,40 @@ class PooledConnection:
 
     def close(self):
         if not self._closed:
-            try:
-                self._conn.rollback()
-            except Exception:
-                pass
-            self._pool.putconn(self._conn)
             self._closed = True
+            try:
+                try:
+                    self._conn.rollback()
+                except Exception:
+                    pass
+                _last_used[id(self._conn)] = time.monotonic()
+                self._pool.putconn(self._conn)
+            finally:
+                _slots.release()
 
 
 POOL_WAIT_SECONDS = float(os.environ.get("GAME_DB_POOL_WAIT", "20"))
 
 
+_POOL_MAX = int(os.environ.get("GAME_DB_POOL_MAX", "10"))
+_slots = threading.BoundedSemaphore(_POOL_MAX)   # one slot per pooled connection
+_last_used = {}                                  # id(raw connection) -> last time it was returned
+_PING_AFTER_IDLE_SECONDS = 20                    # only health-check connections idle longer than this
+
+
 def connect():
+    """Check a connection out of the pool. Callers wait (cheaply) for a free slot,
+    up to POOL_WAIT_SECONDS, instead of spinning and failing with 'pool exhausted'."""
+    if not _slots.acquire(timeout=POOL_WAIT_SECONDS):
+        raise psycopg2.pool.PoolError(f"no free database connection after {POOL_WAIT_SECONDS:.0f}s")
+    try:
+        return _connect_inner()
+    except BaseException:
+        _slots.release()
+        raise
+
+
+def _connect_inner():
     """Check a connection out of the pool.
 
     Two failure modes used to surface here as exceptions that silently
@@ -124,7 +146,8 @@ def connect():
             # at connection time - Neon's pooled endpoint rejects that as an
             # unsupported startup parameter. This also doubles as a cheap
             # liveness check for the connection we were just handed.
-            raw.cursor().execute("SET statement_timeout = 15000")
+            if time.monotonic() - _last_used.get(id(raw), 0.0) > _PING_AFTER_IDLE_SECONDS:
+                raw.cursor().execute("SET statement_timeout = 15000")
         except (psycopg2.OperationalError, psycopg2.InterfaceError):
             # Dead/stale connection: discard it and take another.
             try:

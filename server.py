@@ -2,6 +2,7 @@ import os
 import asyncio
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from aiohttp import web
 
 from telegram import Update
@@ -11,6 +12,8 @@ import ads_main as ads_bot_module
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+# One access-log line per webhook/health ping buries every real log line.
+logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
 
 PORT = int(os.environ.get("PORT", 10000))
 
@@ -23,6 +26,12 @@ if not BASE_URL:
 
 GAME_WEBHOOK_PATH = "/webhook/game"
 ADS_WEBHOOK_PATH = "/webhook/ads"
+
+# How many updates one bot processes at the same time. Extra updates wait in the
+# event loop (cheap) instead of all fighting for database connections at once.
+MAX_CONCURRENT_UPDATES = int(os.environ.get("UPDATE_CONCURRENCY", "16"))
+# Worker threads for the blocking (psycopg2) calls each bot makes via asyncio.to_thread.
+BOT_THREADS = int(os.environ.get("BOT_THREADS", "24"))
 
 
 class BotRunner:
@@ -37,6 +46,7 @@ class BotRunner:
         self.webhook_path = webhook_path
         self.loop = None
         self.app = None
+        self._sem = None
         self.ready = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True)
         # Futures from run_coroutine_threadsafe() must be kept referenced
@@ -49,6 +59,11 @@ class BotRunner:
     def _run(self):
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
+        # Enough worker threads that waiting for a database slot never starves
+        # the rest of this bot's asyncio.to_thread() calls.
+        self.loop.set_default_executor(
+            ThreadPoolExecutor(max_workers=BOT_THREADS, thread_name_prefix=self.name.replace(" ", "_"))
+        )
         try:
             self.app = self.build_app_fn()
             self.loop.run_until_complete(self._startup())
@@ -59,6 +74,7 @@ class BotRunner:
         self.loop.run_forever()
 
     async def _startup(self):
+        self._sem = asyncio.Semaphore(MAX_CONCURRENT_UPDATES)
         await self.app.initialize()
         await self.app.bot.set_webhook(
             url=BASE_URL + self.webhook_path,
@@ -67,16 +83,20 @@ class BotRunner:
         await self.app.start()
         logger.info(f"{self.name}: initialized, webhook set, started.")
 
+    async def _process(self, update):
+        async with self._sem:
+            await self.app.process_update(update)
+
     def start(self):
         self.thread.start()
         self.ready.wait(timeout=60)
 
     def submit_update(self, data):
-        if self.app is None or self.loop is None:
+        if self.app is None or self.loop is None or self._sem is None:
             logger.error(f"{self.name}: not ready, dropping update")
             return
         update = Update.de_json(data, self.app.bot)
-        future = asyncio.run_coroutine_threadsafe(self.app.process_update(update), self.loop)
+        future = asyncio.run_coroutine_threadsafe(self._process(update), self.loop)
         self._pending_futures.add(future)
         future.add_done_callback(self._on_update_done)
 
