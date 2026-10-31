@@ -4,8 +4,13 @@ see the "shared tables" section at the bottom of create_tables()).
 """
 
 import os
+import random
 import re
+import secrets
+import sys
+import threading
 import time
+from collections import OrderedDict
 from datetime import datetime, timedelta
 
 import psycopg2
@@ -13,8 +18,8 @@ import psycopg2.pool
 from dotenv import load_dotenv
 
 load_dotenv()
-DAILY_REWARD = 50
-DAILY_REWARD_PREMIUM = 100
+DAILY_REWARD = 10
+DAILY_REWARD_PREMIUM = 100   # unchanged
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
@@ -659,6 +664,50 @@ def create_tables():
             "ON hack_players (hack_id, user_id)"
         )
 
+        # ---- Jackpot / Lucky Number (additive tables only) ------------------
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS jackpot_settings (
+            chat_id BIGINT PRIMARY KEY,
+            fee BIGINT NOT NULL,
+            reward BIGINT NOT NULL,
+            updated_at TEXT
+        )
+        """)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS jackpot_games (
+            id BIGSERIAL PRIMARY KEY,
+            chat_id BIGINT NOT NULL,
+            user_id BIGINT NOT NULL,
+            user_name TEXT,
+            fee BIGINT NOT NULL,
+            reward BIGINT NOT NULL,
+            range_max INTEGER NOT NULL,
+            secret INTEGER NOT NULL,
+            source TEXT,
+            status TEXT NOT NULL DEFAULT 'active',
+            guess INTEGER,
+            message_id BIGINT,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            settled_at TEXT
+        )
+        """)
+        # One row per player per UTC day, across ALL groups. The PRIMARY KEY is
+        # what makes "one attempt per day" race-proof: it is written in the same
+        # transaction as the fee debit.
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS jackpot_daily (
+            user_id BIGINT NOT NULL,
+            play_date TEXT NOT NULL,
+            game_id BIGINT,
+            PRIMARY KEY (user_id, play_date)
+        )
+        """)
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_jackpot_one_active_per_user "
+            "ON jackpot_games (user_id) WHERE status = 'active'"
+        )
+
         # ---- /support (Telegram Stars) -------------------------------------
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS support_payments (
@@ -788,19 +837,21 @@ def compute_level_rank(balance):
 
 
 def get_combined_balance(user_id):
+    """Word Game + Word Scramble money (each counted only when positive) -
+    exactly what fee checks and the combined leaderboard use."""
+    return get_spendable_balance(user_id)
+
+
+def get_spendable_balance(user_id):
+    """What a player can actually spend on fees/transfers/requests: Word
+    Scramble money + Word Game money (each counted only when positive). This is
+    the exact figure _tx_deduct_combined checks, so a pre-check here can never
+    disagree with the real debit."""
     conn = connect()
     try:
         cursor = conn.cursor()
-        cursor.execute("""
-            SELECT COALESCE(g.coins, 0), COALESCE(s.earned, 0)
-            FROM (SELECT %s::bigint AS uid) x
-            LEFT JOIN global_scores g ON g.user_id = x.uid
-            LEFT JOIN scramble_global_stats s ON s.user_id = x.uid
-        """, (user_id,))
-        row = cursor.fetchone()
-        if not row:
-            return 0
-        return (row[0] or 0) + (row[1] or 0)
+        scramble, game = _tx_spendable(cursor, user_id)
+        return scramble + game
     finally:
         conn.close()
 
@@ -876,34 +927,102 @@ def award_global_coins(user_id, name, amount):
         increment_stat("total_rewards_given", amount)
 
 
-def claim_daily_reward(user_id, name, username=None, premium=False):
+def _config_tx(cursor, key, default):
+    """bot_config lookup on the CALLER's cursor (so it joins the caller's transaction)."""
+    cursor.execute("SELECT value FROM bot_config WHERE key=%s", (key,))
+    row = cursor.fetchone()
+    return row[0] if row and row[0] is not None else default
+
+
+def claim_daily_reward_tx(user_id, name, username=None, premium=False, chat_id=None, credit_chat=True):
+    """Claim the daily reward in ONE transaction. Everything below commits together
+    or not at all:
+        1. lock the player's row (concurrent claims queue up behind this lock),
+        2. enforce the 24-hour rule,
+        3. record the claim time,
+        4. credit the reward to the global Word Game balance,
+        5. write the daily_reward_log row and the total_rewards_given counter,
+        6. credit the chat record (chat_id, or the player's last chat) - same rule
+           the bot used before, now inside the same transaction.
+    A crash/DB error at any point rolls ALL of it back, so a player can never be
+    marked as claimed without being paid. The second of two simultaneous claims
+    waits for the first, then sees the new claim time and is refused.
+    Returns (True, combined_balance, amount_credited) or (False, time_remaining, 0)."""
     conn = connect()
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT last_daily_claim FROM users WHERE id=%s", (user_id,))
+        now = datetime.now()
+        # Same as add_user: make sure the row exists so it can be locked.
+        cursor.execute(
+            "INSERT INTO users (id, name, username, last_active) VALUES (%s, %s, %s, %s) "
+            "ON CONFLICT (id) DO NOTHING",
+            (user_id, name, username, now.isoformat())
+        )
+        cursor.execute("SELECT last_daily_claim FROM users WHERE id=%s FOR UPDATE", (user_id,))
         row = cursor.fetchone()
         last_claim = row[0] if row else None
-        now = datetime.now()
         if last_claim:
             last_claim_dt = datetime.fromisoformat(last_claim)
             if now - last_claim_dt < timedelta(hours=24):
                 remaining = timedelta(hours=24) - (now - last_claim_dt)
-                return False, remaining
-        cursor.execute(
-            "UPDATE users SET last_daily_claim=%s WHERE id=%s",
-            (now.isoformat(), user_id)
-        )
+                conn.rollback()
+                return False, remaining, 0
+
+        if premium:
+            amount = int(_config_tx(cursor, "reward_daily_premium", DAILY_REWARD_PREMIUM))
+        else:
+            amount = int(_config_tx(cursor, "reward_daily", DAILY_REWARD))
+
+        cursor.execute("UPDATE users SET last_daily_claim=%s WHERE id=%s", (now.isoformat(), user_id))
+        cursor.execute("""
+            INSERT INTO global_scores (user_id, name, coins)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (user_id) DO UPDATE SET
+                coins = global_scores.coins + EXCLUDED.coins,
+                name = EXCLUDED.name
+        """, (user_id, name, amount))
+        cursor.execute("""
+            INSERT INTO daily_reward_log (user_id, name, username, amount, claim_date, claimed_at)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, (user_id, name, username, amount, now.strftime("%Y-%m-%d"), now.isoformat()))
+        if amount > 0:
+            cursor.execute("""
+                INSERT INTO bot_stats (key, value) VALUES ('total_rewards_given', %s)
+                ON CONFLICT (key) DO UPDATE SET value = bot_stats.value + EXCLUDED.value
+            """, (amount,))
+        if credit_chat:
+            target_chat = chat_id
+            if not target_chat:
+                cursor.execute("SELECT last_chat_id FROM users WHERE id=%s", (user_id,))
+                r = cursor.fetchone()
+                target_chat = r[0] if r and r[0] else None
+            if target_chat:
+                cursor.execute("""
+                    INSERT INTO chat_scores (user_id, chat_id, name, coins)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (user_id, chat_id) DO UPDATE SET
+                        coins = chat_scores.coins + EXCLUDED.coins,
+                        name = EXCLUDED.name
+                """, (user_id, target_chat, name, amount))
+                cursor.execute("UPDATE users SET last_chat_id=%s WHERE id=%s", (target_chat, user_id))
+        combined = _tx_combined_total(cursor, user_id)
         conn.commit()
+        return True, combined, amount
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
     finally:
         conn.close()
 
-    if premium:
-        amount = int(get_config("reward_daily_premium", DAILY_REWARD_PREMIUM))
-    else:
-        amount = int(get_config("reward_daily", DAILY_REWARD))
-    award_global_coins(user_id, name, amount)
-    log_daily_claim(user_id, name, username, amount)
-    return True, get_combined_balance(user_id)
+
+def claim_daily_reward(user_id, name, username=None, premium=False):
+    """Backward-compatible wrapper: same (ok, value) result as before, but now
+    atomic. (The bot itself calls claim_daily_reward_tx, which also credits the chat.)"""
+    ok, value, _amount = claim_daily_reward_tx(user_id, name, username, premium, credit_chat=False)
+    return ok, value
 
 
 def log_daily_claim(user_id, name, username, amount):
@@ -1343,68 +1462,252 @@ def get_global_leaderboard_with_ids(limit=10):
         conn.close()
 
 
+# NOTE (egress): the *_position() helpers below used to SELECT the whole
+# leaderboard table and scan it in Python to find one user's rank. The rank
+# is now computed inside Postgres (ROW_NUMBER over the SAME ORDER BY, so ranks
+# and tie-breaks are identical) and only that one row comes back.
 def get_chat_position(chat_id, user_id):
     conn = connect()
     try:
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT user_id, name, coins FROM chat_scores WHERE chat_id=%s ORDER BY coins DESC, user_id ASC
-        """, (chat_id,))
-        rows = cursor.fetchall()
+            SELECT rnk, name, coins FROM (
+                SELECT user_id, name, coins,
+                       ROW_NUMBER() OVER (ORDER BY coins DESC, user_id ASC) AS rnk
+                FROM chat_scores WHERE chat_id=%s
+            ) t WHERE user_id=%s
+        """, (chat_id, user_id))
+        row = cursor.fetchone()
     finally:
         conn.close()
-    for index, row in enumerate(rows, start=1):
-        if row[0] == user_id:
-            return index, row[1], row[2]
-    return None
+    if row is None:
+        return None
+    return int(row[0]), row[1], row[2]
 
 
 def get_global_position(user_id):
     conn = connect()
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT user_id, name, coins FROM global_scores ORDER BY coins DESC, user_id ASC")
-        rows = cursor.fetchall()
+        cursor.execute("""
+            SELECT rnk, name, coins FROM (
+                SELECT user_id, name, coins,
+                       ROW_NUMBER() OVER (ORDER BY coins DESC, user_id ASC) AS rnk
+                FROM global_scores
+            ) t WHERE user_id=%s
+        """, (user_id,))
+        row = cursor.fetchone()
     finally:
         conn.close()
-    for index, row in enumerate(rows, start=1):
-        if row[0] == user_id:
-            return index, row[1], row[2]
-    return None
+    if row is None:
+        return None
+    return int(row[0]), row[1], row[2]
+
+
+# ---------------------------------------------------------------------------
+# Used-word history (Word Game: used_words, Word Scramble / Tournament /
+# Elimination: scramble_used_words).
+#
+# Every word pick used to download the chat's ENTIRE used-word history
+# (SELECT word ... WHERE chat_id=...) and filter it in Python. The history
+# only ever changes through mark / reset below, so it is now kept in a
+# bounded in-memory cache and the full download happens only on a cache
+# miss (first pick after a restart, after eviction, after the TTL, or after
+# any DB error). The database stays the single source of truth:
+#   * every mark/reset writes to the DB FIRST; the cache is only touched if
+#     that write succeeded, and is DROPPED (never trusted) if it failed or
+#     its outcome is uncertain;
+#   * a cache miss always reloads the exact set from the DB;
+#   * entries expire after a TTL so a manual edit of the table in the
+#     database (or a second bot instance during a redeploy overlap) can
+#     never leave a chat with a permanently stale history.
+# ---------------------------------------------------------------------------
+
+_USED_WORDS_TABLES = {"wg": "used_words", "sc": "scramble_used_words"}
+_USED_WORDS_CACHE_MAX_CHATS = 250          # per table; least-recently-used evicted
+_USED_WORDS_CACHE_TTL_SECONDS = 6 * 3600   # forced reload from the DB after this
+
+_used_words_cache = {kind: OrderedDict() for kind in _USED_WORDS_TABLES}
+_used_words_cache_mu = threading.Lock()    # guards the OrderedDicts only (never held during I/O)
+# Striped per-chat locks: bounded memory no matter how many chats exist.
+# Reentrant, so word pickers can hold one across get -> choose -> mark.
+_used_words_locks = tuple(threading.RLock() for _ in range(64))
+_used_words_stats = {"hits": 0, "db_loads": 0}
+
+
+def used_words_lock(kind, chat_id):
+    """Lock that serialises pick/mark/reset for one chat's used-word history.
+    kind: "wg" (Word Game) or "sc" (Scramble/Tournament/Elimination).
+    Callers hold it across get_used_words -> choose -> mark_word_used so two
+    simultaneous picks in the same chat can never choose the same word."""
+    return _used_words_locks[hash((kind, chat_id)) % len(_used_words_locks)]
+
+
+def _uw_cache_get(kind, chat_id):
+    with _used_words_cache_mu:
+        od = _used_words_cache[kind]
+        entry = od.get(chat_id)
+        if entry is None:
+            return None
+        loaded_at, words = entry
+        if time.monotonic() - loaded_at > _USED_WORDS_CACHE_TTL_SECONDS:
+            del od[chat_id]
+            return None
+        od.move_to_end(chat_id)
+        return words
+
+
+def _uw_cache_put(kind, chat_id, words):
+    with _used_words_cache_mu:
+        od = _used_words_cache[kind]
+        od[chat_id] = (time.monotonic(), words)
+        od.move_to_end(chat_id)
+        while len(od) > _USED_WORDS_CACHE_MAX_CHATS:
+            od.popitem(last=False)
+
+
+def _uw_cache_drop(kind, chat_id):
+    with _used_words_cache_mu:
+        _used_words_cache[kind].pop(chat_id, None)
+
+
+def invalidate_used_words_cache(chat_id=None):
+    """Forget cached used-word history (one chat, or everything when chat_id
+    is None). Safe to call at any time - the next pick just reloads from the
+    database. Use after any out-of-band change to the used-word tables."""
+    with _used_words_cache_mu:
+        for od in _used_words_cache.values():
+            if chat_id is None:
+                od.clear()
+            else:
+                od.pop(chat_id, None)
+
+
+def _uw_stat(name):
+    with _used_words_cache_mu:
+        _used_words_stats[name] += 1
+
+
+def used_words_cache_stats():
+    """In-process counters (reset on restart): cache hits vs. full DB loads,
+    plus how many chats are cached. For verifying the cache is working."""
+    with _used_words_cache_mu:
+        return {
+            "hits": _used_words_stats["hits"],
+            "db_loads": _used_words_stats["db_loads"],
+            "cached_chats": {k: len(v) for k, v in _used_words_cache.items()},
+        }
+
+
+def _used_words_get(kind, chat_id):
+    table = _USED_WORDS_TABLES[kind]
+    with used_words_lock(kind, chat_id):
+        words = _uw_cache_get(kind, chat_id)
+        if words is not None:
+            _uw_stat("hits")
+            return set(words)   # copy: callers can never mutate the cache
+        conn = connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(f"SELECT word FROM {table} WHERE chat_id=%s", (chat_id,))
+            loaded = {sys.intern(row[0]) for row in cursor.fetchall()}
+        finally:
+            conn.close()
+        _uw_stat("db_loads")
+        _uw_cache_put(kind, chat_id, loaded)
+        return set(loaded)
+
+
+def _used_words_mark(kind, chat_id, word):
+    """Record a word as used. Returns True if THIS call inserted the row, False if
+    it was already there (e.g. another bot instance used it first). The INSERT ...
+    ON CONFLICT DO NOTHING on the (chat_id, word) primary key is atomic across
+    processes, so it is the real arbiter of "who got the word"."""
+    table = _USED_WORDS_TABLES[kind]
+    with used_words_lock(kind, chat_id):
+        try:
+            conn = connect()
+            try:
+                cursor = conn.cursor()
+                cursor.execute(
+                    f"INSERT INTO {table} (chat_id, word) VALUES (%s, %s) ON CONFLICT (chat_id, word) DO NOTHING",
+                    (chat_id, word)
+                )
+                inserted = cursor.rowcount == 1
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception:
+            # The write may or may not have reached the DB (e.g. commit
+            # raised after the server applied it) - don't trust the cache.
+            _uw_cache_drop(kind, chat_id)
+            raise
+        cached = _uw_cache_get(kind, chat_id)
+        if cached is not None:
+            cached.add(sys.intern(word))     # inserted by us OR already used by someone else: used either way
+        return inserted
+
+
+def _used_words_reset(kind, chat_id):
+    table = _USED_WORDS_TABLES[kind]
+    with used_words_lock(kind, chat_id):
+        # Drop first: if anything below fails the cache is already gone.
+        _uw_cache_drop(kind, chat_id)
+        conn = connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(f"DELETE FROM {table} WHERE chat_id=%s", (chat_id,))
+            conn.commit()
+        finally:
+            conn.close()
+        # Dropped (not "set to empty") so the next pick re-reads the DB's
+        # truth - a 0-row query, negligible egress.
+        _uw_cache_drop(kind, chat_id)
+
+
+def claim_unused_word(kind, chat_id, pool, exclude=None):
+    """Pick a word that is not used in this chat AND claim it, safely even when
+    several bot instances run at once (e.g. overlapping Render deploys).
+
+    How: candidates come from the in-memory history (no download per round); the
+    word is then CLAIMED with one atomic INSERT ... ON CONFLICT DO NOTHING on the
+    existing (chat_id, word) primary key. If another instance already used that word
+    the INSERT adds nothing, the word goes into our cache and we try another - so two
+    instances can never both be handed the same word, and the used-word table is never
+    downloaded just to check one word. Only when the cache says "everything is used"
+    is the history re-read from the database once (the cache may be stale, e.g. another
+    instance reset it); if it really is exhausted, the history is reset exactly like
+    before. `exclude` (the previous word) is never picked.
+    Returns the claimed word."""
+    with used_words_lock(kind, chat_id):
+        for refreshed in (False, True):
+            used = _used_words_get(kind, chat_id)
+            choices = [w for w in pool if w not in used and w != exclude]
+            while choices:
+                word = random.choice(choices)
+                if _used_words_mark(kind, chat_id, word):
+                    return word
+                choices.remove(word)     # someone else claimed it first (the mark added it to our cache)
+            if not refreshed:
+                _uw_cache_drop(kind, chat_id)    # re-read the truth from the database, once
+        # Really exhausted: start the history over (same behaviour as always).
+        _used_words_reset(kind, chat_id)
+        choices = [w for w in pool if w != exclude] or list(pool)
+        word = random.choice(choices)
+        _used_words_mark(kind, chat_id, word)
+        return word
 
 
 def get_used_words(chat_id):
-    conn = connect()
-    try:
-        cursor = conn.cursor()
-        cursor.execute("SELECT word FROM used_words WHERE chat_id=%s", (chat_id,))
-        rows = cursor.fetchall()
-        return {row[0] for row in rows}
-    finally:
-        conn.close()
+    return _used_words_get("wg", chat_id)
 
 
 def mark_word_used(chat_id, word):
-    conn = connect()
-    try:
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO used_words (chat_id, word) VALUES (%s, %s) ON CONFLICT (chat_id, word) DO NOTHING",
-            (chat_id, word)
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    return _used_words_mark("wg", chat_id, word)
 
 
 def reset_used_words(chat_id):
-    conn = connect()
-    try:
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM used_words WHERE chat_id=%s", (chat_id,))
-        conn.commit()
-    finally:
-        conn.close()
+    _used_words_reset("wg", chat_id)
 
 
 def set_explaining_started(chat_id, started: bool):
@@ -2129,25 +2432,100 @@ def _tx_credit_global(cursor, user_id, name, amount):
     return cursor.fetchone()[0]
 
 
+def _tx_spendable(cursor, user_id, lock=False):
+    """(scramble, word_game) spendable amounts for one player, each clamped at 0
+    (a Word Game balance can dip below zero from cheat penalties; that never
+    counts as spendable money). lock=True takes row locks - always scramble
+    row first, then word-game row, so concurrent transactions can't deadlock."""
+    suffix = " FOR UPDATE" if lock else ""
+    cursor.execute("SELECT earned FROM scramble_global_stats WHERE user_id=%s" + suffix, (user_id,))
+    row = cursor.fetchone()
+    scramble = max((row[0] or 0), 0) if row else 0
+    cursor.execute("SELECT coins FROM global_scores WHERE user_id=%s" + suffix, (user_id,))
+    row = cursor.fetchone()
+    game = max((row[0] or 0), 0) if row else 0
+    return scramble, game
+
+
+def _tx_deduct_combined(cursor, user_id, name, amount):
+    """THE one fee/debit helper for every paid action (Tournament, Elimination,
+    Hack joins, /transfer, /request, Jackpot...). Spends from the COMBINED
+    Word Scramble + Word Game balance: Word Scramble money first, then the
+    remainder from Word Game money (e.g. fee 1000 with 300 Scramble and 900
+    Word Game -> 300 + 700, leaving 200 Word Game).
+    All-or-nothing: if the combined balance can't cover `amount`, NOTHING is
+    changed. Must run inside the caller's open transaction.
+    Returns (combined_balance_after, source) or (None, None) when insufficient.
+    `source` records the split so a refund restores exactly what was taken:
+    'scramble' | 'global' | 'split:<scramble>:<word game>'."""
+    if amount < 0:
+        raise ValueError("amount must not be negative")
+    scramble, game = _tx_spendable(cursor, user_id, lock=True)
+    if scramble + game < amount:
+        return None, None
+    take_scramble = min(scramble, amount)
+    take_game = amount - take_scramble
+    if take_scramble:
+        cursor.execute(
+            "UPDATE scramble_global_stats SET earned = earned - %s, name = %s WHERE user_id = %s",
+            (take_scramble, name, user_id),
+        )
+    if take_game:
+        cursor.execute(
+            "UPDATE global_scores SET coins = coins - %s, name = %s WHERE user_id = %s",
+            (take_game, name, user_id),
+        )
+    if take_game == 0:
+        source = "scramble"
+    elif take_scramble == 0:
+        source = "global"
+    else:
+        source = f"split:{take_scramble}:{take_game}"
+    return scramble + game - amount, source
+
+
 def _tx_deduct_any(cursor, user_id, name, amount):
-    """Takes `amount` from whichever balance covers it: the Word Scramble
-    balance first (the old behaviour), then the Word Game (global) balance.
-    Never goes negative and never splits a fee across both.
-    Returns (new_balance, source) or (None, None)."""
-    bal = _tx_deduct(cursor, user_id, name, amount)
-    if bal is not None:
-        return bal, "scramble"
-    bal = _tx_deduct_global(cursor, user_id, name, amount)
-    if bal is not None:
-        return bal, "global"
-    return None, None
+    """Kept under its old name for the existing join paths: now a combined
+    (split-capable) deduction - see _tx_deduct_combined."""
+    return _tx_deduct_combined(cursor, user_id, name, amount)
+
+
+def _tx_combined_total(cursor, user_id):
+    scramble, game = _tx_spendable(cursor, user_id)
+    return scramble + game
 
 
 def _tx_credit_source(cursor, user_id, name, amount, source):
-    """Refund helper: puts money back into the balance it was taken from."""
-    if source == "global":
-        return _tx_credit_global(cursor, user_id, name, amount)
-    return _tx_credit(cursor, user_id, name, amount)
+    """Refund helper: puts money back exactly where it was taken from. Handles
+    the legacy single-source values ('scramble'/'global') and split sources.
+    Returns the player's combined balance afterwards."""
+    src = source or "scramble"
+    if src.startswith("split:"):
+        try:
+            _, part_scramble, part_game = src.split(":")
+            part_scramble, part_game = int(part_scramble), int(part_game)
+        except ValueError:
+            part_scramble, part_game = amount, 0   # unreadable marker: refund to Scramble
+        if part_scramble:
+            _tx_credit(cursor, user_id, name, part_scramble)
+        if part_game:
+            _tx_credit_global(cursor, user_id, name, part_game)
+    elif src == "global":
+        _tx_credit_global(cursor, user_id, name, amount)
+    else:
+        _tx_credit(cursor, user_id, name, amount)
+    return _tx_combined_total(cursor, user_id)
+
+
+def _tx_chat_for_credit(cursor, user_id, chat_id):
+    """The chat a received amount is recorded under: the group it happened in;
+    for a DM (positive chat id) the player's last group chat, or None."""
+    if chat_id is not None and chat_id < 0:
+        return chat_id
+    cursor.execute("SELECT last_chat_id FROM users WHERE id=%s", (user_id,))
+    row = cursor.fetchone()
+    last = row[0] if row and row[0] else None
+    return last if last is not None and last < 0 else None
 
 
 def _tx_credit_chat_scramble(cursor, user_id, chat_id, name, amount):
@@ -2165,15 +2543,26 @@ def _tx_credit_chat_scramble(cursor, user_id, chat_id, name, amount):
 
 
 def scramble_conditional_deduct(user_id, name, amount):
-    """Atomically deducts `amount` from the Word Scramble global balance only
-    if the balance covers it. Returns the new balance, or None if insufficient
-    (never deducts partially, never goes negative)."""
+    """Atomically deducts `amount` from the COMBINED balance (Word Scramble first,
+    then Word Game) only if it covers it. Returns the new combined balance, or None
+    if insufficient (never deducts partially, never goes negative). Nothing in the bot
+    calls this today; it follows the same rule as every other paid action so a future
+    caller can't bring back a Scramble-only fee."""
     conn = connect()
     try:
         cursor = conn.cursor()
-        new_balance = _tx_deduct(cursor, user_id, name, amount)
+        new_balance, _source = _tx_deduct_combined(cursor, user_id, name, amount)
+        if new_balance is None:
+            conn.rollback()
+            return None
         conn.commit()
         return new_balance
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
     finally:
         conn.close()
 
@@ -2676,11 +3065,20 @@ def _request_row(row):
 
 
 def _tx_lock_balances(cursor, user_ids):
-    """Locks the existing balance rows for these users in a fixed order."""
+    """Locks the existing balance rows (Word Scramble, then Word Game) for
+    these users in a fixed order, so concurrent transfers/requests between the
+    same players can never deadlock or interleave."""
+    ids = sorted(set(user_ids))
     cursor.execute(
         "SELECT user_id FROM scramble_global_stats WHERE user_id = ANY(%s) "
         "ORDER BY user_id FOR UPDATE",
-        (sorted(set(user_ids)),),
+        (ids,),
+    )
+    cursor.fetchall()
+    cursor.execute(
+        "SELECT user_id FROM global_scores WHERE user_id = ANY(%s) "
+        "ORDER BY user_id FOR UPDATE",
+        (ids,),
     )
     cursor.fetchall()
 
@@ -2693,22 +3091,28 @@ def _tx_audit(cursor, kind, from_id, to_id, amount, chat_id):
 
 
 def transfer_execute(from_id, from_name, to_id, to_name, amount, chat_id):
-    """Moves `amount` from one Word Scramble global balance to another in ONE
-    transaction: conditional deduct (never negative) + credit + audit row.
-    Returns ('ok', sender_new_balance, recipient_new_balance) or
-    ('insufficient', sender_current_balance, None)."""
+    """Moves `amount` between players in ONE transaction: all-or-nothing
+    combined debit of the sender (Word Scramble first, then Word Game), credit
+    of the recipient's Word Scramble balance AND of the selected chat's
+    "in this chat" record (so their previous balance in that chat + the
+    transfer is what that chat shows), plus an audit row.
+    Returns ('ok', sender_combined_after, recipient_combined_after) or
+    ('insufficient', sender_combined_balance, None)."""
     conn = connect()
     try:
         cursor = conn.cursor()
         try:
             _tx_lock_balances(cursor, [from_id, to_id])
-            new_from = _tx_deduct(cursor, from_id, from_name, amount)
+            new_from, _src = _tx_deduct_combined(cursor, from_id, from_name, amount)
             if new_from is None:
-                cursor.execute("SELECT earned FROM scramble_global_stats WHERE user_id=%s", (from_id,))
-                row = cursor.fetchone()
+                have = _tx_combined_total(cursor, from_id)
                 conn.rollback()
-                return "insufficient", (row[0] if row else 0), None
-            new_to = _tx_credit(cursor, to_id, to_name, amount)
+                return "insufficient", have, None
+            _tx_credit(cursor, to_id, to_name, amount)
+            credit_chat = _tx_chat_for_credit(cursor, to_id, chat_id)
+            if credit_chat is not None:
+                _tx_credit_chat_scramble(cursor, to_id, credit_chat, to_name, amount)
+            new_to = _tx_combined_total(cursor, to_id)
             _tx_audit(cursor, "transfer", from_id, to_id, amount, chat_id)
             conn.commit()
             return "ok", new_from, new_to
@@ -2888,13 +3292,16 @@ def request_pay(request_id, actor_id, expire_seconds):
                 return "expired", row, None
 
             _tx_lock_balances(cursor, [row["target_id"], row["requester_id"]])
-            target_bal = _tx_deduct(cursor, row["target_id"], row["target_name"], row["amount"])
+            target_bal, _src = _tx_deduct_combined(cursor, row["target_id"], row["target_name"], row["amount"])
             if target_bal is None:
-                cursor.execute("SELECT earned FROM scramble_global_stats WHERE user_id=%s", (row["target_id"],))
-                brow = cursor.fetchone()
+                have = _tx_combined_total(cursor, row["target_id"])
                 conn.rollback()
-                return "insufficient", row, (brow[0] if brow else 0)
-            req_bal = _tx_credit(cursor, row["requester_id"], row["requester_name"], row["amount"])
+                return "insufficient", row, have
+            _tx_credit(cursor, row["requester_id"], row["requester_name"], row["amount"])
+            credit_chat = _tx_chat_for_credit(cursor, row["requester_id"], row["chat_id"])
+            if credit_chat is not None:
+                _tx_credit_chat_scramble(cursor, row["requester_id"], credit_chat, row["requester_name"], row["amount"])
+            req_bal = _tx_combined_total(cursor, row["requester_id"])
             cursor.execute(
                 "UPDATE money_requests SET status='paid', resolved_at=%s "
                 "WHERE id=%s AND status='pending'",
@@ -3226,19 +3633,78 @@ def set_config(key, value):
             ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
         """, (key, str(value)))
         conn.commit()
+    except Exception:
+        invalidate_config_cache(key)     # outcome uncertain: the next read goes to the database
+        raise
     finally:
         conn.close()
+    with _config_cache_mu:
+        _config_cache[key] = (time.monotonic(), str(value))
+
+
+# Rewards can be overridden at runtime (bot_config keys written by
+# /setreward and /scramblesetreward). Changing the code defaults alone would
+# not affect a database that already holds such a stored value, so this
+# runs ONCE (guarded by a marker row) to bring any stored value in line with
+# the new rules. Anything the owner sets afterwards is never touched again.
+_REWARD_DEFAULTS_V1 = (("reward_scramble_win", 1), ("reward_daily", 10))
+_REWARD_DEFAULTS_V1_MARKER = "migration_reward_defaults_v1"
+
+
+def apply_reward_defaults_v1():
+    """Returns the list of (key, old, new) values that were changed."""
+    changed = []
+    if get_config(_REWARD_DEFAULTS_V1_MARKER) is not None:
+        return changed
+    for key, new_value in _REWARD_DEFAULTS_V1:
+        old = get_config(key)
+        if old is not None and str(old) != str(new_value):
+            set_config(key, new_value)
+            changed.append((key, old, new_value))
+    set_config(_REWARD_DEFAULTS_V1_MARKER, "1")
+    return changed
+
+
+# bot_config is read on nearly every update and every answer (maintenance flag,
+# medal/level toggles, reward amounts, ...), and it changes rarely. set_config is
+# the ONLY writer, so reads are cached briefly and every write updates the cache
+# immediately (this process always sees its own changes at once); a change made by
+# another running instance, or by hand in the database, is picked up within the TTL.
+_CONFIG_CACHE_TTL_SECONDS = 30
+_CONFIG_CACHE_MAX_KEYS = 2000
+_CONFIG_MISSING = object()               # 'no such key' (distinct from a stored NULL, as before)
+_config_cache = {}                       # key -> (loaded_monotonic, raw value or _CONFIG_MISSING)
+_config_cache_mu = threading.Lock()
+
+
+def invalidate_config_cache(key=None):
+    with _config_cache_mu:
+        if key is None:
+            _config_cache.clear()
+        else:
+            _config_cache.pop(key, None)
 
 
 def get_config(key, default=None):
-    conn = connect()
-    try:
-        cursor = conn.cursor()
-        cursor.execute("SELECT value FROM bot_config WHERE key=%s", (key,))
-        row = cursor.fetchone()
-        return row[0] if row else default
-    finally:
-        conn.close()
+    now = time.monotonic()
+    with _config_cache_mu:
+        hit = _config_cache.get(key)
+    if hit is not None and now - hit[0] < _CONFIG_CACHE_TTL_SECONDS:
+        value = hit[1]
+    else:
+        conn = connect()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT value FROM bot_config WHERE key=%s", (key,))
+            row = cursor.fetchone()
+        finally:
+            conn.close()
+        value = row[0] if row else _CONFIG_MISSING
+        with _config_cache_mu:
+            if len(_config_cache) >= _CONFIG_CACHE_MAX_KEYS:
+                _config_cache.clear()
+            _config_cache[key] = (now, value)
+    return default if value is _CONFIG_MISSING else value
 
 
 def get_custom_words():
@@ -3542,56 +4008,68 @@ def get_all_active_scramble_rounds_with_time():
         conn.close()
 
 
-def scramble_get_used_words(chat_id):
-    conn = connect()
-    try:
-        cursor = conn.cursor()
-        cursor.execute("SELECT word FROM scramble_used_words WHERE chat_id=%s", (chat_id,))
-        rows = cursor.fetchall()
-        return {row[0] for row in rows}
-    finally:
-        conn.close()
-
-
-def scramble_mark_word_used(chat_id, word):
+def get_overdue_scramble_rounds(cutoff_iso):
+    """Active rounds that started before `cutoff_iso` (ISO text, the same format
+    started_at is stored in) or have no start time. The 20-second watchdog only
+    needs these - it used to download EVERY active round just to filter them in Python."""
     conn = connect()
     try:
         cursor = conn.cursor()
         cursor.execute(
-            "INSERT INTO scramble_used_words (chat_id, word) VALUES (%s, %s) ON CONFLICT (chat_id, word) DO NOTHING",
-            (chat_id, word)
+            "SELECT chat_id, started_at FROM scramble_games "
+            "WHERE round_active=1 AND (started_at IS NULL OR started_at < %s)",
+            (cutoff_iso,)
         )
-        conn.commit()
+        return cursor.fetchall()
     finally:
         conn.close()
 
 
-def scramble_reset_used_words(chat_id):
+def scramble_get_idle_auto_chats():
+    """Automatic-Mode chats with NO live round (the only ones the watchdog may need to
+    restart). Replaces downloading every Automatic-Mode chat plus every active round and
+    comparing them in Python. Both tables are keyed by chat_id (existing primary keys)."""
     conn = connect()
     try:
         cursor = conn.cursor()
-        cursor.execute("DELETE FROM scramble_used_words WHERE chat_id=%s", (chat_id,))
-        conn.commit()
+        cursor.execute("""
+            SELECT a.chat_id FROM scramble_auto_mode a
+            WHERE a.auto_enabled = 1
+              AND NOT EXISTS (
+                  SELECT 1 FROM scramble_games g WHERE g.chat_id = a.chat_id AND g.round_active = 1
+              )
+        """)
+        return [r[0] for r in cursor.fetchall()]
     finally:
         conn.close()
 
 
+def scramble_get_used_words(chat_id):
+    return _used_words_get("sc", chat_id)
+
+
+def scramble_mark_word_used(chat_id, word):
+    return _used_words_mark("sc", chat_id, word)
+
+
+def scramble_reset_used_words(chat_id):
+    _used_words_reset("sc", chat_id)
+
+
 def scramble_record_win(user_id, chat_id, name, reward_amount):
+    """Record a Word Scramble win. Win streaks were removed: current_streak /
+    best_streak are no longer read or changed (existing values are left as-is)."""
     conn = connect()
     try:
         cursor = conn.cursor()
         cursor.execute("""
             INSERT INTO scramble_chat_stats (user_id, chat_id, name, wins, earned, current_streak, best_streak)
-            VALUES (%s, %s, %s, 1, %s, 1, 1)
+            VALUES (%s, %s, %s, 1, %s, 0, 0)
             ON CONFLICT (user_id, chat_id) DO UPDATE SET
                 name = EXCLUDED.name,
                 wins = scramble_chat_stats.wins + 1,
-                earned = scramble_chat_stats.earned + %s,
-                current_streak = scramble_chat_stats.current_streak + 1,
-                best_streak = GREATEST(scramble_chat_stats.best_streak, scramble_chat_stats.current_streak + 1)
-            RETURNING current_streak
+                earned = scramble_chat_stats.earned + %s
         """, (user_id, chat_id, name, reward_amount, reward_amount))
-        new_streak = cursor.fetchone()[0]
 
         cursor.execute("""
             INSERT INTO scramble_global_stats (user_id, name, wins, earned)
@@ -3602,7 +4080,6 @@ def scramble_record_win(user_id, chat_id, name, reward_amount):
                 earned = scramble_global_stats.earned + %s
         """, (user_id, name, reward_amount, reward_amount))
         conn.commit()
-        return new_streak
     finally:
         conn.close()
 
@@ -3667,16 +4144,18 @@ def scramble_get_chat_position(chat_id, user_id):
     try:
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT user_id, name, wins, earned, current_streak
-            FROM scramble_chat_stats WHERE chat_id=%s ORDER BY earned DESC, user_id ASC
-        """, (chat_id,))
-        rows = cursor.fetchall()
+            SELECT rnk, name, wins, earned, current_streak FROM (
+                SELECT user_id, name, wins, earned, current_streak,
+                       ROW_NUMBER() OVER (ORDER BY earned DESC, user_id ASC) AS rnk
+                FROM scramble_chat_stats WHERE chat_id=%s
+            ) t WHERE user_id=%s
+        """, (chat_id, user_id))
+        row = cursor.fetchone()
     finally:
         conn.close()
-    for index, row in enumerate(rows, start=1):
-        if row[0] == user_id:
-            return index, row[1], row[2], row[3], row[4]
-    return None
+    if row is None:
+        return None
+    return int(row[0]), row[1], row[2], row[3], row[4]
 
 
 def scramble_get_global_position(user_id):
@@ -3684,15 +4163,18 @@ def scramble_get_global_position(user_id):
     try:
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT user_id, name, wins, earned FROM scramble_global_stats ORDER BY earned DESC, user_id ASC
-        """)
-        rows = cursor.fetchall()
+            SELECT rnk, name, wins, earned FROM (
+                SELECT user_id, name, wins, earned,
+                       ROW_NUMBER() OVER (ORDER BY earned DESC, user_id ASC) AS rnk
+                FROM scramble_global_stats
+            ) t WHERE user_id=%s
+        """, (user_id,))
+        row = cursor.fetchone()
     finally:
         conn.close()
-    for index, row in enumerate(rows, start=1):
-        if row[0] == user_id:
-            return index, row[1], row[2], row[3]
-    return None
+    if row is None:
+        return None
+    return int(row[0]), row[1], row[2], row[3]
 
 
 def scramble_register_group(chat_id, title):
@@ -3913,18 +4395,25 @@ def get_all_active_word_game_chats():
         conn.close()
 
 
+# THE combined-balance definition, used by fee checks (_tx_spendable), by
+# get_combined_balance, and by the leaderboard/rank queries below:
+#   Word Scramble money + Word Game money, each counted only when positive.
+_COMBINED_TOTAL_SQL = "GREATEST(COALESCE(g.coins, 0), 0) + GREATEST(COALESCE(s.earned, 0), 0)"
+
+
 def get_combined_global_leaderboard(limit=10):
-    """Global leaderboard combining regular game coins (global_scores) with
-    Word Scramble earnings (scramble_global_stats) per player."""
+    """Global leaderboard by COMBINED balance: Word Game money (global_scores)
+    + Word Scramble money (scramble_global_stats) per player - the same
+    definition the fee checks use. Ties are broken by user id (same as ranks)."""
     conn = connect()
     try:
         cursor = conn.cursor()
-        cursor.execute("""
+        cursor.execute(f"""
             SELECT COALESCE(g.name, s.name) AS name,
-                   COALESCE(g.coins, 0) + COALESCE(s.earned, 0) AS total
+                   {_COMBINED_TOTAL_SQL} AS total
             FROM global_scores g
             FULL OUTER JOIN scramble_global_stats s ON g.user_id = s.user_id
-            ORDER BY total DESC
+            ORDER BY {_COMBINED_TOTAL_SQL} DESC, COALESCE(g.user_id, s.user_id) ASC
             LIMIT %s
         """, (limit,))
         return cursor.fetchall()
@@ -3932,25 +4421,51 @@ def get_combined_global_leaderboard(limit=10):
         conn.close()
 
 
-def get_combined_global_position(user_id):
+def get_combined_top_user_ids(limit=3):
+    """User ids of the top `limit` players by combined balance, best first - the same
+    ordering as get_combined_global_position / the combined leaderboard (balance DESC,
+    then user id). Returns at most `limit` small rows."""
     conn = connect()
     try:
         cursor = conn.cursor()
-        cursor.execute("""
-            SELECT COALESCE(g.user_id, s.user_id) AS user_id,
-                   COALESCE(g.name, s.name) AS name,
-                   COALESCE(g.coins, 0) + COALESCE(s.earned, 0) AS total
+        cursor.execute(f"""
+            SELECT COALESCE(g.user_id, s.user_id) AS user_id
             FROM global_scores g
             FULL OUTER JOIN scramble_global_stats s ON g.user_id = s.user_id
-            ORDER BY total DESC, user_id ASC
-        """)
-        rows = cursor.fetchall()
+            ORDER BY {_COMBINED_TOTAL_SQL} DESC, COALESCE(g.user_id, s.user_id) ASC
+            LIMIT %s
+        """, (limit,))
+        return [r[0] for r in cursor.fetchall()]
     finally:
         conn.close()
-    for index, row in enumerate(rows, start=1):
-        if row[0] == user_id:
-            return index, row[1], row[2]
-    return None
+
+
+def get_combined_global_position(user_id):
+    # Called for the top-3 medal on every correct answer, so it must not
+    # download the whole player table: rank is computed in Postgres with the
+    # same ordering (total DESC, user_id ASC) and one row is returned.
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(f"""
+            SELECT rnk, name, total FROM (
+                SELECT COALESCE(g.user_id, s.user_id) AS user_id,
+                       COALESCE(g.name, s.name) AS name,
+                       {_COMBINED_TOTAL_SQL} AS total,
+                       ROW_NUMBER() OVER (
+                           ORDER BY {_COMBINED_TOTAL_SQL} DESC,
+                                    COALESCE(g.user_id, s.user_id) ASC
+                       ) AS rnk
+                FROM global_scores g
+                FULL OUTER JOIN scramble_global_stats s ON g.user_id = s.user_id
+            ) t WHERE user_id=%s
+        """, (user_id,))
+        row = cursor.fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    return int(row[0]), row[1], row[2]
 
 
 def get_group_admin_mode_override(chat_id):
@@ -5666,5 +6181,223 @@ def support_stats(latest=5):
         """, (latest,))
         return {"total_stars": total or 0, "supporters": supporters or 0,
                 "contributions": contributions or 0, "latest": cursor.fetchall()}
+    finally:
+        conn.close()
+
+# ===========================================================================
+# JACKPOT / LUCKY NUMBER
+# ===========================================================================
+# Defaults and limits live here so the DB layer and the bot agree.
+JACKPOT_DEFAULT_FEE = 1000
+JACKPOT_REWARD_MULTIPLIER = 10          # default prize = fee x 10
+JACKPOT_SMALL_RANGE_MAX = 20            # fee below the threshold: 1-20
+JACKPOT_BIG_RANGE_MAX = 9               # fee at/above the threshold: 1-9
+JACKPOT_BIG_FEE_THRESHOLD = 1000
+
+
+def jackpot_range_max(fee):
+    """Highest lucky number for this fee (the lowest is always 1)."""
+    return JACKPOT_BIG_RANGE_MAX if fee >= JACKPOT_BIG_FEE_THRESHOLD else JACKPOT_SMALL_RANGE_MAX
+
+
+def _jackpot_random_number(range_max):
+    """Unpredictable pick from 1..range_max (OS entropy, no seed/cycle)."""
+    return secrets.randbelow(range_max) + 1
+
+
+def jackpot_get_settings(chat_id):
+    """(fee, reward) for a chat; defaults when the chat never configured it."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        return _jackpot_settings_tx(cursor, chat_id)
+    finally:
+        conn.close()
+
+
+def _jackpot_settings_tx(cursor, chat_id):
+    cursor.execute("SELECT fee, reward FROM jackpot_settings WHERE chat_id=%s", (chat_id,))
+    row = cursor.fetchone()
+    if row:
+        return int(row[0]), int(row[1])
+    return JACKPOT_DEFAULT_FEE, JACKPOT_DEFAULT_FEE * JACKPOT_REWARD_MULTIPLIER
+
+
+def jackpot_set_settings(chat_id, fee, reward, now_str):
+    """Persist the chat's fee and prize (kept until changed again)."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO jackpot_settings (chat_id, fee, reward, updated_at)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (chat_id) DO UPDATE SET
+                fee = EXCLUDED.fee, reward = EXCLUDED.reward, updated_at = EXCLUDED.updated_at
+        """, (chat_id, fee, reward, now_str))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def jackpot_start(chat_id, user_id, name, play_date, now_str, expires_str):
+    """Join a Jackpot: ONE transaction that
+         1. claims today's attempt for this player (PRIMARY KEY on user+day),
+         2. refuses if they already have an active game,
+         3. debits the fee from the combined balance (all-or-nothing),
+         4. creates the game with a fresh secret number.
+    Anything other than success rolls the WHOLE transaction back, so a failed
+    join (not enough money, already played...) never consumes the attempt and
+    never charges. Two simultaneous starts by one player cannot both succeed:
+    the second blocks on the PRIMARY KEY row, then sees it already exists.
+    Returns (status, info): 'ok' -> game dict | 'already_played' | 'active' |
+    'insufficient' -> {'have': combined balance, 'fee': fee}."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        fee, reward = _jackpot_settings_tx(cursor, chat_id)
+
+        cursor.execute("""
+            INSERT INTO jackpot_daily (user_id, play_date) VALUES (%s, %s)
+            ON CONFLICT (user_id, play_date) DO NOTHING
+        """, (user_id, play_date))
+        if cursor.rowcount == 0:
+            conn.rollback()
+            return "already_played", None
+
+        cursor.execute("SELECT id FROM jackpot_games WHERE user_id=%s AND status='active'", (user_id,))
+        if cursor.fetchone():
+            conn.rollback()
+            return "active", None
+
+        balance_after, source = _tx_deduct_combined(cursor, user_id, name, fee)
+        if balance_after is None:
+            have = _tx_combined_total(cursor, user_id)
+            conn.rollback()
+            return "insufficient", {"have": have, "fee": fee}
+
+        range_max = jackpot_range_max(fee)
+        secret = _jackpot_random_number(range_max)
+        cursor.execute("""
+            INSERT INTO jackpot_games
+                (chat_id, user_id, user_name, fee, reward, range_max, secret, source,
+                 status, created_at, expires_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'active', %s, %s)
+            RETURNING id
+        """, (chat_id, user_id, name, fee, reward, range_max, secret, source, now_str, expires_str))
+        game_id = cursor.fetchone()[0]
+        cursor.execute("UPDATE jackpot_daily SET game_id=%s WHERE user_id=%s AND play_date=%s",
+                       (game_id, user_id, play_date))
+        conn.commit()
+        return "ok", {
+            "id": game_id, "chat_id": chat_id, "user_id": user_id, "user_name": name,
+            "fee": fee, "reward": reward, "range_max": range_max, "secret": secret,
+            "expires_at": expires_str, "balance_after": balance_after,
+        }
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+
+
+def jackpot_attach_message(game_id, message_id):
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE jackpot_games SET message_id=%s WHERE id=%s", (message_id, game_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def jackpot_settle(game_id, guess, now_str):
+    """Settle ONE game exactly once. guess=None means the time ran out.
+    The row is locked and only an 'active' game can be settled, so a guess
+    racing the timeout, a double tap, or a restart replay can never pay twice
+    or settle twice. A guess that arrives after the deadline is ignored (the
+    timeout settles it). Returns None when there was nothing to settle, else
+    {'outcome': 'won'|'lost'|'timeout', ...} including the real new balance."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT chat_id, user_id, user_name, fee, reward, range_max, secret, status,
+                   expires_at, message_id
+            FROM jackpot_games WHERE id=%s FOR UPDATE
+        """, (game_id,))
+        row = cursor.fetchone()
+        if not row or row[7] != "active":
+            conn.rollback()
+            return None
+        (chat_id, user_id, name, fee, reward, range_max, secret, _status, expires_at, message_id) = row
+
+        if guess is not None:
+            if now_str > expires_at or not (1 <= guess <= range_max):
+                conn.rollback()
+                return None
+            outcome = "won" if guess == secret else "lost"
+        else:
+            outcome = "timeout"
+
+        if outcome == "won":
+            _tx_credit(cursor, user_id, name, reward)
+            if chat_id < 0:
+                _tx_credit_chat_scramble(cursor, user_id, chat_id, name, reward)
+        cursor.execute(
+            "UPDATE jackpot_games SET status=%s, guess=%s, settled_at=%s WHERE id=%s",
+            (outcome, guess, now_str, game_id),
+        )
+        balance = _tx_combined_total(cursor, user_id)
+        conn.commit()
+        return {
+            "outcome": outcome, "id": game_id, "chat_id": chat_id, "user_id": user_id,
+            "user_name": name, "fee": fee, "reward": reward, "secret": secret,
+            "guess": guess, "balance": balance, "message_id": message_id,
+        }
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+
+
+def jackpot_get_active_for_user(user_id):
+    """The player's unsettled game, or None. Used to recover when jackpot_start
+    failed at the very moment of commit (the game may exist even though the call raised)."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, chat_id, user_id, user_name, fee, reward, range_max, secret, message_id, expires_at
+            FROM jackpot_games WHERE user_id=%s AND status='active'
+        """, (user_id,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        keys = ("id", "chat_id", "user_id", "user_name", "fee", "reward", "range_max", "secret",
+                "message_id", "expires_at")
+        return dict(zip(keys, row))
+    finally:
+        conn.close()
+
+
+def jackpot_get_active():
+    """Every unsettled game (used once at startup to restore timers)."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, chat_id, user_id, user_name, fee, reward, range_max, message_id, expires_at
+            FROM jackpot_games WHERE status='active'
+        """)
+        keys = ("id", "chat_id", "user_id", "user_name", "fee", "reward", "range_max",
+                "message_id", "expires_at")
+        return [dict(zip(keys, r)) for r in cursor.fetchall()]
     finally:
         conn.close()
