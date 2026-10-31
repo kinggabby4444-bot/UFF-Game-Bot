@@ -13607,6 +13607,5 @@ def main():
 
     return app
 
-
 if __name__ == "__main__":
-    pass
+    main().run_polling()
