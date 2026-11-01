@@ -1,4 +1,5 @@
 import os
+import time
 import asyncio
 import logging
 import threading
@@ -7,13 +8,27 @@ from aiohttp import web
 
 from telegram import Update
 
+try:
+    import dbtiming  # DIAGNOSTICS ONLY - must be imported before main/database
+except Exception:
+    dbtiming = None
+
 import main as game_bot_module
-import ads_main as ads_bot_module
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 # One access-log line per webhook/health ping buries every real log line.
 logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
+
+if dbtiming is not None:
+    try:
+        import database as _database
+        dbtiming.install(_database, game_bot_module)
+    except Exception:
+        logger.exception("dbtiming could not be installed (the bot runs normally without diagnostics)")
+        dbtiming = None
+
+import ads_main as ads_bot_module
 
 PORT = int(os.environ.get("PORT", 10000))
 
@@ -47,6 +62,7 @@ class BotRunner:
         self.loop = None
         self.app = None
         self._sem = None
+        self._diag_task = None
         self.ready = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True)
         # Futures from run_coroutine_threadsafe() must be kept referenced
@@ -81,11 +97,27 @@ class BotRunner:
             allowed_updates=Update.ALL_TYPES,
         )
         await self.app.start()
+        if dbtiming is not None:
+            try:
+                self._diag_task = asyncio.ensure_future(dbtiming.loop_monitor(self.name, self.app.bot))
+            except Exception:
+                logger.exception(f"{self.name}: could not start the loop monitor")
         logger.info(f"{self.name}: initialized, webhook set, started.")
 
-    async def _process(self, update):
+    async def _process(self, update, received, tg_age):
         async with self._sem:
-            await self.app.process_update(update)
+            started = time.monotonic()
+            try:
+                await self.app.process_update(update)
+            finally:
+                if dbtiming is not None:
+                    try:
+                        dbtiming.observe_update(
+                            self.name, started - received, time.monotonic() - started,
+                            tg_age, len(self._pending_futures),
+                        )
+                    except Exception:
+                        pass
 
     def start(self):
         self.thread.start()
@@ -96,7 +128,14 @@ class BotRunner:
             logger.error(f"{self.name}: not ready, dropping update")
             return
         update = Update.de_json(data, self.app.bot)
-        future = asyncio.run_coroutine_threadsafe(self._process(update), self.loop)
+        received = time.monotonic()
+        tg_age = None
+        try:
+            if update.message is not None and update.message.date is not None:
+                tg_age = time.time() - update.message.date.timestamp()
+        except Exception:
+            tg_age = None
+        future = asyncio.run_coroutine_threadsafe(self._process(update, received, tg_age), self.loop)
         self._pending_futures.add(future)
         future.add_done_callback(self._on_update_done)
 
