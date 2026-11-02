@@ -9,6 +9,11 @@ from aiohttp import web
 from telegram import Update
 
 try:
+    import poolfix  # keeps DB connections warm + fewer round trips for read-only queries
+except Exception:
+    poolfix = None
+
+try:
     import dbtiming  # DIAGNOSTICS ONLY - must be imported before main/database
 except Exception:
     dbtiming = None
@@ -20,9 +25,17 @@ logger = logging.getLogger(__name__)
 # One access-log line per webhook/health ping buries every real log line.
 logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
 
+import database as _database
+
+# poolfix must be installed BEFORE dbtiming so that dbtiming sits on the outside.
+if poolfix is not None:
+    try:
+        poolfix.install(_database)
+    except Exception:
+        logger.exception("poolfix could not be installed (the bot runs normally without it)")
+
 if dbtiming is not None:
     try:
-        import database as _database
         dbtiming.install(_database, game_bot_module)
     except Exception:
         logger.exception("dbtiming could not be installed (the bot runs normally without diagnostics)")
