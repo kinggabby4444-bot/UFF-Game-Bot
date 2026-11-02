@@ -731,6 +731,7 @@ def create_tables():
             "ON jackpot_games (user_id) WHERE status = 'active'"
         )
 
+        cursor.execute("ALTER TABLE jackpot_daily ADD COLUMN IF NOT EXISTS plays INTEGER DEFAULT 1")
         # ---- /support (Telegram Stars) -------------------------------------
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS support_payments (
@@ -3674,6 +3675,27 @@ _REWARD_DEFAULTS_V1 = (("reward_scramble_win", 1), ("reward_daily", 10))
 _REWARD_DEFAULTS_V1_MARKER = "migration_reward_defaults_v1"
 
 
+def apply_jackpot_x5_migration():
+    """One time: groups still on the old default prize (fee x 10) get the new default (fee x 5).
+    A custom prize (anything that is not exactly fee x 10) is left alone. Returns how many rows changed."""
+    marker = "migration_jackpot_x5_v1"
+    if get_config(marker) is not None:
+        return 0
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE jackpot_settings SET reward = fee * %s WHERE reward = fee * 10",
+            (JACKPOT_REWARD_MULTIPLIER,),
+        )
+        changed = cursor.rowcount
+        conn.commit()
+    finally:
+        conn.close()
+    set_config(marker, "1")
+    return changed
+
+
 def apply_reward_defaults_v1():
     """Returns the list of (key, old, new) values that were changed."""
     changed = []
@@ -6212,7 +6234,7 @@ def support_stats(latest=5):
 # ===========================================================================
 # Defaults and limits live here so the DB layer and the bot agree.
 JACKPOT_DEFAULT_FEE = 1000
-JACKPOT_REWARD_MULTIPLIER = 10          # default prize = fee x 10
+JACKPOT_REWARD_MULTIPLIER = 5          # default prize = fee x 5
 JACKPOT_SMALL_RANGE_MAX = 20            # fee below the threshold: 1-20
 JACKPOT_BIG_RANGE_MAX = 9               # fee at/above the threshold: 1-9
 JACKPOT_BIG_FEE_THRESHOLD = 1000
@@ -6262,7 +6284,7 @@ def jackpot_set_settings(chat_id, fee, reward, now_str):
         conn.close()
 
 
-def jackpot_start(chat_id, user_id, name, play_date, now_str, expires_str):
+def jackpot_start(chat_id, user_id, name, play_date, now_str, expires_str, max_plays=1):
     """Join a Jackpot: ONE transaction that
          1. claims today's attempt for this player (PRIMARY KEY on user+day),
          2. refuses if they already have an active game,
@@ -6280,9 +6302,10 @@ def jackpot_start(chat_id, user_id, name, play_date, now_str, expires_str):
         fee, reward = _jackpot_settings_tx(cursor, chat_id)
 
         cursor.execute("""
-            INSERT INTO jackpot_daily (user_id, play_date) VALUES (%s, %s)
-            ON CONFLICT (user_id, play_date) DO NOTHING
-        """, (user_id, play_date))
+            INSERT INTO jackpot_daily (user_id, play_date, plays) VALUES (%s, %s, 1)
+            ON CONFLICT (user_id, play_date) DO UPDATE SET plays = COALESCE(jackpot_daily.plays, 1) + 1
+            WHERE COALESCE(jackpot_daily.plays, 1) < %s
+        """, (user_id, play_date, max_plays))
         if cursor.rowcount == 0:
             conn.rollback()
             return "already_played", None
