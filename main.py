@@ -13735,8 +13735,9 @@ async def stopallactivities_command(update: Update, context: ContextTypes.DEFAUL
     ]])
     await update.message.reply_text(
         "🛑 Stop EVERYTHING in EVERY group?\n\n"
-        "Word Scramble (normal, Slow and Automatic Mode), Word Game, tournaments, eliminations, hacks, "
-        "jackpot games and the other games. Every fee is refunded. This asks again for nothing - tap Yes within 60 seconds.",
+        "Word Scramble, Word Game, tournaments, eliminations, hacks, jackpot games and the other games are "
+        "stopped and every fee is refunded. Slow Mode, Automatic Mode and the global Scramble Mode are switched OFF "
+        "until an admin turns them on again. Tap Yes within 60 seconds.",
         reply_markup=keyboard,
     )
 
@@ -13793,16 +13794,51 @@ async def stopall_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
+def _compact_duration(seconds) -> str:
+    """90 -> '90s', 60 -> '1m', 3600 -> '1h', 86400 -> '1d' (the form /slowmode on <time> accepts)."""
+    try:
+        s = int(seconds)
+    except (TypeError, ValueError):
+        return "1m"
+    for size, unit in ((86400, "d"), (3600, "h"), (60, "m")):
+        if s >= size and s % size == 0:
+            return f"{s // size}{unit}"
+    return f"{s}s"
+
+
+def _stopall_group_text(phrases, hints) -> str:
+    text = "🛑 The bot owner stopped everything here: " + "; ".join(dict.fromkeys(phrases)) + "."
+    text += ("\n\n👥 <b>Members</b>: send /wordscramble to start a normal Word Scramble round "
+             "(or /wordgame for a Word Game).")
+    admin = []
+    if hints.get("slow"):
+        admin.append(f"/slowmode on {_compact_duration(hints['slow'])} - turn Slow Mode back on")
+    if hints.get("auto"):
+        admin.append("/scrambleautomaticmode on - turn Automatic Mode back on")
+    if hints.get("tour"):
+        admin.append("/tournament - start a tournament")
+    if hints.get("elim"):
+        admin.append("/elimination - start an elimination")
+    if hints.get("hack"):
+        admin.append("/hack - start a hack")
+    if admin:
+        text += "\n\n👑 <b>Admins</b> (these stay OFF until you switch them on):\n" + "\n".join(admin)
+    return text
+
+
 async def _stop_all_activities(context) -> str:
-    """Force-stops everything in every group. Each step has its own try/except so one failure never blocks
-    the rest; safe to run twice. Returns the HTML summary for the owner."""
+    """Force-stops everything in every group AND switches the timed modes off (Slow Mode, Automatic Mode,
+    the owner's global Scramble Mode) so nothing starts again by itself. Each step has its own try/except so one
+    failure never blocks the rest; safe to run twice. Returns the HTML summary for the owner."""
     jq = context.job_queue
     affected = {}      # chat_id -> [short phrases]
+    hints = {}         # chat_id -> what the admins can switch back on
     counts = defaultdict(int)
     failures = []
 
-    def note(chat_id, phrase):
+    def note(chat_id, phrase, **hint):
         affected.setdefault(chat_id, []).append(phrase)
+        hints.setdefault(chat_id, {}).update({k: v for k, v in hint.items() if v})
 
     async def step(label, coro):
         try:
@@ -13811,6 +13847,30 @@ async def _stop_all_activities(context) -> str:
             logger.error(f"stopall step '{label}' failed: {e}", exc_info=True)
             failures.append(label)
             return None
+
+    def sweep_jobs():
+        """Removes every pending Word Scramble / Slow Mode timer in EVERY chat, even ones the database
+        no longer knows about, so nothing can start a round after the stop."""
+        if jq is None:
+            return 0
+        prefixes = tuple(p for p in (
+            _slowmode_next_job_name(""), _scramble_timeout_job_name(""), _scramble_send_retry_job_name(""),
+            _timeout_job_name(""),
+        ) if p)
+        removed = 0
+        for job in list(jq.jobs()):
+            if job.name and job.name.startswith(prefixes):
+                job.schedule_removal()
+                removed += 1
+        return removed
+
+    # 0) the owner's global Scramble Mode (it starts a round in EVERY group on a timer)
+    async def _global_mode():
+        if await asyncio.to_thread(db.get_config, "scramble_mode_enabled", "0") == "1":
+            await asyncio.to_thread(db.set_config, "scramble_mode_enabled", "0")
+            counts["global Scramble Mode (turn it on again in my DM with /scramblemode <time>)"] += 1
+        cancel_scramblemode_job(jq)
+    await step("global Scramble Mode", _global_mode())
 
     # 1) Word Scramble (normal / Slow / Automatic) - first, so no new round can start while the rest is stopped
     async def _scramble():
@@ -13822,11 +13882,11 @@ async def _stop_all_activities(context) -> str:
                 counts["scramble rounds"] += 1
                 note(chat_id, f"Word Scramble round (the word was {esc(i['word'])})")
             if i["slow"]:
-                counts["slow mode"] += 1
-                note(chat_id, "Slow Mode switched off")
+                counts["slow mode switched off"] += 1
+                note(chat_id, "Slow Mode switched off", slow=i.get("slow_seconds") or 60)
             if i["auto"]:
-                counts["automatic mode"] += 1
-                note(chat_id, "Automatic Mode switched off")
+                counts["automatic mode switched off"] += 1
+                note(chat_id, "Automatic Mode switched off", auto=True)
     await step("Word Scramble", _scramble())
 
     # 2) Word Game
@@ -13849,7 +13909,7 @@ async def _stop_all_activities(context) -> str:
             if res:
                 counts["tournaments"] += 1
                 counts["refunds"] += len(res["refunds"])
-                note(t["chat_id"], f"Tournament (fees refunded)")
+                note(t["chat_id"], "Tournament (fees refunded)", tour=True)
     await step("tournaments", _tournaments())
 
     # 4) Eliminations
@@ -13864,7 +13924,7 @@ async def _stop_all_activities(context) -> str:
             if res:
                 counts["eliminations"] += 1
                 counts["refunds"] += len(res["refunds"])
-                note(e["chat_id"], "Elimination (fees refunded)")
+                note(e["chat_id"], "Elimination (fees refunded)", elim=True)
     await step("eliminations", _elims())
 
     # 5) Hacks (the host is refunded too)
@@ -13879,7 +13939,7 @@ async def _stop_all_activities(context) -> str:
             if res:
                 counts["hacks"] += 1
                 counts["refunds"] += len(res["refunds"])
-                note(h["chat_id"], "Hack (fees refunded)")
+                note(h["chat_id"], "Hack (fees refunded)", hack=True)
     await step("hacks", _hacks())
 
     # 6) Jackpot games: fee refunded AND the daily try given back
@@ -13907,16 +13967,21 @@ async def _stop_all_activities(context) -> str:
                 note(chat_id, phrase)
         await step(getattr(hook, "__name__", "game hook"), _hook())
 
-    # 8) In-memory state
+    # 8) In-memory state + every leftover timer
     _ELIM_CHATS.clear()
     _JACKPOT_ACTIVE.clear()
+    try:
+        counts["leftover timers removed"] += sweep_jobs()
+    except Exception as e:
+        logger.error(f"stopall: timer sweep failed: {e}", exc_info=True)
+        failures.append("timer sweep")
 
-    # 9) ONE short message per affected group
+    # 9) ONE short message per affected group (what stopped + how to start again)
     sent = 0
     for chat_id, phrases in affected.items():
-        text = "🛑 The bot owner stopped everything here: " + "; ".join(dict.fromkeys(phrases)) + "."
         try:
-            await safe_send(context.bot, chat_id, text=text, parse_mode="HTML")
+            await safe_send(context.bot, chat_id, text=_stopall_group_text(phrases, hints.get(chat_id, {})),
+                            parse_mode="HTML")
             sent += 1
         except Exception as ex:
             logger.info(f"stopall notice to {chat_id} not delivered: {ex}")
@@ -13924,10 +13989,12 @@ async def _stop_all_activities(context) -> str:
 
     lines = ["🛑 <b>Everything stopped</b>", ""]
     if counts:
-        lines += [f"• {k}: {v}" for k, v in counts.items()]
+        lines += [f"• {k}: {v}" for k, v in counts.items() if k != "leftover timers removed"]
     else:
         lines.append("Nothing was running anywhere.")
-    lines += ["", f"Groups notified: {sent} of {len(affected)}"]
+    lines += ["", "Slow Mode, Automatic Mode and the global Scramble Mode are now OFF everywhere until an admin "
+              "(or you) switches them on again. Members can still start a normal round with /wordscramble.",
+              f"Groups notified: {sent} of {len(affected)}"]
     if failures:
         lines += ["", "⚠️ Steps that failed (run the command again): " + esc(", ".join(failures))]
     return "\n".join(lines)

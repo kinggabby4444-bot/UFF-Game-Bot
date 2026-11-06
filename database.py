@@ -6655,7 +6655,8 @@ def jackpot_get_active_for_user(user_id):
 
 def stopall_clear_scramble_state():
     """/stopallactivities: in ONE transaction end every Word Scramble round, turn Slow Mode off and turn
-    Automatic Mode off everywhere. Returns {chat_id: {"word": str|None, "slow": bool, "auto": bool}} for every
+    Automatic Mode off everywhere (they stay off until an admin switches them on again).
+    Returns {chat_id: {"word": str|None, "slow": bool, "slow_seconds": int|None, "auto": bool}} for every
     chat where something was running."""
     conn = connect()
     try:
@@ -6663,15 +6664,19 @@ def stopall_clear_scramble_state():
         out = {}
 
         def info(chat_id):
-            return out.setdefault(chat_id, {"word": None, "slow": False, "auto": False})
+            return out.setdefault(chat_id, {"word": None, "slow": False, "slow_seconds": None, "auto": False})
 
         cursor.execute("DELETE FROM scramble_games RETURNING chat_id, word, round_active")
         for chat_id, word, active in cursor.fetchall():
             if active:
                 info(chat_id)["word"] = word
-        cursor.execute("UPDATE scramble_slowmode SET enabled=0, next_round_due_at=NULL WHERE enabled=1 RETURNING chat_id")
-        for (chat_id,) in cursor.fetchall():
+        cursor.execute(
+            "UPDATE scramble_slowmode SET enabled=0, next_round_due_at=NULL WHERE enabled=1 "
+            "RETURNING chat_id, interval_seconds"
+        )
+        for chat_id, seconds in cursor.fetchall():
             info(chat_id)["slow"] = True
+            info(chat_id)["slow_seconds"] = seconds
         cursor.execute("UPDATE scramble_slowmode SET next_round_due_at=NULL WHERE next_round_due_at IS NOT NULL")
         cursor.execute(
             "UPDATE scramble_auto_mode SET auto_enabled=0, manual_streak=0, miss_streak=0 "
