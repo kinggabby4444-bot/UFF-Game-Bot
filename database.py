@@ -453,6 +453,27 @@ def create_tables():
 
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_scramble_chat_stats_chat ON scramble_chat_stats (chat_id, earned DESC)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_scramble_global_stats_earned ON scramble_global_stats (earned DESC)")
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS balance_repair_runs (
+            id BIGSERIAL PRIMARY KEY,
+            applied_by BIGINT,
+            created_at TEXT,
+            users_changed INTEGER,
+            rows_changed INTEGER,
+            total_removed BIGINT
+        )
+        """)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS balance_repair_backup (
+            id BIGSERIAL PRIMARY KEY,
+            run_id BIGINT NOT NULL,
+            tbl TEXT NOT NULL,
+            user_id BIGINT NOT NULL,
+            chat_id BIGINT NOT NULL,
+            old_value BIGINT NOT NULL,
+            new_value BIGINT NOT NULL
+        )
+        """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_scramble_group_stats_rounds ON scramble_group_stats (rounds_played DESC)")
 
         cursor.execute("""
@@ -1443,34 +1464,36 @@ def award_coins(user_id, chat_id, name, amount):
 
 
 def get_chat_leaderboard(chat_id, limit=10):
+    """'In this chat' board: Word Game + Word Scramble money earned in this chat
+    (never shown higher than the player's global balance)."""
     conn = connect()
     try:
         cursor = conn.cursor()
-        cursor.execute("""
-            SELECT name, coins FROM chat_scores WHERE chat_id=%s ORDER BY coins DESC LIMIT %s
-        """, (chat_id, limit))
+        cursor.execute(f"""
+            SELECT COALESCE(a.name, b.name) AS name, {_CHAT_TOTAL_SQL} AS total
+            FROM {_CHAT_BOARD_FROM}
+            ORDER BY total DESC, COALESCE(a.user_id, b.user_id) ASC LIMIT %s
+        """, (chat_id, chat_id, limit))
         return cursor.fetchall()
     finally:
         conn.close()
 
 
 def get_global_leaderboard(limit=10):
-    conn = connect()
-    try:
-        cursor = conn.cursor()
-        cursor.execute("SELECT name, coins FROM global_scores ORDER BY coins DESC LIMIT %s", (limit,))
-        return cursor.fetchall()
-    finally:
-        conn.close()
+    """Global board = combined balance (Word Game + Word Scramble), same as /bal."""
+    return get_combined_global_leaderboard(limit)
 
 
 def get_chat_leaderboard_with_ids(chat_id, limit=10):
     conn = connect()
     try:
         cursor = conn.cursor()
-        cursor.execute("""
-            SELECT user_id, name, coins FROM chat_scores WHERE chat_id=%s ORDER BY coins DESC LIMIT %s
-        """, (chat_id, limit))
+        cursor.execute(f"""
+            SELECT COALESCE(a.user_id, b.user_id) AS user_id, COALESCE(a.name, b.name) AS name,
+                   {_CHAT_TOTAL_SQL} AS total
+            FROM {_CHAT_BOARD_FROM}
+            ORDER BY total DESC, COALESCE(a.user_id, b.user_id) ASC LIMIT %s
+        """, (chat_id, chat_id, limit))
         return cursor.fetchall()
     finally:
         conn.close()
@@ -1480,7 +1503,14 @@ def get_global_leaderboard_with_ids(limit=10):
     conn = connect()
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT user_id, name, coins FROM global_scores ORDER BY coins DESC LIMIT %s", (limit,))
+        cursor.execute(f"""
+            SELECT COALESCE(g.user_id, s.user_id) AS user_id, COALESCE(g.name, s.name) AS name,
+                   {_COMBINED_TOTAL_SQL} AS total
+            FROM global_scores g
+            FULL OUTER JOIN scramble_global_stats s ON g.user_id = s.user_id
+            ORDER BY {_COMBINED_TOTAL_SQL} DESC, COALESCE(g.user_id, s.user_id) ASC
+            LIMIT %s
+        """, (limit,))
         return cursor.fetchall()
     finally:
         conn.close()
@@ -1494,13 +1524,14 @@ def get_chat_position(chat_id, user_id):
     conn = connect()
     try:
         cursor = conn.cursor()
-        cursor.execute("""
-            SELECT rnk, name, coins FROM (
-                SELECT user_id, name, coins,
-                       ROW_NUMBER() OVER (ORDER BY coins DESC, user_id ASC) AS rnk
-                FROM chat_scores WHERE chat_id=%s
+        cursor.execute(f"""
+            SELECT rnk, name, total FROM (
+                SELECT COALESCE(a.user_id, b.user_id) AS user_id, COALESCE(a.name, b.name) AS name,
+                       {_CHAT_TOTAL_SQL} AS total,
+                       ROW_NUMBER() OVER (ORDER BY {_CHAT_TOTAL_SQL} DESC, COALESCE(a.user_id, b.user_id) ASC) AS rnk
+                FROM {_CHAT_BOARD_FROM}
             ) t WHERE user_id=%s
-        """, (chat_id, user_id))
+        """, (chat_id, chat_id, user_id))
         row = cursor.fetchone()
     finally:
         conn.close()
@@ -1510,22 +1541,7 @@ def get_chat_position(chat_id, user_id):
 
 
 def get_global_position(user_id):
-    conn = connect()
-    try:
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT rnk, name, coins FROM (
-                SELECT user_id, name, coins,
-                       ROW_NUMBER() OVER (ORDER BY coins DESC, user_id ASC) AS rnk
-                FROM global_scores
-            ) t WHERE user_id=%s
-        """, (user_id,))
-        row = cursor.fetchone()
-    finally:
-        conn.close()
-    if row is None:
-        return None
-    return int(row[0]), row[1], row[2]
+    return get_combined_global_position(user_id)
 
 
 # ---------------------------------------------------------------------------
@@ -2471,7 +2487,7 @@ def _tx_spendable(cursor, user_id, lock=False):
     return scramble, game
 
 
-def _tx_deduct_combined(cursor, user_id, name, amount):
+def _tx_deduct_combined(cursor, user_id, name, amount, chat_id=None):
     """THE one fee/debit helper for every paid action (Tournament, Elimination,
     Hack joins, /transfer, /request, Jackpot...). Spends from the COMBINED
     Word Scramble + Word Game balance: Word Scramble money first, then the
@@ -2499,6 +2515,9 @@ def _tx_deduct_combined(cursor, user_id, name, amount):
             "UPDATE global_scores SET coins = coins - %s, name = %s WHERE user_id = %s",
             (take_game, name, user_id),
         )
+    if amount:
+        # the money leaves the chat where it was spent first; chat figures can never exceed global
+        _tx_trim_chats(cursor, user_id, chat_id, amount)
     if take_game == 0:
         source = "scramble"
     elif take_scramble == 0:
@@ -2508,10 +2527,10 @@ def _tx_deduct_combined(cursor, user_id, name, amount):
     return scramble + game - amount, source
 
 
-def _tx_deduct_any(cursor, user_id, name, amount):
+def _tx_deduct_any(cursor, user_id, name, amount, chat_id=None):
     """Kept under its old name for the existing join paths: now a combined
     (split-capable) deduction - see _tx_deduct_combined."""
-    return _tx_deduct_combined(cursor, user_id, name, amount)
+    return _tx_deduct_combined(cursor, user_id, name, amount, chat_id=chat_id)
 
 
 def _tx_combined_total(cursor, user_id):
@@ -2564,6 +2583,176 @@ def _tx_credit_chat_scramble(cursor, user_id, chat_id, name, amount):
             earned = GREATEST(0, scramble_chat_stats.earned + %s),
             name = EXCLUDED.name
     """, (user_id, chat_id, name, amount, amount))
+
+
+_TRIM_PAIRS = (
+    # (chat table, chat column, global table, global column)
+    ("scramble_chat_stats", "earned", "scramble_global_stats", "earned"),
+    ("chat_scores", "coins", "global_scores", "coins"),
+)
+
+
+def _tx_event_chat(cursor, table, row_id):
+    """chat_id of a tournament / elimination / hack (None if not found)."""
+    if table not in ("tournaments", "eliminations", "hacks"):
+        return None
+    cursor.execute(f"SELECT chat_id FROM {table} WHERE id=%s", (row_id,))
+    row = cursor.fetchone()
+    return row[0] if row else None
+
+
+def _tx_trim_chats(cursor, user_id, spent_chat_id=None, spent=0):
+    """Keeps every 'in this chat' figure a PART of the player's global balance.
+    Runs inside the caller's transaction right after a debit (or after an owner
+    cut). It never touches a global balance - it only lowers chat figures:
+      1) the money the player just spent is taken from THIS chat first
+         (Word Scramble chat figure, then Word Game chat figure), as far as
+         that chat holds that much;
+      2) then, per balance (Word Scramble / Word Game), if the chat figures
+         added together are still more than the global balance, the largest
+         chat figures are lowered until they fit.
+    So 'in this chat' can never be higher than global."""
+    if spent and spent_chat_id is not None and spent_chat_id < 0:
+        remaining = int(spent)
+        for ctab, ccol, _gtab, _gcol in _TRIM_PAIRS:
+            if remaining <= 0:
+                break
+            cursor.execute(
+                f"SELECT {ccol} FROM {ctab} WHERE user_id=%s AND chat_id=%s FOR UPDATE",
+                (user_id, spent_chat_id),
+            )
+            row = cursor.fetchone()
+            have = max((row[0] or 0), 0) if row else 0
+            cut = min(have, remaining)
+            if cut:
+                cursor.execute(
+                    f"UPDATE {ctab} SET {ccol} = {ccol} - %s WHERE user_id=%s AND chat_id=%s",
+                    (cut, user_id, spent_chat_id),
+                )
+                remaining -= cut
+    for ctab, ccol, gtab, gcol in _TRIM_PAIRS:
+        cursor.execute(f"SELECT {gcol} FROM {gtab} WHERE user_id=%s", (user_id,))
+        row = cursor.fetchone()
+        limit = max((row[0] or 0), 0) if row else 0
+        cursor.execute(
+            f"SELECT chat_id, {ccol} FROM {ctab} WHERE user_id=%s AND {ccol} > 0 "
+            f"ORDER BY {ccol} DESC, chat_id ASC FOR UPDATE",
+            (user_id,),
+        )
+        rows = cursor.fetchall()
+        excess = sum(v for _c, v in rows) - limit
+        for cid, val in rows:
+            if excess <= 0:
+                break
+            cut = min(val, excess)
+            cursor.execute(
+                f"UPDATE {ctab} SET {ccol} = {ccol} - %s WHERE user_id=%s AND chat_id=%s",
+                (cut, user_id, cid),
+            )
+            excess -= cut
+
+
+_BALANCE_LABELS = {"scramble_chat_stats": "Word Scramble", "chat_scores": "Word Game"}
+
+
+def _balance_plan(cursor, lock=False):
+    """Works out what a repair would change, WITHOUT changing anything: for every player and balance
+    (Word Scramble / Word Game), if their 'in this chat' figures added together are more than their
+    global balance, the largest chat figures are lowered until they fit. Global balances are never
+    touched. Returns a list (biggest excess first) of
+    {table, user_id, name, global, chat_sum, excess, changes: [(chat_id, old, new)]}."""
+    plan = []
+    for ctab, ccol, gtab, gcol in _TRIM_PAIRS:
+        cursor.execute(
+            f"SELECT c.user_id, c.chat_id, c.{ccol}, GREATEST(COALESCE(g.{gcol}, 0), 0), c.name "
+            f"FROM {ctab} c LEFT JOIN {gtab} g ON g.user_id = c.user_id "
+            f"WHERE c.{ccol} > 0 ORDER BY c.user_id, c.{ccol} DESC, c.chat_id ASC"
+            + (" FOR UPDATE OF c" if lock else "")
+        )
+        by_user = {}
+        for uid, cid, val, glob, name in cursor.fetchall():
+            by_user.setdefault(uid, {"glob": glob, "name": name, "rows": []})["rows"].append((cid, val))
+        for uid, info in by_user.items():
+            total = sum(v for _c, v in info["rows"])
+            excess = total - info["glob"]
+            if excess <= 0:
+                continue
+            changes, left = [], excess
+            for cid, val in info["rows"]:
+                if left <= 0:
+                    break
+                cut = min(val, left)
+                changes.append((cid, val, val - cut))
+                left -= cut
+            plan.append({"table": ctab, "user_id": uid, "name": info["name"], "global": info["glob"],
+                         "chat_sum": total, "excess": excess, "changes": changes})
+    plan.sort(key=lambda p: (-p["excess"], p["user_id"]))
+    return plan
+
+
+def _balance_report(plan):
+    return {
+        "users": len({p["user_id"] for p in plan}),
+        "cases": len(plan),
+        "rows": sum(len(p["changes"]) for p in plan),
+        "removed": sum(p["excess"] for p in plan),
+        "top": [(p["user_id"], p["name"], _BALANCE_LABELS[p["table"]], p["global"], p["chat_sum"], p["excess"])
+                for p in plan[:15]],
+    }
+
+
+def balance_audit():
+    """READ-ONLY. Finds players whose 'in this chat' figures add up to more than their global balance."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        report = _balance_report(_balance_plan(cursor))
+        conn.rollback()
+        return report
+    finally:
+        conn.close()
+
+
+def balance_repair_apply(applied_by):
+    """One-time repair. ONE transaction: re-checks the problem under a lock, saves every row it is about to
+    change in balance_repair_backup, lowers ONLY 'in this chat' figures (never a global balance).
+    Idempotent: when nothing is left to fix it changes nothing and returns run_id None."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT pg_advisory_xact_lock(%s)", (8800123,))
+            plan = _balance_plan(cursor, lock=True)
+            if not plan:
+                conn.rollback()
+                return {"run_id": None, "users": 0, "rows": 0, "removed": 0}
+            rep = _balance_report(plan)
+            cursor.execute(
+                "INSERT INTO balance_repair_runs (applied_by, created_at, users_changed, rows_changed, total_removed) "
+                "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                (applied_by, datetime.now().isoformat(), rep["users"], rep["rows"], rep["removed"]),
+            )
+            run_id = cursor.fetchone()[0]
+            ccols = {t: c for t, c, _g, _gc in _TRIM_PAIRS}
+            for p in plan:
+                ccol = ccols[p["table"]]
+                for cid, old, new in p["changes"]:
+                    cursor.execute(
+                        "INSERT INTO balance_repair_backup (run_id, tbl, user_id, chat_id, old_value, new_value) "
+                        "VALUES (%s, %s, %s, %s, %s, %s)",
+                        (run_id, p["table"], p["user_id"], cid, old, new),
+                    )
+                    cursor.execute(
+                        f"UPDATE {p['table']} SET {ccol} = %s WHERE user_id=%s AND chat_id=%s AND {ccol} = %s",
+                        (new, p["user_id"], cid, old),
+                    )
+            conn.commit()
+            return {"run_id": run_id, "users": rep["users"], "rows": rep["rows"], "removed": rep["removed"]}
+        except Exception:
+            conn.rollback()
+            raise
+    finally:
+        conn.close()
 
 
 def scramble_conditional_deduct(user_id, name, amount):
@@ -2648,7 +2837,7 @@ def tournament_join(tournament_id, user_id, name):
                 conn.rollback()
                 return "already", None
 
-            new_balance, source = _tx_deduct_any(cursor, user_id, name, fee)
+            new_balance, source = _tx_deduct_any(cursor, user_id, name, fee, chat_id=_tx_event_chat(cursor, "tournaments", tournament_id))
             if new_balance is None:
                 conn.rollback()
                 return "insufficient", None
@@ -3127,7 +3316,8 @@ def transfer_execute(from_id, from_name, to_id, to_name, amount, chat_id):
         cursor = conn.cursor()
         try:
             _tx_lock_balances(cursor, [from_id, to_id])
-            new_from, _src = _tx_deduct_combined(cursor, from_id, from_name, amount)
+            new_from, _src = _tx_deduct_combined(cursor, from_id, from_name, amount,
+                                                 chat_id=_tx_chat_for_credit(cursor, from_id, chat_id))
             if new_from is None:
                 have = _tx_combined_total(cursor, from_id)
                 conn.rollback()
@@ -3316,7 +3506,8 @@ def request_pay(request_id, actor_id, expire_seconds):
                 return "expired", row, None
 
             _tx_lock_balances(cursor, [row["target_id"], row["requester_id"]])
-            target_bal, _src = _tx_deduct_combined(cursor, row["target_id"], row["target_name"], row["amount"])
+            target_bal, _src = _tx_deduct_combined(cursor, row["target_id"], row["target_name"], row["amount"],
+                                                   chat_id=_tx_chat_for_credit(cursor, row["target_id"], row["chat_id"]))
             if target_bal is None:
                 have = _tx_combined_total(cursor, row["target_id"])
                 conn.rollback()
@@ -4163,10 +4354,12 @@ def scramble_get_chat_leaderboard(chat_id, limit=10):
     conn = connect()
     try:
         cursor = conn.cursor()
-        cursor.execute("""
-            SELECT name, wins, earned, current_streak
-            FROM scramble_chat_stats WHERE chat_id=%s ORDER BY earned DESC LIMIT %s
-        """, (chat_id, limit))
+        cursor.execute(f"""
+            SELECT COALESCE(a.name, b.name) AS name, COALESCE(b.wins, 0), {_CHAT_TOTAL_SQL} AS total,
+                   COALESCE(b.current_streak, 0)
+            FROM {_CHAT_BOARD_FROM}
+            ORDER BY total DESC, COALESCE(a.user_id, b.user_id) ASC LIMIT %s
+        """, (chat_id, chat_id, limit))
         return cursor.fetchall()
     finally:
         conn.close()
@@ -4176,8 +4369,12 @@ def scramble_get_global_leaderboard(limit=10):
     conn = connect()
     try:
         cursor = conn.cursor()
-        cursor.execute("""
-            SELECT name, wins, earned FROM scramble_global_stats ORDER BY earned DESC LIMIT %s
+        cursor.execute(f"""
+            SELECT COALESCE(s.name, g.name) AS name, COALESCE(s.wins, 0), {_COMBINED_TOTAL_SQL} AS total
+            FROM global_scores g
+            FULL OUTER JOIN scramble_global_stats s ON g.user_id = s.user_id
+            ORDER BY {_COMBINED_TOTAL_SQL} DESC, COALESCE(g.user_id, s.user_id) ASC
+            LIMIT %s
         """, (limit,))
         return cursor.fetchall()
     finally:
@@ -4188,13 +4385,15 @@ def scramble_get_chat_position(chat_id, user_id):
     conn = connect()
     try:
         cursor = conn.cursor()
-        cursor.execute("""
-            SELECT rnk, name, wins, earned, current_streak FROM (
-                SELECT user_id, name, wins, earned, current_streak,
-                       ROW_NUMBER() OVER (ORDER BY earned DESC, user_id ASC) AS rnk
-                FROM scramble_chat_stats WHERE chat_id=%s
+        cursor.execute(f"""
+            SELECT rnk, name, wins, total, streak FROM (
+                SELECT COALESCE(a.user_id, b.user_id) AS user_id, COALESCE(a.name, b.name) AS name,
+                       COALESCE(b.wins, 0) AS wins, {_CHAT_TOTAL_SQL} AS total,
+                       COALESCE(b.current_streak, 0) AS streak,
+                       ROW_NUMBER() OVER (ORDER BY {_CHAT_TOTAL_SQL} DESC, COALESCE(a.user_id, b.user_id) ASC) AS rnk
+                FROM {_CHAT_BOARD_FROM}
             ) t WHERE user_id=%s
-        """, (chat_id, user_id))
+        """, (chat_id, chat_id, user_id))
         row = cursor.fetchone()
     finally:
         conn.close()
@@ -4207,11 +4406,13 @@ def scramble_get_global_position(user_id):
     conn = connect()
     try:
         cursor = conn.cursor()
-        cursor.execute("""
-            SELECT rnk, name, wins, earned FROM (
-                SELECT user_id, name, wins, earned,
-                       ROW_NUMBER() OVER (ORDER BY earned DESC, user_id ASC) AS rnk
-                FROM scramble_global_stats
+        cursor.execute(f"""
+            SELECT rnk, name, wins, total FROM (
+                SELECT COALESCE(g.user_id, s.user_id) AS user_id, COALESCE(s.name, g.name) AS name,
+                       COALESCE(s.wins, 0) AS wins, {_COMBINED_TOTAL_SQL} AS total,
+                       ROW_NUMBER() OVER (ORDER BY {_COMBINED_TOTAL_SQL} DESC, COALESCE(g.user_id, s.user_id) ASC) AS rnk
+                FROM global_scores g
+                FULL OUTER JOIN scramble_global_stats s ON g.user_id = s.user_id
             ) t WHERE user_id=%s
         """, (user_id,))
         row = cursor.fetchone()
@@ -4286,6 +4487,9 @@ def scramble_adjust_global_earned(user_id, name, amount):
             RETURNING earned
         """, (user_id, name, amount, amount))
         new_balance = cursor.fetchone()[0]
+        if amount < 0:
+            # money was taken off the global balance: keep 'in this chat' a part of it
+            _tx_trim_chats(cursor, user_id)
         conn.commit()
         return new_balance
     finally:
@@ -4444,6 +4648,22 @@ def get_all_active_word_game_chats():
 # get_combined_balance, and by the leaderboard/rank queries below:
 #   Word Scramble money + Word Game money, each counted only when positive.
 _COMBINED_TOTAL_SQL = "GREATEST(COALESCE(g.coins, 0), 0) + GREATEST(COALESCE(s.earned, 0), 0)"
+
+
+# --- "In this chat" boards: the chat figure is Word Scramble money + Word Game money earned in
+# that chat, and can never be shown higher than the player's global (combined) balance. -------------
+_CHAT_BOARD_FROM = """
+    (SELECT user_id, name, coins FROM chat_scores WHERE chat_id=%s) a
+    FULL OUTER JOIN
+    (SELECT user_id, name, wins, earned, current_streak FROM scramble_chat_stats WHERE chat_id=%s) b
+        ON a.user_id = b.user_id
+    LEFT JOIN global_scores g ON g.user_id = COALESCE(a.user_id, b.user_id)
+    LEFT JOIN scramble_global_stats s ON s.user_id = COALESCE(a.user_id, b.user_id)
+"""
+_CHAT_TOTAL_SQL = (
+    "LEAST(GREATEST(COALESCE(a.coins, 0), 0) + GREATEST(COALESCE(b.earned, 0), 0), "
+    "GREATEST(COALESCE(g.coins, 0), 0) + GREATEST(COALESCE(s.earned, 0), 0))"
+)
 
 
 def get_combined_global_leaderboard(limit=10):
@@ -5251,7 +5471,7 @@ def elim_join(elimination_id, user_id, name):
                 conn.rollback()
                 return "already", None, None
 
-            new_balance, source = _tx_deduct_any(cursor, user_id, name, fee)
+            new_balance, source = _tx_deduct_any(cursor, user_id, name, fee, chat_id=_tx_event_chat(cursor, "eliminations", elimination_id))
             if new_balance is None:
                 conn.rollback()
                 return "insufficient", None, None
@@ -5776,7 +5996,7 @@ def hack_join(hack_id, user_id, name):
                 conn.rollback()
                 return "already", None, None
 
-            new_balance, source = _tx_deduct_any(cursor, user_id, name, fee)
+            new_balance, source = _tx_deduct_any(cursor, user_id, name, fee, chat_id=_tx_event_chat(cursor, "hacks", hack_id))
             if new_balance is None:
                 conn.rollback()
                 return "insufficient", None, None
@@ -6315,7 +6535,7 @@ def jackpot_start(chat_id, user_id, name, play_date, now_str, expires_str, max_p
             conn.rollback()
             return "active", None
 
-        balance_after, source = _tx_deduct_combined(cursor, user_id, name, fee)
+        balance_after, source = _tx_deduct_combined(cursor, user_id, name, fee, chat_id=chat_id)
         if balance_after is None:
             have = _tx_combined_total(cursor, user_id)
             conn.rollback()

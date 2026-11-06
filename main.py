@@ -7255,7 +7255,7 @@ OWNER_ONLY_COMMANDS = frozenset({
     "scramblemode", "scramblereloadwords", "scramblesetreward", "scramblestats", "scramblestopallgroups",
     "scrambletopup", "scrambletopupspecific", "scrambleusers", "seepremiumplayers", "sendgroupmessage",
     "setdollarpack", "setpremium", "setreward", "setsupport", "share", "shufflewords", "sponsoredad",
-    "starbalance", "stats", "stopelimination", "supportstats", "topup", "users", "withdraw",
+    "starbalance", "stats", "stopelimination", "auditbalances", "repairbalances", "supportstats", "topup", "users", "withdraw",
 })
 
 
@@ -13641,6 +13641,107 @@ def schedule_premium_reminder_job(job_queue):
     )
 
 
+# ---------------------------- /auditbalances, /repairbalances ----------------------------
+_pending_repairs = {}  # token -> deadline (in memory: the buttons expire in 2 minutes anyway)
+REPAIR_CONFIRM_SECONDS = 120
+
+
+def _balance_report_text(rep, heading) -> str:
+    if rep["cases"] == 0:
+        return f"{heading}\n\n✅ Everything is fine: no player has more 'in this chat' than global."
+    lines = [
+        heading, "",
+        f"⚠️ {rep['users']} player(s) have 'in this chat' money adding up to MORE than their global balance "
+        f"({rep['cases']} case(s), {rep['rows']} chat row(s)).",
+        f"Total that would be removed from chat figures: {DOLLAR}{fmt_coins(rep['removed'])}",
+        "Global balances are never lowered by the repair.", "",
+        "<b>Biggest cases</b>",
+    ]
+    for uid, name, label, glob, chat_sum, excess in rep["top"]:
+        lines.append(
+            f'• <a href="tg://user?id={uid}">{esc_name(name)}</a> ({label}) - global {DOLLAR}{fmt_coins(glob)}, '
+            f"in chats {DOLLAR}{fmt_coins(chat_sum)}, too much {DOLLAR}{fmt_coins(excess)}"
+        )
+    return "\n".join(lines)
+
+
+@owner_only
+async def auditbalances_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/auditbalances: read-only check of 'in this chat' versus global."""
+    rep = await asyncio.to_thread(db.balance_audit)
+    await reply_html_in_parts(update.message, _balance_report_text(rep, "🔎 <b>Balance audit</b>"))
+
+
+@owner_only
+async def repairbalances_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/repairbalances: shows what the one-time repair would change; nothing happens until the owner taps Apply."""
+    rep = await asyncio.to_thread(db.balance_audit)
+    text = _balance_report_text(rep, "🛠 <b>Balance repair - preview</b>")
+    if rep["cases"] == 0:
+        await reply_html_in_parts(update.message, text)
+        return
+    now = asyncio.get_running_loop().time()
+    for t in [t for t, d in _pending_repairs.items() if d < now]:
+        _pending_repairs.pop(t, None)
+    token = os.urandom(4).hex()
+    _pending_repairs[token] = now + REPAIR_CONFIRM_SECONDS
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Apply repair", callback_data=f"rb:y:{token}"),
+        InlineKeyboardButton("❌ Cancel", callback_data=f"rb:n:{token}"),
+    ]])
+    await update.message.reply_html(
+        text[:3500] + "\n\nEvery changed row is saved in a backup table first. Apply?",
+        reply_markup=keyboard, link_preview_options=LinkPreviewOptions(is_disabled=True),
+    )
+
+
+async def repair_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    try:
+        _p, action, token = query.data.split(":")
+    except ValueError:
+        await query.answer()
+        return
+    if not is_owner(user.id):
+        await query.answer("Only the bot owner can use these buttons.", show_alert=True)
+        return
+    deadline = _pending_repairs.pop(token, None)   # claim BEFORE any await: a double tap can never run twice
+    if deadline is None or asyncio.get_running_loop().time() > deadline:
+        await query.answer("⌛ Expired - run /repairbalances again.", show_alert=True)
+        try:
+            await query.edit_message_text("⌛ Repair confirmation expired - nothing was changed.")
+        except Exception:
+            pass
+        return
+    if action == "n":
+        await query.answer("Cancelled.")
+        try:
+            await query.edit_message_text("❌ Repair cancelled - nothing was changed.")
+        except Exception:
+            pass
+        return
+    await query.answer("Working...")
+    try:
+        res = await asyncio.to_thread(db.balance_repair_apply, user.id)
+    except Exception as e:
+        logger.error(f"balance repair failed: {e}", exc_info=True)
+        text = "❌ The repair failed and NOTHING was changed. Check the logs."
+    else:
+        if res["run_id"] is None:
+            text = "✅ Nothing to repair - everything already fits."
+        else:
+            text = (
+                f"✅ Repair #{res['run_id']} done: {res['rows']} chat row(s) of {res['users']} player(s) lowered by "
+                f"{DOLLAR}{fmt_coins(res['removed'])} in total. Global balances were not touched. "
+                f"Old values are saved in table balance_repair_backup (run_id {res['run_id']})."
+            )
+    try:
+        await query.edit_message_text(text)
+    except Exception:
+        pass
+
+
 def main():
     print("GAME BOT: main() started", flush=True)
 
@@ -13870,6 +13971,8 @@ def main():
     app.add_handler(CommandHandler("editbuycashtext", editbuycashtext_command))
     app.add_handler(CommandHandler("setdollarpack", setdollarpack_command))
     app.add_handler(CommandHandler("transfer", transfer_command))
+    app.add_handler(CommandHandler("auditbalances", auditbalances_command))
+    app.add_handler(CommandHandler("repairbalances", repairbalances_command))
     app.add_handler(CommandHandler("request", request_command))
     app.add_handler(CommandHandler("deleterequestprompt", deleterequestprompt_command))
     app.add_handler(CommandHandler("searchcommand", searchcommand_command))
@@ -13896,6 +13999,7 @@ def main():
     app.add_handler(CommandHandler("profile", profile_command))
     app.add_handler(CommandHandler("inviteandearn", inviteandearn_command))
 
+    app.add_handler(CallbackQueryHandler(repair_button, pattern=r"^rb:[yn]:[0-9a-f]+$"))
     app.add_handler(CallbackQueryHandler(button))
 
     app.add_handler(MessageHandler(
