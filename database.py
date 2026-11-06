@@ -501,6 +501,36 @@ def create_tables():
         """)
         cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_anagram_active ON anagram_rounds (chat_id) WHERE status = 'active'")
         cursor.execute("""
+        CREATE TABLE IF NOT EXISTS mystery_boxes (
+            id BIGSERIAL PRIMARY KEY,
+            chat_id BIGINT NOT NULL,
+            starter_id BIGINT,
+            starter_name TEXT,
+            started_at TEXT,
+            expires_at TEXT,
+            status TEXT NOT NULL DEFAULT 'open',
+            ended_at TEXT
+        )
+        """)
+        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_mystery_box_open ON mystery_boxes (chat_id) WHERE status = 'open'")
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS mystery_box_opens (
+            box_id BIGINT NOT NULL,
+            user_id BIGINT NOT NULL,
+            prize INTEGER,
+            created_at TEXT,
+            PRIMARY KEY (box_id, user_id)
+        )
+        """)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS mystery_daily (
+            user_id BIGINT NOT NULL,
+            open_date TEXT NOT NULL,
+            opens INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (user_id, open_date)
+        )
+        """)
+        cursor.execute("""
         CREATE TABLE IF NOT EXISTS scramble_auto_release (
             chat_id BIGINT PRIMARY KEY,
             released_at TEXT
@@ -4587,6 +4617,117 @@ def set_scramble_slowmode(chat_id, interval_seconds, enabled: bool):
                 (chat_id, datetime.now().isoformat()),
             )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def mystery_box_start(chat_id, starter_id, starter_name, started_at, expires_at):
+    """Records a new Mystery Box. Returns its id, or None if this chat already has an open one
+    (the unique index guarantees it even across two bot instances). An overdue box is closed first."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE mystery_boxes SET status='interrupted', ended_at=%s "
+            "WHERE chat_id=%s AND status='open' AND expires_at < %s", (started_at, chat_id, started_at))
+        cursor.execute(
+            "INSERT INTO mystery_boxes (chat_id, starter_id, starter_name, started_at, expires_at, status) "
+            "VALUES (%s, %s, %s, %s, %s, 'open') ON CONFLICT (chat_id) WHERE status='open' DO NOTHING RETURNING id",
+            (chat_id, starter_id, starter_name, started_at, expires_at))
+        row = cursor.fetchone()
+        conn.commit()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def mystery_box_close(box_id, status):
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE mystery_boxes SET status=%s, ended_at=%s WHERE id=%s AND status='open'",
+                       (status, datetime.now().isoformat(), box_id))
+        changed = cursor.rowcount == 1
+        conn.commit()
+        return changed
+    finally:
+        conn.close()
+
+
+def mystery_interrupt_open(started_before):
+    """At startup: closes every box still marked open (once - one atomic UPDATE); returns [(chat_id,)]."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE mystery_boxes SET status='interrupted', ended_at=%s WHERE status='open' AND started_at < %s "
+            "RETURNING chat_id", (datetime.now().isoformat(), started_before))
+        rows = cursor.fetchall()
+        conn.commit()
+        return rows
+    finally:
+        conn.close()
+
+
+def _mystery_try(cursor, box_id, chat_id, user_id, name, play_date, max_opens, fee, prize):
+    # 1) one open per player per box
+    cursor.execute(
+        "INSERT INTO mystery_box_opens (box_id, user_id, created_at) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+        (box_id, user_id, datetime.now().isoformat()))
+    if cursor.rowcount != 1:
+        return {"status": "already"}
+    # 2) the daily try (atomic: the WHERE keeps it from ever passing the limit)
+    cursor.execute("""
+        INSERT INTO mystery_daily (user_id, open_date, opens) VALUES (%s, %s, 1)
+        ON CONFLICT (user_id, open_date) DO UPDATE SET opens = mystery_daily.opens + 1
+        WHERE mystery_daily.opens < %s
+        RETURNING opens
+    """, (user_id, play_date, max_opens))
+    row = cursor.fetchone()
+    if not row:
+        return {"status": "limit"}
+    opens_today = row[0]
+    # 3) the fee: Word Scramble money first, then Word Game money
+    _tx_lock_balances(cursor, [user_id])
+    balance, _source = _tx_deduct_combined(cursor, user_id, name, fee, chat_id=chat_id)
+    if balance is None:
+        return {"status": "insufficient"}
+    # 4) the prize: Word Scramble balance, counted once (global + this chat)
+    _tx_credit(cursor, user_id, name, prize)
+    _tx_credit_chat_scramble(cursor, user_id, chat_id, name, prize)
+    cursor.execute("UPDATE mystery_box_opens SET prize=%s WHERE box_id=%s AND user_id=%s", (prize, box_id, user_id))
+    return {"status": "ok", "prize": prize, "opens_today": opens_today,
+            "balance": _tx_combined_total(cursor, user_id)}
+
+
+def mystery_box_open(box_id, chat_id, user_id, name, play_date, max_opens, fee, prize, close_box=False):
+    """ONE transaction: check the box is open -> claim the player's open -> claim the daily try -> take the fee
+    -> add the prize. If anything fails (limit, not enough cash, already opened) NOTHING is kept - no try is used
+    and no money moves. close_box=True is the automatic open at the end: the box is closed in the same transaction
+    whatever the outcome. Returns {"status": ok|already|limit|insufficient|closed, ...}."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT status FROM mystery_boxes WHERE id=%s FOR UPDATE", (box_id,))
+        row = cursor.fetchone()
+        if not row or row[0] != "open":
+            conn.rollback()
+            return {"status": "closed"}
+        cursor.execute("SAVEPOINT attempt")
+        result = _mystery_try(cursor, box_id, chat_id, user_id, name, play_date, max_opens, fee, prize)
+        if result["status"] != "ok":
+            cursor.execute("ROLLBACK TO SAVEPOINT attempt")
+        if close_box:
+            cursor.execute("UPDATE mystery_boxes SET status='closed', ended_at=%s WHERE id=%s",
+                           (datetime.now().isoformat(), box_id))
+        conn.commit()
+        return result
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
     finally:
         conn.close()
 

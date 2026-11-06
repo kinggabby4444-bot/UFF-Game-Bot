@@ -14476,6 +14476,18 @@ def main():
     except Exception:
         logger.exception("GAME BOT: Anagram could not be loaded - everything else keeps working")
 
+    # Mystery Box game: its own file; if it cannot load, the rest of the bot is unaffected.
+    try:
+        import mysterybox
+        mysterybox.install(app, SimpleNamespace(
+            db=db, esc_name=esc_name, DOLLAR=DOLLAR, fmt_coins=fmt_coins, safe_send=safe_send,
+            send_winner_message=send_winner_message, insufficient_cash_text=insufficient_cash_text,
+            is_premium=is_premium, bot_is_admin_in_chat=_bot_is_admin_in_chat,
+            register_stopall_hook=register_stopall_hook,
+        ))
+    except Exception:
+        logger.exception("GAME BOT: Mystery Box could not be loaded - everything else keeps working")
+
     if app.job_queue is not None:
         # A timer that fires even 1-2 seconds late (event loop briefly busy)
         # is DROPPED by APScheduler under its default 1-second grace window.
