@@ -1271,6 +1271,8 @@ async def _start_scramble_round_locked(context: ContextTypes.DEFAULT_TYPE, chat)
         return "tournament"  # an Elimination owns the chat too (same "paused until it ends" handling)
     if chat.type != ChatType.PRIVATE and await asyncio.to_thread(db.hack_get_open_for_chat, chat.id):
         return "tournament"  # so does a Hack
+    if chat.type != ChatType.PRIVATE and _anagram_running(chat.id):
+        return "tournament"  # an Anagram owns the chat too: Slow / Automatic Mode wait and retry
 
     if await asyncio.to_thread(db.scramble_get_round, chat.id):
         return False
@@ -1340,6 +1342,10 @@ async def wordscramble_command(update: Update, context: ContextTypes.DEFAULT_TYP
                 "then just run this command again!"
             )
             return
+
+    if _anagram_running(chat.id):
+        await update.message.reply_text("🔀 An Anagram game is running here - wait for it to end, then start a round.")
+        return
 
     _open_t = await asyncio.to_thread(db.tournament_get_open_for_chat, chat.id)
     if _open_t:
@@ -3580,6 +3586,10 @@ async def word_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = update.effective_chat.id
+
+    if _anagram_running(chat_id):
+        await update.message.reply_text("🔀 An Anagram game is running here - wait for it to end.")
+        return
 
     if await asyncio.to_thread(db.get_effective_admin_mode, chat_id):
         if not await _bot_is_admin_in_chat(context, chat_id):
@@ -7707,6 +7717,9 @@ async def _open_tournament_lobby(update: Update, context: ContextTypes.DEFAULT_T
     if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         await update.message.reply_text("🏟️ Tournaments can only be started inside a group.")
         return
+    if _anagram_running(chat.id):
+        await update.message.reply_text("🔀 An Anagram game is running here - wait for it to end.")
+        return
 
     if await asyncio.to_thread(db.is_tournament_banned, "group", chat.id):
         await update.message.reply_text("🚫 This group isn't allowed to run tournaments.")
@@ -8962,6 +8975,9 @@ async def _open_elimination_lobby(update: Update, context: ContextTypes.DEFAULT_
     if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         await update.message.reply_text("🔥 Eliminations can only be started inside a group.")
         return
+    if _anagram_running(chat.id):
+        await update.message.reply_text("🔀 An Anagram game is running here - wait for it to end.")
+        return
 
     # Same gates the tournament uses.
     if await asyncio.to_thread(db.is_tournament_banned, "group", chat.id):
@@ -9704,6 +9720,10 @@ async def _open_hack_lobby(update: Update, context: ContextTypes.DEFAULT_TYPE, f
 
     if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         await update.message.reply_text("💻 Games are played in groups - add me to a group and start a Hack there!")
+        return
+
+    if _anagram_running(chat.id):
+        await update.message.reply_text("🔀 An Anagram game is running here - wait for it to end.")
         return
 
     # Same gates the tournament / elimination use.
@@ -10692,6 +10712,7 @@ PLAYGAME_BUTTON_LABELS = {
     "tour": "🏟️ Tournament",
     "elim": "🔥 Elimination",
     "hack": "💻 Hack",
+    "anagram": "🔀 Anagram",   # available in /editplaygamebutton, hidden by default
 }
 PLAYGAME_DEFAULT_ORDER = ("normal", "slow", "jackpot", "tour", "elim", "hack")
 PLAYGAME_BUTTONS_CONFIG_KEY = "playgame_buttons"
@@ -10703,6 +10724,7 @@ _PLAYGAME_ALIASES = {
     "tour": "tour", "tournament": "tour",
     "elim": "elim", "elimination": "elim",
     "hack": "hack",
+    "anagram": "anagram", "anagrams": "anagram",
 }
 
 
@@ -10889,7 +10911,7 @@ async def playgame_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("🎮 Games are played in groups.", show_alert=True)
         return
     action = (query.data or "").split(":", 1)[-1]
-    if action not in ("normal", "slow", "auto", "tour", "elim", "hack", "jackpot"):
+    if action not in ("normal", "slow", "auto", "tour", "elim", "hack", "jackpot", "anagram"):
         await query.answer()
         return
     await query.answer()
@@ -10926,6 +10948,9 @@ async def playgame_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "hack":
         context.args = [str(HACK_QUICK_FEE), str(HACK_QUICK_DIGITS)]
         await hack_command(shim, context)
+    elif action == "anagram":
+        context.args = []
+        await anagram_command(shim, context)
     elif action == "jackpot":
         await _jackpot_join(context, chat, user)   # same safe flow as /jackpot
     else:
@@ -14013,6 +14038,34 @@ async def _stop_all_activities(context) -> str:
     return "\n".join(lines)
 
 
+# ---------------------------- Anagram (the game itself lives in anagram.py) ----------------------------
+def _anagram_running(chat_id) -> bool:
+    """True while an Anagram round runs in this chat (in-memory check: no database call)."""
+    try:
+        import anagram
+        return anagram.is_running(chat_id)
+    except Exception:
+        return False
+
+
+def _anagram_dictionary_words():
+    """(word, frequency) pairs of the spell-checker dictionary, used only for the 'words you missed' list."""
+    try:
+        return list(_get_spellchecker().word_frequency.dictionary.items())
+    except Exception:
+        return []
+
+
+async def anagram_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/anagram (also used by the optional /playgame button)."""
+    try:
+        import anagram
+        await anagram.start_command(update, context)
+    except Exception as e:
+        logger.error(f"anagram_command failed: {e}", exc_info=True)
+        await update.message.reply_text("⚠️ Anagram isn't available right now - please tell the bot owner.")
+
+
 # ---------------------------- /auditbalances, /repairbalances ----------------------------
 _pending_repairs = {}  # token -> deadline (in memory: the buttons expire in 2 minutes anyway)
 REPAIR_CONFIRM_SECONDS = 120
@@ -14409,6 +14462,19 @@ def main():
         filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND & filters.Regex(r"^\s*[0-9]{1,4}\s*$"),
         jackpot_text_guess,
     ), group=3)
+
+    # Anagram game: its own file; if it cannot load, the rest of the bot is unaffected.
+    try:
+        import anagram
+        anagram.install(app, SimpleNamespace(
+            db=db, esc=esc, esc_name=esc_name, DOLLAR=DOLLAR, fmt_coins=fmt_coins, safe_send=safe_send,
+            safe_react=safe_react, is_valid_english_word=is_valid_english_word,
+            get_scramble_words=lambda: SCRAMBLE_WORDS, dictionary_words=_anagram_dictionary_words,
+            is_owner=is_owner, is_chat_admin=is_chat_admin, bot_is_admin_in_chat=_bot_is_admin_in_chat,
+            register_stopall_hook=register_stopall_hook,
+        ))
+    except Exception:
+        logger.exception("GAME BOT: Anagram could not be loaded - everything else keeps working")
 
     if app.job_queue is not None:
         # A timer that fires even 1-2 seconds late (event loop briefly busy)

@@ -487,6 +487,20 @@ def create_tables():
         cursor.execute("ALTER TABLE scramble_slowmode ADD COLUMN IF NOT EXISTS next_round_due_at TEXT")
         cursor.execute("ALTER TABLE scramble_slowmode ADD COLUMN IF NOT EXISTS gen INTEGER DEFAULT 0")
         cursor.execute("""
+        CREATE TABLE IF NOT EXISTS anagram_rounds (
+            id BIGSERIAL PRIMARY KEY,
+            chat_id BIGINT NOT NULL,
+            base_word TEXT NOT NULL,
+            started_by BIGINT,
+            started_at TEXT,
+            expires_at TEXT,
+            status TEXT NOT NULL DEFAULT 'active',
+            words_paid INTEGER DEFAULT 0,
+            ended_at TEXT
+        )
+        """)
+        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_anagram_active ON anagram_rounds (chat_id) WHERE status = 'active'")
+        cursor.execute("""
         CREATE TABLE IF NOT EXISTS scramble_auto_release (
             chat_id BIGINT PRIMARY KEY,
             released_at TEXT
@@ -4572,6 +4586,79 @@ def set_scramble_slowmode(chat_id, interval_seconds, enabled: bool):
                 "INSERT INTO scramble_auto_release (chat_id, released_at) VALUES (%s, %s) ON CONFLICT DO NOTHING",
                 (chat_id, datetime.now().isoformat()),
             )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def anagram_round_start(chat_id, base_word, started_by, started_at, expires_at):
+    """Records a new Anagram round. Returns its id, or None when this chat already has a live round
+    (the unique index makes that true even across two bot instances). A round that is long overdue
+    (crash / restart) is closed first."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE anagram_rounds SET status='interrupted', ended_at=%s "
+            "WHERE chat_id=%s AND status='active' AND expires_at < %s", (started_at, chat_id, started_at))
+        cursor.execute(
+            "INSERT INTO anagram_rounds (chat_id, base_word, started_by, started_at, expires_at, status) "
+            "VALUES (%s, %s, %s, %s, %s, 'active') ON CONFLICT (chat_id) WHERE status='active' DO NOTHING "
+            "RETURNING id", (chat_id, base_word, started_by, started_at, expires_at))
+        row = cursor.fetchone()
+        conn.commit()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def anagram_round_finish(round_id, status, words_paid=0):
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE anagram_rounds SET status=%s, words_paid=%s, ended_at=%s WHERE id=%s AND status='active'",
+            (status, words_paid, datetime.now().isoformat(), round_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def anagram_interrupt_active(started_before):
+    """At startup: closes every round still marked active (exactly once - one atomic UPDATE) and returns
+    [(chat_id, base_word)] so the groups can be told politely."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE anagram_rounds SET status='interrupted', ended_at=%s "
+            "WHERE status='active' AND started_at < %s RETURNING chat_id, base_word",
+            (datetime.now().isoformat(), started_before))
+        rows = cursor.fetchall()
+        conn.commit()
+        return rows
+    finally:
+        conn.close()
+
+
+def anagram_credit(user_id, chat_id, name, amount):
+    """Pays one Anagram word to the Word Scramble balance, counted ONCE: the global figure and the
+    'in this chat' figure each go up by exactly `amount`. It is not a Word Scramble win, so wins stay as they are."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO scramble_chat_stats (user_id, chat_id, name, wins, earned, current_streak, best_streak)
+            VALUES (%s, %s, %s, 0, %s, 0, 0)
+            ON CONFLICT (user_id, chat_id) DO UPDATE SET
+                name = EXCLUDED.name, earned = scramble_chat_stats.earned + %s
+        """, (user_id, chat_id, name, amount, amount))
+        cursor.execute("""
+            INSERT INTO scramble_global_stats (user_id, name, wins, earned)
+            VALUES (%s, %s, 0, %s)
+            ON CONFLICT (user_id) DO UPDATE SET
+                name = EXCLUDED.name, earned = scramble_global_stats.earned + %s
+        """, (user_id, name, amount, amount))
         conn.commit()
     finally:
         conn.close()
