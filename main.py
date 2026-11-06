@@ -7255,7 +7255,7 @@ OWNER_ONLY_COMMANDS = frozenset({
     "scramblemode", "scramblereloadwords", "scramblesetreward", "scramblestats", "scramblestopallgroups",
     "scrambletopup", "scrambletopupspecific", "scrambleusers", "seepremiumplayers", "sendgroupmessage",
     "setdollarpack", "setpremium", "setreward", "setsupport", "share", "shufflewords", "sponsoredad",
-    "starbalance", "stats", "stopelimination", "auditbalances", "repairbalances", "supportstats", "topup", "users", "withdraw",
+    "starbalance", "stats", "stopelimination", "auditbalances", "repairbalances", "stopallactivities", "supportstats", "topup", "users", "withdraw",
 })
 
 
@@ -7856,7 +7856,7 @@ async def stoptournament_command(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def _tournament_abort_and_announce(context, tid, chat_id, headline, delete=False,
-                                         dm_players=False, group_title=None):
+                                         dm_players=False, group_title=None, announce=True):
     """Refund everyone still staked, finalize (or delete) the tournament, and
     tell the chat. Idempotent - returns None if there was nothing open."""
     res = await asyncio.to_thread(db.tournament_abort, tid, delete)
@@ -7870,7 +7870,8 @@ async def _tournament_abort_and_announce(context, tid, chat_id, headline, delete
     else:
         text = f"❌ {headline}\n\nNobody had joined yet, so there was nothing to refund."
     try:
-        await safe_send(context.bot, chat_id, text=text)
+        if announce:
+            await safe_send(context.bot, chat_id, text=text)
     except Exception as e:
         logger.info(f"tournament abort notice to {chat_id} not delivered: {e}")
 
@@ -9269,7 +9270,7 @@ async def _elim_finish(context, eid):
         logger.exception(f"elimination {eid}: winner announcement failed (the prize was already paid)")
 
 
-async def _elim_cancel_and_announce(context, eid, headline):
+async def _elim_cancel_and_announce(context, eid, headline, announce=True):
     """Refund everyone, finalize and tell the chat. Idempotent."""
     _elim_cancel_jobs(context.job_queue, eid)
     res = await asyncio.to_thread(db.elim_cancel, eid)
@@ -9282,7 +9283,8 @@ async def _elim_cancel_and_announce(context, eid, headline):
     else:
         text = f"❌ {headline}\n\nNobody had joined yet, so there was nothing to refund."
     try:
-        await safe_send(context.bot, res["chat_id"], text=text)
+        if announce:
+            await safe_send(context.bot, res["chat_id"], text=text)
     except Exception as ex:
         logger.info(f"elimination cancel notice to {res['chat_id']} not delivered: {ex}")
     return res
@@ -10035,7 +10037,7 @@ async def _hack_process_guess(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
 
 
-async def _hack_cancel_and_announce(context, hid, headline, keep_host_fee=False):
+async def _hack_cancel_and_announce(context, hid, headline, keep_host_fee=False, announce=True):
     """Refund (everyone, or everyone but the host), finalize and tell the
     chat. Idempotent."""
     _hack_cancel_jobs(context.job_queue, hid)
@@ -10053,7 +10055,8 @@ async def _hack_cancel_and_announce(context, hid, headline, keep_host_fee=False)
     if res["kept"]:
         lines.append("The host's own entry fee stays with the bot.")
     try:
-        await safe_send(context.bot, res["chat_id"], text="\n".join(lines))
+        if announce:
+            await safe_send(context.bot, res["chat_id"], text="\n".join(lines))
     except Exception as ex:
         logger.info(f"hack cancel notice to {res['chat_id']} not delivered: {ex}")
     return res
@@ -13641,6 +13644,295 @@ def schedule_premium_reminder_job(job_queue):
     )
 
 
+# ---------------------------- /richest ----------------------------
+def format_richest(rows, position_info=None, requester_name=None):
+    text = "💎 <b>Richest Players</b>\n\n"
+    if not rows:
+        text += "No scores yet.\n"
+    else:
+        for i, (name, coins) in enumerate(rows, start=1):
+            prefix = MEDALS.get(i, f"{i}.")
+            text += f"{prefix} {truncate_name(name)}\t{DOLLAR}{fmt_coins(coins)}\n"
+    if position_info:
+        pos, name, coins = position_info
+        text += f"\n  Your Position\n{pos}. {truncate_name(requester_name or name)} {DOLLAR}{fmt_coins(coins)}\n"
+    text += ad_footer_html()
+    return text
+
+
+def richest_keyboard():
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("📍 In This Chat", callback_data="rich_chat"),
+        InlineKeyboardButton("🌍 Global", callback_data="rich_global"),
+    ]])
+
+
+async def _richest_text(scope, chat_id, user):
+    """Top 10 by the whole balance (Word Game + Word Scramble, same as /bal): one query for the board
+    and one for the player's own position."""
+    if scope == "chat":
+        rows = await asyncio.to_thread(db.get_chat_leaderboard, chat_id, 10)
+        pos = await asyncio.to_thread(db.get_chat_position, chat_id, user.id)
+    else:
+        rows = await asyncio.to_thread(db.get_combined_global_leaderboard, 10)
+        pos = await asyncio.to_thread(db.get_combined_global_position, user.id)
+    return format_richest(rows, pos, user.first_name)
+
+
+async def richest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    text = await _richest_text("global", None, user)
+    await update.message.reply_html(
+        text, reply_markup=richest_keyboard(), link_preview_options=LinkPreviewOptions(is_disabled=True),
+    )
+
+
+async def richest_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+    chat = query.message.chat if query.message else None
+    await query.answer()
+    if query.data == "rich_chat":
+        if chat is None or chat.type == ChatType.PRIVATE:
+            await query.edit_message_text(
+                "📍 'In This Chat' isn't available in a private chat with me - try /richest inside a group instead.",
+                reply_markup=richest_keyboard(),
+            )
+            return
+        text = await _richest_text("chat", chat.id, user)
+    else:
+        text = await _richest_text("global", None, user)
+    try:
+        await query.edit_message_text(
+            text, parse_mode="HTML", reply_markup=richest_keyboard(),
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+        )
+    except BadRequest:
+        pass   # same text tapped again: Telegram says "message is not modified"
+
+
+# ---------------------------- /stopallactivities ----------------------------
+STOPALL_CONFIRM_SECONDS = 60
+_pending_stopall = {}   # token -> deadline (in memory: it expires in 60 s anyway)
+_stopall_running = False
+_STOPALL_HOOKS = []     # later games register an async callable(context) -> {chat_id: "what was stopped"}
+
+
+def register_stopall_hook(fn):
+    _STOPALL_HOOKS.append(fn)
+
+
+@owner_only
+async def stopallactivities_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    now = asyncio.get_running_loop().time()
+    for t in [t for t, d in _pending_stopall.items() if d < now]:
+        _pending_stopall.pop(t, None)
+    token = os.urandom(4).hex()
+    _pending_stopall[token] = now + STOPALL_CONFIRM_SECONDS
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Yes, stop everything", callback_data=f"sa:y:{token}"),
+        InlineKeyboardButton("❌ No", callback_data=f"sa:n:{token}"),
+    ]])
+    await update.message.reply_text(
+        "🛑 Stop EVERYTHING in EVERY group?\n\n"
+        "Word Scramble (normal, Slow and Automatic Mode), Word Game, tournaments, eliminations, hacks, "
+        "jackpot games and the other games. Every fee is refunded. This asks again for nothing - tap Yes within 60 seconds.",
+        reply_markup=keyboard,
+    )
+
+
+async def stopall_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global _stopall_running
+    query = update.callback_query
+    user = query.from_user
+    try:
+        _p, action, token = query.data.split(":")
+    except ValueError:
+        await query.answer()
+        return
+    if not is_owner(user.id):
+        await query.answer("Only the bot owner can use these buttons.", show_alert=True)
+        return
+    deadline = _pending_stopall.pop(token, None)   # claim BEFORE any await: a double tap can never run twice
+    if deadline is None or asyncio.get_running_loop().time() > deadline:
+        await query.answer("⌛ Expired - run /stopallactivities again.", show_alert=True)
+        try:
+            await query.edit_message_text("⌛ Confirmation expired - nothing was stopped.")
+        except Exception:
+            pass
+        return
+    if action == "n":
+        await query.answer("Cancelled.")
+        try:
+            await query.edit_message_text("❌ Cancelled - nothing was stopped.")
+        except Exception:
+            pass
+        return
+    if _stopall_running:
+        await query.answer("Already running.", show_alert=True)
+        return
+    await query.answer("Stopping everything...")
+    try:
+        await query.edit_message_text("⏳ Stopping everything - this can take a little while...")
+    except Exception:
+        pass
+    _stopall_running = True
+    try:
+        summary = await _stop_all_activities(context)
+    except Exception as e:
+        logger.error(f"stopallactivities failed: {e}", exc_info=True)
+        summary = "❌ /stopallactivities hit an unexpected error. Check the logs and run it again (it is safe to run twice)."
+    finally:
+        _stopall_running = False
+    try:
+        await query.edit_message_text(summary, parse_mode="HTML")
+    except Exception:
+        try:
+            await context.bot.send_message(chat_id=user.id, text=summary, parse_mode="HTML")
+        except Exception:
+            pass
+
+
+async def _stop_all_activities(context) -> str:
+    """Force-stops everything in every group. Each step has its own try/except so one failure never blocks
+    the rest; safe to run twice. Returns the HTML summary for the owner."""
+    jq = context.job_queue
+    affected = {}      # chat_id -> [short phrases]
+    counts = defaultdict(int)
+    failures = []
+
+    def note(chat_id, phrase):
+        affected.setdefault(chat_id, []).append(phrase)
+
+    async def step(label, coro):
+        try:
+            return await coro
+        except Exception as e:
+            logger.error(f"stopall step '{label}' failed: {e}", exc_info=True)
+            failures.append(label)
+            return None
+
+    # 1) Word Scramble (normal / Slow / Automatic) - first, so no new round can start while the rest is stopped
+    async def _scramble():
+        info = await asyncio.to_thread(db.stopall_clear_scramble_state)
+        for chat_id, i in info.items():
+            cancel_scramble_timeout(context, chat_id)
+            cancel_slowmode_next_job(jq, chat_id)
+            if i["word"]:
+                counts["scramble rounds"] += 1
+                note(chat_id, f"Word Scramble round (the word was {esc(i['word'])})")
+            if i["slow"]:
+                counts["slow mode"] += 1
+                note(chat_id, "Slow Mode switched off")
+            if i["auto"]:
+                counts["automatic mode"] += 1
+                note(chat_id, "Automatic Mode switched off")
+    await step("Word Scramble", _scramble())
+
+    # 2) Word Game
+    async def _wordgame():
+        for chat_id in await asyncio.to_thread(db.stopall_clear_word_games):
+            cancel_explain_timeout(context, chat_id)
+            counts["word games"] += 1
+            note(chat_id, "Word Game round")
+    await step("Word Game", _wordgame())
+
+    # 3) Tournaments (lobby, active AND paused) - everyone is refunded
+    async def _tournaments():
+        for t in await asyncio.to_thread(db.tournament_get_all_open):
+            try:
+                res = await _tournament_abort_and_announce(context, t["id"], t["chat_id"], "", announce=False)
+            except Exception as e:
+                logger.error(f"stopall: tournament {t['id']} failed: {e}", exc_info=True)
+                failures.append(f"tournament {t['id']}")
+                continue
+            if res:
+                counts["tournaments"] += 1
+                counts["refunds"] += len(res["refunds"])
+                note(t["chat_id"], f"Tournament (fees refunded)")
+    await step("tournaments", _tournaments())
+
+    # 4) Eliminations
+    async def _elims():
+        for e in await asyncio.to_thread(db.elim_get_all_open):
+            try:
+                res = await _elim_cancel_and_announce(context, e["id"], "", announce=False)
+            except Exception as ex:
+                logger.error(f"stopall: elimination {e['id']} failed: {ex}", exc_info=True)
+                failures.append(f"elimination {e['id']}")
+                continue
+            if res:
+                counts["eliminations"] += 1
+                counts["refunds"] += len(res["refunds"])
+                note(e["chat_id"], "Elimination (fees refunded)")
+    await step("eliminations", _elims())
+
+    # 5) Hacks (the host is refunded too)
+    async def _hacks():
+        for h in await asyncio.to_thread(db.hack_get_all_open):
+            try:
+                res = await _hack_cancel_and_announce(context, h["id"], "", keep_host_fee=False, announce=False)
+            except Exception as ex:
+                logger.error(f"stopall: hack {h['id']} failed: {ex}", exc_info=True)
+                failures.append(f"hack {h['id']}")
+                continue
+            if res:
+                counts["hacks"] += 1
+                counts["refunds"] += len(res["refunds"])
+                note(h["chat_id"], "Hack (fees refunded)")
+    await step("hacks", _hacks())
+
+    # 6) Jackpot games: fee refunded AND the daily try given back
+    async def _jackpots():
+        for g in await asyncio.to_thread(db.jackpot_get_active):
+            try:
+                res = await asyncio.to_thread(db.jackpot_cancel, g["id"])
+            except Exception as ex:
+                logger.error(f"stopall: jackpot {g['id']} failed: {ex}", exc_info=True)
+                failures.append(f"jackpot {g['id']}")
+                continue
+            _jackpot_forget(jq, g["id"])
+            if res:
+                counts["jackpot games"] += 1
+                counts["refunds"] += 1
+                note(res["chat_id"], "Jackpot game (fee refunded, try given back)")
+    await step("jackpot", _jackpots())
+
+    # 7) Games added later register themselves here
+    for hook in list(_STOPALL_HOOKS):
+        async def _hook(h=hook):
+            result = await h(context) or {}
+            for chat_id, phrase in result.items():
+                counts["other games"] += 1
+                note(chat_id, phrase)
+        await step(getattr(hook, "__name__", "game hook"), _hook())
+
+    # 8) In-memory state
+    _ELIM_CHATS.clear()
+    _JACKPOT_ACTIVE.clear()
+
+    # 9) ONE short message per affected group
+    sent = 0
+    for chat_id, phrases in affected.items():
+        text = "🛑 The bot owner stopped everything here: " + "; ".join(dict.fromkeys(phrases)) + "."
+        try:
+            await safe_send(context.bot, chat_id, text=text, parse_mode="HTML")
+            sent += 1
+        except Exception as ex:
+            logger.info(f"stopall notice to {chat_id} not delivered: {ex}")
+        await asyncio.sleep(0.1)
+
+    lines = ["🛑 <b>Everything stopped</b>", ""]
+    if counts:
+        lines += [f"• {k}: {v}" for k, v in counts.items()]
+    else:
+        lines.append("Nothing was running anywhere.")
+    lines += ["", f"Groups notified: {sent} of {len(affected)}"]
+    if failures:
+        lines += ["", "⚠️ Steps that failed (run the command again): " + esc(", ".join(failures))]
+    return "\n".join(lines)
+
+
 # ---------------------------- /auditbalances, /repairbalances ----------------------------
 _pending_repairs = {}  # token -> deadline (in memory: the buttons expire in 2 minutes anyway)
 REPAIR_CONFIRM_SECONDS = 120
@@ -13973,6 +14265,8 @@ def main():
     app.add_handler(CommandHandler("transfer", transfer_command))
     app.add_handler(CommandHandler("auditbalances", auditbalances_command))
     app.add_handler(CommandHandler("repairbalances", repairbalances_command))
+    app.add_handler(CommandHandler("richest", richest_command))
+    app.add_handler(CommandHandler("stopallactivities", stopallactivities_command))
     app.add_handler(CommandHandler("request", request_command))
     app.add_handler(CommandHandler("deleterequestprompt", deleterequestprompt_command))
     app.add_handler(CommandHandler("searchcommand", searchcommand_command))
@@ -13999,6 +14293,8 @@ def main():
     app.add_handler(CommandHandler("profile", profile_command))
     app.add_handler(CommandHandler("inviteandearn", inviteandearn_command))
 
+    app.add_handler(CallbackQueryHandler(richest_button, pattern=r"^rich_(chat|global)$"))
+    app.add_handler(CallbackQueryHandler(stopall_button, pattern=r"^sa:[yn]:[0-9a-f]+$"))
     app.add_handler(CallbackQueryHandler(repair_button, pattern=r"^rb:[yn]:[0-9a-f]+$"))
     app.add_handler(CallbackQueryHandler(button))
 

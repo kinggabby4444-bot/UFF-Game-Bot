@@ -6653,6 +6653,99 @@ def jackpot_get_active_for_user(user_id):
         conn.close()
 
 
+def stopall_clear_scramble_state():
+    """/stopallactivities: in ONE transaction end every Word Scramble round, turn Slow Mode off and turn
+    Automatic Mode off everywhere. Returns {chat_id: {"word": str|None, "slow": bool, "auto": bool}} for every
+    chat where something was running."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        out = {}
+
+        def info(chat_id):
+            return out.setdefault(chat_id, {"word": None, "slow": False, "auto": False})
+
+        cursor.execute("DELETE FROM scramble_games RETURNING chat_id, word, round_active")
+        for chat_id, word, active in cursor.fetchall():
+            if active:
+                info(chat_id)["word"] = word
+        cursor.execute("UPDATE scramble_slowmode SET enabled=0, next_round_due_at=NULL WHERE enabled=1 RETURNING chat_id")
+        for (chat_id,) in cursor.fetchall():
+            info(chat_id)["slow"] = True
+        cursor.execute("UPDATE scramble_slowmode SET next_round_due_at=NULL WHERE next_round_due_at IS NOT NULL")
+        cursor.execute(
+            "UPDATE scramble_auto_mode SET auto_enabled=0, manual_streak=0, miss_streak=0 "
+            "WHERE auto_enabled=1 RETURNING chat_id"
+        )
+        for (chat_id,) in cursor.fetchall():
+            info(chat_id)["auto"] = True
+        conn.commit()
+        return out
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+
+
+def stopall_clear_word_games():
+    """/stopallactivities: ends every Word Game round that has a leader. Returns the chat ids."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE word_games
+            SET leader_id=NULL, leader_name=NULL, secret_word=NULL, game_active=0, explaining_started=0,
+                leader_message_id=NULL
+            WHERE leader_id IS NOT NULL
+            RETURNING chat_id
+        """)
+        chats = [r[0] for r in cursor.fetchall()]
+        if chats:
+            cursor.execute("DELETE FROM stop_votes WHERE chat_id = ANY(%s)", (chats,))
+        conn.commit()
+        return chats
+    finally:
+        conn.close()
+
+
+def jackpot_cancel(game_id):
+    """Cancels ONE active Jackpot game exactly once: the fee goes back to where it came from and the
+    player's try for that UTC day is given back, all in one transaction (status 'cancelled').
+    Returns {chat_id, user_id, user_name, fee} or None if the game was not active any more."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT chat_id, user_id, user_name, fee, source, created_at, status "
+            "FROM jackpot_games WHERE id=%s FOR UPDATE", (game_id,))
+        row = cursor.fetchone()
+        if not row or row[6] != "active":
+            conn.rollback()
+            return None
+        chat_id, user_id, name, fee, source, created_at, _st = row
+        _tx_lock_balances(cursor, [user_id])
+        _tx_credit_source(cursor, user_id, name, fee, source)
+        cursor.execute(
+            "UPDATE jackpot_daily SET plays = GREATEST(COALESCE(plays, 1) - 1, 0) "
+            "WHERE user_id=%s AND play_date=%s", (user_id, str(created_at)[:10]))
+        cursor.execute("UPDATE jackpot_games SET status='cancelled', settled_at=%s WHERE id=%s",
+                       (datetime.now().isoformat(), game_id))
+        conn.commit()
+        return {"chat_id": chat_id, "user_id": user_id, "user_name": name, "fee": fee}
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+
+
 def jackpot_get_active():
     """Every unsettled game (used once at startup to restore timers)."""
     conn = connect()
