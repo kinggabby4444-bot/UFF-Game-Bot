@@ -1159,6 +1159,8 @@ async def scramble_send_retry_callback(context: ContextTypes.DEFAULT_TYPE):
     else:
         if await asyncio.to_thread(db.get_config, "scramble_mode_enabled", "0") != "1":
             return
+    if await asyncio.to_thread(db.scramble_auto_blocked, chat_id):
+        return
 
     def _again():
         if attempt >= SCRAMBLE_SEND_RETRY_MAX_ATTEMPTS:
@@ -2123,12 +2125,14 @@ def cancel_slowmode_next_job(job_queue, chat_id):
 async def schedule_slowmode_next_round(job_queue, chat_id, interval_seconds):
     if job_queue is None:
         return
+    gen = await asyncio.to_thread(db.scramble_get_gen, chat_id)
     cancel_slowmode_next_job(job_queue, chat_id)
     job_queue.run_once(
         slowmode_next_round_callback,
         interval_seconds,
         chat_id=chat_id,
         name=_slowmode_next_job_name(chat_id),
+        data={"gen": gen},
     )
     due_at = (datetime.now() + timedelta(seconds=interval_seconds)).isoformat()
     await asyncio.to_thread(db.scramble_set_next_round_due, chat_id, due_at)
@@ -2140,6 +2144,10 @@ async def slowmode_next_round_callback(context: ContextTypes.DEFAULT_TYPE):
     slow = await asyncio.to_thread(db.get_scramble_slowmode, chat_id)
     if not slow or not slow[1]:
         return
+
+    job_gen = (context.job.data or {}).get("gen")
+    if job_gen is not None and job_gen != await asyncio.to_thread(db.scramble_get_gen, chat_id):
+        return   # a timer from before a stop / Slow Mode switch: the newer chain owns this chat
 
     interval_seconds = slow[0]
 
@@ -2285,8 +2293,12 @@ def schedule_scramblemode_job(job_queue, interval_seconds):
 
 
 async def scramblemode_tick_callback(context: ContextTypes.DEFAULT_TYPE):
+    if await asyncio.to_thread(db.get_config, "scramble_mode_enabled", "0") != "1":
+        return   # switched off (a stray timer must never start rounds)
     groups = await asyncio.to_thread(db.get_current_groups)
     for chat_id, title in groups:
+        if await asyncio.to_thread(db.scramble_auto_blocked, chat_id):
+            continue
         fake_chat = SimpleNamespace(id=chat_id, type=ChatType.GROUP, title=title)
         try:
             result = await start_scramble_round(context, fake_chat)
@@ -2331,6 +2343,7 @@ async def scramblemode_command(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     await asyncio.to_thread(db.set_config, "scramble_mode_enabled", "1")
+    await asyncio.to_thread(db.scramble_unhalt_all)
     await asyncio.to_thread(db.set_config, "scramble_mode_interval_seconds", str(seconds))
     schedule_scramblemode_job(context.job_queue, seconds)
     await update.message.reply_text(

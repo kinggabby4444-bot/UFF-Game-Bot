@@ -485,6 +485,13 @@ def create_tables():
         """)
 
         cursor.execute("ALTER TABLE scramble_slowmode ADD COLUMN IF NOT EXISTS next_round_due_at TEXT")
+        cursor.execute("ALTER TABLE scramble_slowmode ADD COLUMN IF NOT EXISTS gen INTEGER DEFAULT 0")
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS scramble_auto_release (
+            chat_id BIGINT PRIMARY KEY,
+            released_at TEXT
+        )
+        """)
 
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS scramble_auto_mode (
@@ -4553,11 +4560,61 @@ def set_scramble_slowmode(chat_id, interval_seconds, enabled: bool):
     try:
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT INTO scramble_slowmode (chat_id, interval_seconds, enabled)
-            VALUES (%s, %s, %s)
+            INSERT INTO scramble_slowmode (chat_id, interval_seconds, enabled, gen)
+            VALUES (%s, %s, %s, 1)
             ON CONFLICT (chat_id) DO UPDATE SET
-                interval_seconds=EXCLUDED.interval_seconds, enabled=EXCLUDED.enabled
+                interval_seconds=EXCLUDED.interval_seconds, enabled=EXCLUDED.enabled,
+                gen=COALESCE(scramble_slowmode.gen, 0) + 1
         """, (chat_id, interval_seconds, 1 if enabled else 0))
+        if enabled:
+            # an admin switched Slow Mode on: this chat may get automatic rounds again after a full stop
+            cursor.execute(
+                "INSERT INTO scramble_auto_release (chat_id, released_at) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                (chat_id, datetime.now().isoformat()),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def scramble_get_gen(chat_id):
+    """Slow Mode 'generation' of a chat. It goes up every time Slow Mode is switched on/off or everything is
+    stopped, so a timer made before that moment can tell it is stale and must not start a round."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COALESCE(gen, 0) FROM scramble_slowmode WHERE chat_id=%s", (chat_id,))
+        row = cursor.fetchone()
+        return int(row[0]) if row else 0
+    finally:
+        conn.close()
+
+
+def scramble_auto_blocked(chat_id):
+    """True while /stopallactivities has halted automatic Word Scramble rounds and no admin has switched
+    Slow / Automatic Mode on again in this chat. Manual /wordscramble is never blocked by this."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM bot_config WHERE key='scramble_auto_halt'")
+        row = cursor.fetchone()
+        if not row or row[0] != "1":
+            return False
+        cursor.execute("SELECT 1 FROM scramble_auto_release WHERE chat_id=%s", (chat_id,))
+        return cursor.fetchone() is None
+    finally:
+        conn.close()
+
+
+def scramble_unhalt_all():
+    """The owner switched the global Scramble Mode on again: automatic rounds are allowed again."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO bot_config (key, value) VALUES ('scramble_auto_halt', '0') "
+            "ON CONFLICT (key) DO UPDATE SET value='0'"
+        )
         conn.commit()
     finally:
         conn.close()
@@ -4989,6 +5046,12 @@ def scramble_set_auto_enabled(chat_id, enabled: bool):
             VALUES (%s, 0, %s, 0)
             ON CONFLICT (chat_id) DO UPDATE SET auto_enabled=%s, manual_streak=0, miss_streak=0
         """, (chat_id, 1 if enabled else 0, 1 if enabled else 0))
+        if enabled:
+            # an admin switched Automatic Mode on: this chat may get automatic rounds again after a full stop
+            cursor.execute(
+                "INSERT INTO scramble_auto_release (chat_id, released_at) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                (chat_id, datetime.now().isoformat()),
+            )
         conn.commit()
     finally:
         conn.close()
@@ -6678,6 +6741,14 @@ def stopall_clear_scramble_state():
             info(chat_id)["slow"] = True
             info(chat_id)["slow_seconds"] = seconds
         cursor.execute("UPDATE scramble_slowmode SET next_round_due_at=NULL WHERE next_round_due_at IS NOT NULL")
+        # every Slow Mode timer made before this moment is now stale; nothing automatic may start a round
+        # until an admin switches Slow / Automatic Mode on again (manual /wordscramble always works)
+        cursor.execute("UPDATE scramble_slowmode SET gen = COALESCE(gen, 0) + 1")
+        cursor.execute("DELETE FROM scramble_auto_release")
+        cursor.execute(
+            "INSERT INTO bot_config (key, value) VALUES ('scramble_auto_halt', '1') "
+            "ON CONFLICT (key) DO UPDATE SET value='1'"
+        )
         cursor.execute(
             "UPDATE scramble_auto_mode SET auto_enabled=0, manual_streak=0, miss_streak=0 "
             "WHERE auto_enabled=1 RETURNING chat_id"
