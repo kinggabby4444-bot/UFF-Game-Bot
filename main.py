@@ -2028,7 +2028,7 @@ def _scrambleallcommands_text() -> str:
 /join - join the Tournament, Elimination or Hack lobby that's open in this group (the host is NOT joined automatically - they use /join too; the fee comes from your combined balance: Word Scramble money first, then Word Game money for the rest; if the total is too low nothing is taken)
 /daily - claim today's daily reward (works only in my DM; premium members get 💵100, everyone else 💵10)
 /getcash - same as /buycash: premium only, buy 💵 cash with Telegram Stars
-/playgame - groups only: pick Normal Mode, Slow Mode, 🎰 Jackpot, Tournament, Elimination or Hack and start it with one tap (Automatic Mode is still available through /scrambleautomaticmode)
+/playgame - groups only: pick Normal Mode, 🔀 Anagram, 🎰 Jackpot, Tournament, Elimination or Hack and start it with one tap (Slow Mode and Automatic Mode are still available through /slowmode and /scrambleautomaticmode)
 /jackpot - groups only: 🎰 Jackpot - pay the entry fee and guess the secret number within 2 minutes to win the prize; one try per day across all groups, or up to 10 tries per day for Premium (also /l, /luckyspin, /spin, /tryyourluck, /lottery, /luckynumber)
 /elimination - quick-start an Elimination: same as /setelimination 10 easy 60s (the host is not joined automatically - use /join)
 /setelimination &lt;fee&gt; &lt;difficulty&gt; &lt;countdown&gt;s - start an Elimination lobby (e.g. /setelimination 100 easy 20s); fee 10 or more; players take turns, the timer halves every cycle, the last player standing wins the whole prize
@@ -2045,7 +2045,7 @@ def _scrambleallcommands_text() -> str:
 /richest - the richest players ranked by combined balance (Word Game + Word Scramble money), with a Global / This chat switch
 /mysterybox - groups only: open a 🎁 Mystery Box for 2 minutes (one box per group); everyone can /open it once
 /open - open the Mystery Box in this group: costs 💵100 and wins 💵1,000, 💵200, 💵50, 💵20 or 💵10; 3 opens a day for normal players, up to 10 for Premium (resets 00:00 UTC)
-/anagram - groups only: 🔀 Anagram - make as many real words as you can from the mixed-up letters within 3 minutes; every new word pays 💵 (just type the words)
+/anagram - groups only: 🔀 Anagram - make as many real words as you can from the mixed-up letters within 2 minutes (words of 5+ letters; 👍 = accepted and pays 💵, 👎 = not accepted; just type the words)
 /anagramwords - the Anagram words found so far
 /anagramscore - the Anagram scores so far
 /anagramhelp - how to play Anagram
@@ -2054,7 +2054,7 @@ def _scrambleallcommands_text() -> str:
 /mysupport - your own total support and number of contributions
 /bal - your total global balance (Word Game + Word Scramble); reply to someone's message with /bal to see theirs
 /balance - same as /bal
-/command - my DM only: browse the commands by category (Scramble, Hack, Elimination, Tournament, Word Game, Jackpot, More Games) with buttons
+/command - my DM only: browse the commands by category (Scramble, Hack, Elimination, Tournament, Word Game, Jackpot, Mystery Box, Anagram, Hidden Letter) with buttons
 /commands - same as /command
 /searchcommand &lt;text&gt; - search the command list by name or description (only shows commands you're allowed to see)
 /fullhelp - a complete, paged guide to the bot: games, tournaments, premium, cash and more
@@ -4947,7 +4947,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /hack &lt;fee&gt; &lt;digits&gt; - (groups) open a Hack lobby: players take turns cracking the hidden number, the winner takes all; just /hack = quick game (see /fullhelp)
 /hackx - (groups) quick Hack X: same, but everybody guesses at the same time; /sethackx &lt;fee&gt; &lt;digits&gt; to choose the fee and digits
 /mysterybox - (groups) 🎁 open a Mystery Box; everyone can /open it once (💵100 a try, up to 💵1,000 - 3 opens a day, Premium 10)
-/anagram - (groups) 🔀 make words from mixed-up letters in 3 minutes (see /anagramhelp)
+/anagram - (groups) 🔀 make words (5+ letters) from mixed-up letters in 2 minutes (see /anagramhelp)
 /hiddenletter - 🔠 a secret letter appears 3 times a day; guess it with /g K or just the letter (see /fullhelp)
 /richest - 💎 the richest players
 /gamedifficulty &lt;mode&gt; - (group admins) choose which word lengths this group's Word Game and Word Scramble use: easy, easy3-6, medium, hard, off (add x, e.g. easyx, for lowercase letters)
@@ -7171,7 +7171,7 @@ def _allcommands_text() -> str:
 /join - join the Tournament, Elimination or Hack lobby that's open in this group (the host is NOT joined automatically - they use /join too; the fee comes from your combined balance: Word Scramble money first, then Word Game money for the rest; if the total is too low nothing is taken)
 /daily - claim today's daily reward (works only in my DM; premium members get 💵100, everyone else 💵10)
 /getcash - same as /buycash: premium only, buy 💵 cash with Telegram Stars
-/playgame - groups only: pick Normal Mode, Slow Mode, 🎰 Jackpot, Tournament, Elimination or Hack and start it with one tap (Automatic Mode is still available through /scrambleautomaticmode)
+/playgame - groups only: pick Normal Mode, 🔀 Anagram, 🎰 Jackpot, Tournament, Elimination or Hack and start it with one tap (Slow Mode and Automatic Mode are still available through /slowmode and /scrambleautomaticmode)
 /jackpot - groups only: 🎰 Jackpot - pay the entry fee and guess the secret number within 2 minutes to win the prize; one try per day across all groups, or up to 10 tries per day for Premium (also /l, /luckyspin, /spin, /tryyourluck, /lottery, /luckynumber)
 /elimination - quick-start an Elimination: same as /setelimination 10 easy 60s (the host is not joined automatically - use /join)
 /setelimination &lt;fee&gt; &lt;difficulty&gt; &lt;countdown&gt;s - start an Elimination lobby (e.g. /setelimination 100 easy 20s); fee 10 or more; players take turns, the timer halves every cycle, the last player standing wins the whole prize
@@ -7188,7 +7188,7 @@ def _allcommands_text() -> str:
 /richest - the richest players ranked by combined balance (Word Game + Word Scramble money), with a Global / This chat switch
 /mysterybox - groups only: open a 🎁 Mystery Box for 2 minutes (one box per group); everyone can /open it once
 /open - open the Mystery Box in this group: costs 💵100 and wins 💵1,000, 💵200, 💵50, 💵20 or 💵10; 3 opens a day for normal players, up to 10 for Premium (resets 00:00 UTC)
-/anagram - groups only: 🔀 Anagram - make as many real words as you can from the mixed-up letters within 3 minutes; every new word pays 💵 (just type the words)
+/anagram - groups only: 🔀 Anagram - make as many real words as you can from the mixed-up letters within 2 minutes (words of 5+ letters; 👍 = accepted and pays 💵, 👎 = not accepted; just type the words)
 /anagramwords - the Anagram words found so far
 /anagramscore - the Anagram scores so far
 /anagramhelp - how to play Anagram
@@ -7197,7 +7197,7 @@ def _allcommands_text() -> str:
 /mysupport - your own total support and number of contributions
 /bal - your total global balance (Word Game + Word Scramble); reply to someone's message with /bal to see theirs
 /balance - same as /bal
-/command - my DM only: browse the commands by category (Scramble, Hack, Elimination, Tournament, Word Game, Jackpot, More Games) with buttons
+/command - my DM only: browse the commands by category (Scramble, Hack, Elimination, Tournament, Word Game, Jackpot, Mystery Box, Anagram, Hidden Letter) with buttons
 /commands - same as /command
 /searchcommand &lt;text&gt; - search the command list by name or description (only shows commands you're allowed to see)
 /fullhelp - a complete, paged guide to the bot: games, tournaments, premium, cash and more
@@ -10756,9 +10756,9 @@ PLAYGAME_BUTTON_LABELS = {
     "tour": "🏟️ Tournament",
     "elim": "🔥 Elimination",
     "hack": "💻 Hack",
-    "anagram": "🔀 Anagram",   # available in /editplaygamebutton, hidden by default
+    "anagram": "🔀 Anagram",   # shown by default (replaced Slow Mode); Slow Mode stays available in /editplaygamebutton
 }
-PLAYGAME_DEFAULT_ORDER = ("normal", "slow", "jackpot", "tour", "elim", "hack")
+PLAYGAME_DEFAULT_ORDER = ("normal", "anagram", "jackpot", "tour", "elim", "hack")
 PLAYGAME_BUTTONS_CONFIG_KEY = "playgame_buttons"
 _PLAYGAME_ALIASES = {
     "normal": "normal", "normalmode": "normal",
@@ -12909,7 +12909,7 @@ def _fullhelp_tournament_page() -> str:
         f"Fee {TOURNAMENT_MIN_FEE:,}-{TOURNAMENT_MAX_FEE:,}, rounds {TOURNAMENT_MIN_ROUNDS}-{TOURNAMENT_MAX_ROUNDS}. "
         f"Difficulty: easy, easy3-easy6, medium, hard, off.\n"
         f"The host is NOT joined automatically and pays nothing until they /join like everyone else.\n\n"
-        f"🎮 Want a menu? /playgame (in a group) lets you start Normal Mode, Slow Mode, a 🎰 Jackpot, a Tournament, an Elimination or a Hack with one tap.\n\n"
+        f"🎮 Want a menu? /playgame (in a group) lets you start Normal Mode, an 🔀 Anagram, a 🎰 Jackpot, a Tournament, an Elimination or a Hack with one tap.\n\n"
         f"🚪 <b>Lobby</b>\n"
         f"Players send /join. The lobby stays open for {TOURNAMENT_LOBBY_SECONDS} seconds, then the tournament starts on its own. "
         f"The host (or a bot admin) can send /starttournament to start early. With fewer than 2 players it is cancelled and refunded.\n\n"
@@ -13066,8 +13066,8 @@ def _fullhelp_more_page() -> str:
         f"Not enough cash never costs you an open.\n"
         f"If the 2 minutes pass, the box opens by itself for the person who started it (if they hadn't opened it yet).\n\n"
         f"🔀 <b>Anagram</b> (groups)\n"
-        f"/anagram - I show a long word with its letters mixed up. For 3 minutes, type real English words (4+ letters) that use only those letters. "
-        f"Every new word pays {DOLLAR}{word_pay}; a word that was already found gets a 👎.\n"
+        f"/anagram - I show a long word with its letters mixed up. For 2 minutes, type real English words (5+ letters; shorter ones are ignored) that use only those letters. "
+        f"A word I accept gets a 👍 and pays {DOLLAR}{word_pay}; a word I don't accept, or one that was already found, gets a 👎.\n"
         f"/anagramwords - words found so far. /anagramscore - the scores so far. /anagramhelp - how to play. "
         f"/stopanagram - group admins or the owner end the game.\n\n"
         f"🔠 <b>Hidden Letter</b> (groups)\n"
@@ -13097,7 +13097,7 @@ def _fullhelp_other_page() -> str:
         f"💝 <b>Support the bot</b>\n"
         f"/support - support the bot with Telegram Stars (quick amounts or a custom one; no in-game advantage). "
         f"/supporters - top supporters. /mysupport - your own total.\n\n"
-        f"🎮 <b>Start a game fast</b> - /playgame (groups): Normal Mode, Slow Mode, 🎰 Jackpot, Tournament, Elimination or Hack.\n\n"
+        f"🎮 <b>Start a game fast</b> - /playgame (groups): Normal Mode, 🔀 Anagram, 🎰 Jackpot, Tournament, Elimination or Hack.\n\n"
         f"🏆 <b>Leaderboards</b>\n"
         f"/leaderboard (combined balance), /wordgameleaderboard (Word Game), /chattop, /globaltop, /topplayers, /topgroups - rankings\n"
         f"/scrambleleaderboard, /scrambletopplayers, /scrambletopgroups - Word Scramble rankings\n\n"
@@ -13213,7 +13213,7 @@ _COMMANDS_MENU = (
     ("sc", "Scramble commands", "🔤 Scramble commands",
      ("wordscramble", "scramblehelp", "scrambleleaderboard", "leaderboard", "scrambletopplayers", "scrambletopgroups",
       "ranks", "playgame", "bal", "balance", "scramblestopgame", "scrambleautomaticmode", "slowmode",
-      "deleterequestprompt", "gamedifficulty"), True),
+      "deleterequestprompt", "gamedifficulty", "richest", "endscramblesession"), True),
     ("hk", "Hack commands", "💻 Hack commands",
      ("hack", "hackx", "sethackx", "guess", "g", "join", "starthack", "stophack", "resumehack"), False),
     ("el", "Elimination commands", "🔥 Elimination commands",
@@ -13222,12 +13222,14 @@ _COMMANDS_MENU = (
      ("tournament", "settournament", "join"), False),
     ("jp", "Jackpot commands", "🎰 Jackpot commands",
      ("jackpot", "setjackpot", "setl", "editjackpot", "playgame"), False),
-    ("mg", "More games", "🎁 More games",
-     ("mysterybox", "open", "anagram", "anagramwords", "anagramscore", "stopanagram", "anagramhelp", "hiddenletter", "richest", "endscramblesession"), False),
+    ("mb", "Mystery Box", "🎁 Mystery Box commands", ("mysterybox", "open"), False),
+    ("an", "Anagram", "🔀 Anagram commands",
+     ("anagram", "anagramwords", "anagramscore", "anagramhelp", "stopanagram", "playgame"), False),
+    ("hl", "Hidden Letter", "🔠 Hidden Letter commands", ("hiddenletter", "guess", "g"), False),
     ("wg", "Word Game commands", "🎮 Word Game commands",
      ("start", "help", "wordgame", "hint", "stopvote", "stopgame", "autodelete", "leaderboard", "wordgameleaderboard", "chattop",
       "globaltop", "topplayers", "topgroups", "claimdailyreward", "settings", "autolead", "bal", "balance",
-      "gamedifficulty"), False),
+      "gamedifficulty", "richest"), False),
 )
 _COMMANDS_OWNER_ONLY_DESC = re.compile(r"\s*(owner only|owner/bot admins|bot admins only)", re.IGNORECASE)
 
@@ -13279,7 +13281,7 @@ def _commands_menu_keyboard(user_id, current=None):
         shown = f"• {c[1]}" if c[0] == current else c[1]
         return InlineKeyboardButton(shown, callback_data=f"cmd:{user_id}:{c[0]}")
     b = {c[0]: btn(c) for c in _COMMANDS_MENU}
-    return InlineKeyboardMarkup([[b["sc"], b["hk"]], [b["el"], b["to"]], [b["wg"], b["jp"]], [b["mg"]]])
+    return InlineKeyboardMarkup([[b["sc"], b["hk"]], [b["el"], b["to"]], [b["wg"], b["jp"]], [b["mb"], b["an"]], [b["hl"]]])
 
 
 def _split_text_parts(text, limit=3800):
@@ -14280,6 +14282,22 @@ def main():
     except Exception as e:
         print(f"GAME BOT: reward default reconciliation failed (will retry next start): {e}", flush=True)
 
+    # One-time: if the /playgame buttons were edited and saved, Anagram takes the place of Slow Mode there too.
+    try:
+        if db.get_config("migration_playgame_anagram_v1") is None:
+            _pg_raw = db.get_config(PLAYGAME_BUTTONS_CONFIG_KEY)
+            if _pg_raw:
+                _pg_keys = list(json.loads(_pg_raw))
+                if "slow" in _pg_keys:
+                    if "anagram" in _pg_keys:
+                        _pg_keys.remove("slow")
+                    else:
+                        _pg_keys[_pg_keys.index("slow")] = "anagram"
+                    db.set_config(PLAYGAME_BUTTONS_CONFIG_KEY, json.dumps(_pg_keys))
+            db.set_config("migration_playgame_anagram_v1", "done")
+    except Exception as e:
+        print(f"GAME BOT: /playgame Anagram migration failed (will retry next start): {e}", flush=True)
+
     # One-time: groups still on the old default Jackpot prize (fee x 10) move to the new default (fee x 5).
     try:
         _jp_changed = db.apply_jackpot_x5_migration()
@@ -14520,7 +14538,7 @@ def main():
     app.add_handler(CallbackQueryHandler(transfer_button, pattern=r"^tf:[yn]:[0-9a-f]+$"))
     app.add_handler(CallbackQueryHandler(request_button, pattern=r"^rq:[yn]:\d+$"))
     app.add_handler(CallbackQueryHandler(fullhelp_button, pattern=r"^fh:\d+:[gstpohjm]$"))
-    app.add_handler(CallbackQueryHandler(commands_menu_button, pattern=r"^cmd:\d+:(sc|hk|el|to|wg|jp|mg)$"))
+    app.add_handler(CallbackQueryHandler(commands_menu_button, pattern=r"^cmd:\d+:(sc|hk|el|to|wg|jp|mb|an|hl)$"))
     app.add_handler(CallbackQueryHandler(premium_players_page_button, pattern=r"^spp:\d+$"))
     app.add_handler(CommandHandler("profile", profile_command))
     app.add_handler(CommandHandler("inviteandearn", inviteandearn_command))

@@ -5,12 +5,12 @@ Put this file next to main.py. main.py loads it from main() inside a try/except,
 problem the rest of the bot keeps working exactly as before.
 
 How a round works
-  * /anagram shows a long word (8+ letters) shuffled in CAPITAL letters. The group has 3 minutes.
+  * /anagram shows a long word (8+ letters) shuffled in CAPITAL letters. The group has 2 minutes.
   * Anyone sends a plain word. It counts when it only uses the shown letters (each letter as many times as it
-    is shown), has 4+ letters, is a real English word, is not the shown word and was not found yet.
+    is shown), has 5+ letters, is a real English word, is not the shown word and was not found yet.
   * Every new word pays 💵 (default 1, /setanagramearnings) to the Word Scramble balance. The money is
-    credited FIRST, then the player gets a reply. A word that was already found gets a 👎 reaction.
-  * Everything else is ignored silently. One round per chat. Rounds do not run next to another game.
+    credited FIRST, then the word gets a 👍 reaction (no message). A word that is not accepted (not a real word,
+    letters not available, already found) gets a 👎 reaction. Anything under 5 letters is ignored silently. One round per chat. Rounds do not run next to another game.
 Hot path: while no round is running in a chat, a group message costs ONE dictionary lookup and no database call.
 """
 import asyncio
@@ -23,8 +23,8 @@ from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
-ROUND_SECONDS = 180
-MIN_WORD_LETTERS = 4
+ROUND_SECONDS = 120
+MIN_WORD_LETTERS = 5
 MIN_BASE_LETTERS = 8
 MAX_BASE_LETTERS = 12
 DEFAULT_REWARD = 1
@@ -189,19 +189,20 @@ async def on_text(update, context):
     if message is None or not message.text or user is None or getattr(user, "is_bot", False):
         return
     word = message.text.strip().lower()
-    if not (MIN_WORD_LETTERS <= len(word) <= len(rnd["base"])) or not _WORD_RE.fullmatch(word):
-        return
-    if word == rnd["base"] or (Counter(word) - rnd["letters"]):
-        return                                      # the shown word itself, or letters that are not available
-    if word in rnd["found"]:
-        await D.safe_react(context.bot, chat.id, message.message_id, "👎")
+    if len(word) < MIN_WORD_LETTERS or not _WORD_RE.fullmatch(word):
+        return                                      # shorter than 5 letters, or not one plain word: ignored
+    bot, mid = context.bot, message.message_id
+    if (len(word) > len(rnd["base"]) or word == rnd["base"] or (Counter(word) - rnd["letters"])
+            or word in rnd["found"]):
+        await D.safe_react(bot, chat.id, mid, "👎")     # letters not available, the shown word, or already found
         return
     if not await asyncio.to_thread(is_real_word, word):
+        await D.safe_react(bot, chat.id, mid, "👎")     # not an accepted English word
         return
     if ACTIVE.get(chat.id) is not rnd:
         return                                      # the round ended while we were checking
     if word in rnd["found"]:
-        await D.safe_react(context.bot, chat.id, message.message_id, "👎")
+        await D.safe_react(bot, chat.id, mid, "👎")
         return
     rnd["found"][word] = user.id                    # claimed before any await: two players can never both get it
     reward = rnd["reward"]
@@ -214,13 +215,7 @@ async def on_text(update, context):
     p = rnd["players"].setdefault(user.id, {"name": user.first_name or "Player", "words": [], "earned": 0})
     p["words"].append(word)
     p["earned"] += reward
-    try:                                            # the money is already in: announcing can fail without harm
-        await D.safe_send(
-            context.bot, chat.id, text=f"{_mention(user.id, p['name'])} +{D.DOLLAR}{D.fmt_coins(reward)}",
-            parse_mode="HTML", reply_parameters=_reply_params(message.message_id),
-        )
-    except Exception:
-        logger.info("anagram: reward announcement for %s not delivered", user.id)
+    await D.safe_react(bot, chat.id, mid, "👍")        # the money is already in; the only feedback is the 👍 (no "+1" message)
 
 
 # ---------------------------------------------------------------- commands
@@ -286,7 +281,7 @@ async def start_command(update, context):
             text=(f"🔀 <b>ANAGRAM</b> 🔀\n\n"
                   f"Make as many words as you can from these letters:\n\n"
                   f"<b>{_shuffle(base)}</b>\n\n"
-                  f"⏱ 3 minutes • 4+ letters • 💵{D.fmt_coins(reward)} per word\n"
+                  f"⏱ 2 minutes • 5+ letters • 💵{D.fmt_coins(reward)} per word\n"
                   f"Just type a word - no command needed."))
         if sent is None:
             raise RuntimeError("the start message was not delivered")
@@ -352,10 +347,10 @@ def help_text():
     return (
         "🔀 <b>Anagram - How to Play</b>\n\n"
         "1️⃣ Run /anagram - I show a long word with its letters mixed up.\n"
-        "2️⃣ Within 3 minutes, type as many real English words as you can using ONLY those letters "
+        "2️⃣ Within 2 minutes, type as many real English words as you can using ONLY those letters "
         "(each letter as many times as it is shown).\n"
-        "3️⃣ Words need 4+ letters. Each new word pays you 💵" + D.fmt_coins(get_reward()) + ". "
-        "A word someone already found gets a 👎.\n"
+        "3️⃣ Words need 5+ letters (shorter ones are ignored). A word I accept gets a 👍 and pays you 💵" + D.fmt_coins(get_reward()) + ". "
+        "A word I don't accept (or one that was already found) gets a 👎.\n"
         "4️⃣ At the end I show the word, the ranking and some words you missed.\n\n"
         "/anagramwords - words found so far\n"
         "/anagramscore - the scores so far\n"
