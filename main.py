@@ -2017,7 +2017,7 @@ def _scrambleallcommands_text() -> str:
 /profile - view your own profile (balance, level, rank)
 /buypremium - premium doubles your 💵 Word Scramble and Word Game rewards (paid with Telegram Stars; used in a group it moves you to my DM, and the invoice has a ➡️ Premium features button)
 /premiumstatus - see whether premium is active and how much time is left
-/premiumadvantage - see everything Premium gives you over a normal player (double rewards, up to 10 Jackpot tries a day instead of 1, bigger daily reward, buy cash, transfer, request, gift Premium)
+/premiumadvantage - see everything Premium gives you over a normal player (double rewards, up to 10 Jackpot tries a day instead of 1, 10 Mystery Box opens a day instead of 3, bigger daily reward, buy cash, transfer, request, gift Premium)
 /buycash - premium only: buy 💵 cash with Telegram Stars; it increases your balance, level and rank (pack sizes and prices are shown live; used in a group it moves you to my DM)
 /boostrank - premium only: same as /buycash - buy 💵 cash to boost your rank
 /boostlevel - premium only: same as /buycash - buy 💵 cash to boost your level
@@ -2042,12 +2042,19 @@ def _scrambleallcommands_text() -> str:
 /starthack - the host who opened the lobby or the bot owner: start the open Hack or Hack X right now instead of waiting for the 2-minute lobby
 /stophack - the host who opened the Hack or the bot owner: cancel the lobby or running Hack or Hack X; every other player is refunded (the host's own fee stays with the bot)
 /resumehack - host or bot owner only: continue a stuck Hack or Hack X from the exact place it stopped
+/richest - the richest players ranked by combined balance (Word Game + Word Scramble money), with a Global / This chat switch
+/mysterybox - groups only: open a 🎁 Mystery Box for 2 minutes (one box per group); everyone can /open it once
+/open - open the Mystery Box in this group: costs 💵100 and wins 💵1,000, 💵200, 💵50, 💵20 or 💵10; 3 opens a day for normal players, up to 10 for Premium (resets 00:00 UTC)
+/anagram - groups only: 🔀 Anagram - make as many real words as you can from the mixed-up letters within 3 minutes; every new word pays 💵 (just type the words)
+/anagramwords - the Anagram words found so far
+/anagramscore - the Anagram scores so far
+/anagramhelp - how to play Anagram
 /support - support the bot with Telegram Stars (quick amounts or a custom amount; gives no in-game advantage; used in a group it moves you to my DM)
 /supporters - the top supporters leaderboard
 /mysupport - your own total support and number of contributions
 /bal - your total global balance (Word Game + Word Scramble); reply to someone's message with /bal to see theirs
 /balance - same as /bal
-/command - my DM only: browse the commands by category (Scramble, Hack, Elimination, Tournament, Word Game) with buttons
+/command - my DM only: browse the commands by category (Scramble, Hack, Elimination, Tournament, Word Game, Jackpot, More Games) with buttons
 /commands - same as /command
 /searchcommand &lt;text&gt; - search the command list by name or description (only shows commands you're allowed to see)
 /fullhelp - a complete, paged guide to the bot: games, tournaments, premium, cash and more
@@ -2061,8 +2068,14 @@ def _scrambleallcommands_text() -> str:
 /deleterequestprompt off|on [&lt;1-9&gt;s|m] - group admins (or the owner) can control whether resolved /request prompts are deleted here and after how long (default on, 30 seconds; no args shows the current setting)
 /gamedifficulty easy|easy3-6|medium|hard|off - group admins (or the owner) can choose which word lengths get picked in this group (shared with Word Game); the owner can also add a group, or leave it out to apply to ALL groups at once (and new groups)
 /gamedifficulty easyx|easy3x-6x|mediumx|hardx|offx - same as the modes above, but the scrambled letters are shown in lowercase so the first letter isn't given away
+/stopanagram - group admins (or the owner) can end a running Anagram game
+/hiddenletter [on|off] - 🔠 Hidden Letter: 3 times a day I post a secret letter in active groups; guess it with /g K, /guess K or just type the letter (10 guesses per group, 1 per player, the winner gets 💵100). Anyone can see the status; the group creator (or the owner) can switch it on or off here. The owner can use it in my DM with a group ID, @username or allgroups
 
 <b>👑 Owner Commands</b>
+/stopallactivities - stop EVERYTHING in EVERY group (games, tournaments, eliminations, hacks, jackpots, anagrams, mystery boxes, hidden letter rounds) and refund the fees; Slow Mode, Automatic Mode and the global Scramble Mode stay off until turned on again (asks Yes/No first)
+/auditbalances - read-only check that no 'in this chat' balance is higher than the global one
+/repairbalances - shows the fixes /auditbalances found and applies them only after you tap Apply
+/setanagramearnings &lt;amount&gt; - set what each Anagram word pays
 /scramblestats - Word Scramble bot-wide statistics
 /scramblesetreward &lt;amount&gt; - set the win reward
 /setscrambleearnings &lt;amount&gt; - owner only: set the 💵 a player earns for winning a Word Scramble round (Premium players earn double; same as /scramblesetreward)
@@ -4929,6 +4942,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /jackpot - (groups) 🎰 guess the secret number, win the prize - one try a day (Premium: up to 10 a day) (also /l /spin /lottery /luckyspin /tryyourluck /luckynumber)
 /hack &lt;fee&gt; &lt;digits&gt; - (groups) open a Hack lobby: players take turns cracking the hidden number, the winner takes all; just /hack = quick game (see /fullhelp)
 /hackx - (groups) quick Hack X: same, but everybody guesses at the same time; /sethackx &lt;fee&gt; &lt;digits&gt; to choose the fee and digits
+/mysterybox - (groups) 🎁 open a Mystery Box; everyone can /open it once (💵100 a try, up to 💵1,000 - 3 opens a day, Premium 10)
+/anagram - (groups) 🔀 make words from mixed-up letters in 3 minutes (see /anagramhelp)
+/hiddenletter - 🔠 a secret letter appears 3 times a day; guess it with /g K or just the letter (see /fullhelp)
+/richest - 💎 the richest players
 /gamedifficulty &lt;mode&gt; - (group admins) choose which word lengths this group's Word Game and Word Scramble use: easy, easy3-6, medium, hard, off (add x, e.g. easyx, for lowercase letters)
 /daily - claim your daily reward (in my DM)
 /support - support the bot with Telegram Stars
@@ -7139,7 +7156,7 @@ def _allcommands_text() -> str:
 /claimdailyreward - claim today's daily reward (premium members get 💵100, everyone else 💵10)
 /buypremium - premium doubles your 💵 rewards in Word Game and Word Scramble (paid with Telegram Stars; used in a group it moves you to my DM, and the invoice has a ➡️ Premium features button)
 /premiumstatus - see whether premium is active and how much time is left
-/premiumadvantage - see everything Premium gives you over a normal player (double rewards, up to 10 Jackpot tries a day instead of 1, bigger daily reward, buy cash, transfer, request, gift Premium)
+/premiumadvantage - see everything Premium gives you over a normal player (double rewards, up to 10 Jackpot tries a day instead of 1, 10 Mystery Box opens a day instead of 3, bigger daily reward, buy cash, transfer, request, gift Premium)
 /buycash - premium only: buy 💵 cash with Telegram Stars; it increases your balance, level and rank (pack sizes and prices are shown live; used in a group it moves you to my DM)
 /boostrank - premium only: same as /buycash - buy 💵 cash to boost your rank
 /boostlevel - premium only: same as /buycash - buy 💵 cash to boost your level
@@ -7164,12 +7181,19 @@ def _allcommands_text() -> str:
 /starthack - the host who opened the lobby or the bot owner: start the open Hack or Hack X right now instead of waiting for the 2-minute lobby
 /stophack - the host who opened the Hack or the bot owner: cancel the lobby or running Hack or Hack X; every other player is refunded (the host's own fee stays with the bot)
 /resumehack - host or bot owner only: continue a stuck Hack or Hack X from the exact place it stopped
+/richest - the richest players ranked by combined balance (Word Game + Word Scramble money), with a Global / This chat switch
+/mysterybox - groups only: open a 🎁 Mystery Box for 2 minutes (one box per group); everyone can /open it once
+/open - open the Mystery Box in this group: costs 💵100 and wins 💵1,000, 💵200, 💵50, 💵20 or 💵10; 3 opens a day for normal players, up to 10 for Premium (resets 00:00 UTC)
+/anagram - groups only: 🔀 Anagram - make as many real words as you can from the mixed-up letters within 3 minutes; every new word pays 💵 (just type the words)
+/anagramwords - the Anagram words found so far
+/anagramscore - the Anagram scores so far
+/anagramhelp - how to play Anagram
 /support - support the bot with Telegram Stars (quick amounts or a custom amount; gives no in-game advantage; used in a group it moves you to my DM)
 /supporters - the top supporters leaderboard
 /mysupport - your own total support and number of contributions
 /bal - your total global balance (Word Game + Word Scramble); reply to someone's message with /bal to see theirs
 /balance - same as /bal
-/command - my DM only: browse the commands by category (Scramble, Hack, Elimination, Tournament, Word Game) with buttons
+/command - my DM only: browse the commands by category (Scramble, Hack, Elimination, Tournament, Word Game, Jackpot, More Games) with buttons
 /commands - same as /command
 /searchcommand &lt;text&gt; - search the command list by name or description (only shows commands you're allowed to see)
 /fullhelp - a complete, paged guide to the bot: games, tournaments, premium, cash and more
@@ -7193,8 +7217,14 @@ def _allcommands_text() -> str:
 /groupadminmode on|off &lt;group ID or @username&gt; - owner/Bot Admins only, works from my DM: require (or not) that I'm an admin here before games can start, overriding the global /adminmode default
 /gamedifficulty easy|easy3-6|medium|hard|off - group admins (or the owner) can choose which word lengths get picked in this group (shared with Word Game); the owner can also add a group, or leave it out to apply to ALL groups at once (and new groups)
 /gamedifficulty easyx|easy3x-6x|mediumx|hardx|offx - same as the modes above, but the scrambled letters are shown in lowercase so the first letter isn't given away
+/stopanagram - group admins (or the owner) can end a running Anagram game
+/hiddenletter [on|off] - 🔠 Hidden Letter: 3 times a day I post a secret letter in active groups; guess it with /g K, /guess K or just type the letter (10 guesses per group, 1 per player, the winner gets 💵100). Anyone can see the status; the group creator (or the owner) can switch it on or off here. The owner can use it in my DM with a group ID, @username or allgroups
 
 <b>👑 Owner Commands</b>
+/stopallactivities - stop EVERYTHING in EVERY group (games, tournaments, eliminations, hacks, jackpots, anagrams, mystery boxes, hidden letter rounds) and refund the fees; Slow Mode, Automatic Mode and the global Scramble Mode stay off until turned on again (asks Yes/No first)
+/auditbalances - read-only check that no 'in this chat' balance is higher than the global one
+/repairbalances - shows the fixes /auditbalances found and applies them only after you tap Apply
+/setanagramearnings &lt;amount&gt; - set what each Anagram word pays
 /stats - bot-wide statistics
 /botgroups (alias: /botsgroups) - groups only: total/current/removed groups, tappable, with per-group Word Game and Scramble activity
 /botusers - users who started the bot in DM: total/active/blocked, tappable, with per-user Word Game and Scramble activity (same layout as /botgroups)
@@ -7278,7 +7308,7 @@ OWNER_ONLY_COMMANDS = frozenset({
     "scramblemode", "scramblereloadwords", "scramblesetreward", "scramblestats", "scramblestopallgroups",
     "scrambletopup", "scrambletopupspecific", "scrambleusers", "seepremiumplayers", "sendgroupmessage",
     "setdollarpack", "setpremium", "setreward", "setsupport", "share", "shufflewords", "sponsoredad",
-    "starbalance", "stats", "stopelimination", "auditbalances", "repairbalances", "stopallactivities", "supportstats", "topup", "users", "withdraw",
+    "starbalance", "stats", "stopelimination", "auditbalances", "repairbalances", "setanagramearnings", "stopallactivities", "supportstats", "topup", "users", "withdraw",
 })
 
 
@@ -11470,6 +11500,15 @@ def _parse_premium_payload(payload):
         return None
 
 
+def _mystery_limits():
+    """(opens a day for normal players, for Premium) - read from mysterybox.py so the help never goes stale."""
+    try:
+        import mysterybox
+        return mysterybox.DAILY_LIMIT_NORMAL, mysterybox.DAILY_LIMIT_PREMIUM
+    except Exception:
+        return 3, 10
+
+
 def premium_features_text(price, dur) -> str:
     """Everything Premium gives, as the bot's code actually implements it. One source for the invoice's
     '➡️ Premium features' button and for /premiumadvantage."""
@@ -11485,6 +11524,8 @@ def premium_features_text(price, dur) -> str:
         f"Word Scramble {DOLLAR}{fmt_coins(scr)} → {DOLLAR}{fmt_coins(scr * 2)}.\n\n"
         f"🎰 <b>More Jackpot tries</b> - up to {JACKPOT_PREMIUM_DAILY_TRIES} tries a day "
         f"(normal players get 1), counted across all groups.\n\n"
+        f"🎁 <b>More Mystery Box opens</b> - up to {_mystery_limits()[1]} opens a day "
+        f"(normal players get {_mystery_limits()[0]}), counted across all groups.\n\n"
         f"🎁 <b>Bigger daily reward</b> - /daily pays {DOLLAR}{daily_prem} instead of {DOLLAR}{daily}.\n\n"
         f"🚀 <b>Buy cash</b> - /buycash, /getcash, /boostrank and /boostlevel let you buy {DOLLAR} with "
         f"Telegram Stars to raise your balance, level and rank.\n\n"
@@ -11494,7 +11535,7 @@ def premium_features_text(price, dur) -> str:
         f"⏰ <b>Renewal reminder</b> - I message you before your Premium runs out, with a one-tap renew button.\n\n"
         f"➕ <b>Stacks</b> - buying again while it is active adds to your time. "
         f"Check it any time with /premiumstatus.\n\n"
-        f"ℹ️ Not doubled: purchased cash, the daily reward, and Tournament / Elimination / Hack / Jackpot prizes.\n\n"
+        f"ℹ️ Not doubled: purchased cash, the daily reward, and Tournament / Elimination / Hack / Jackpot / Mystery Box / Anagram / Hidden Letter prizes.\n\n"
         f"Price: {price} ⭐ for {_format_duration_words(dur)}. Buy it with /buypremium."
     )
 
@@ -12790,6 +12831,7 @@ FULLHELP_PAGES = (
     ("j", "🎰 Jackpot"),
     ("p", "⭐ Premium & Cash"),
     ("o", "📚 Other"),
+    ("m", "🎁 More Games"),
 )
 
 
@@ -12965,7 +13007,7 @@ def _fullhelp_premium_page() -> str:
         f"/buypremium - {price} ⭐ for {_format_duration_words(dur)} (paid with Telegram Stars; buying again while active extends it). "
         f"Used in a group, it moves you to my DM to pay. Tap <b>➡️ Premium features</b> on the invoice to see everything Premium gives.\n"
         f"/premiumstatus - see if it's active and how much time is left.\n"
-        f"/premiumadvantage - the full list of what Premium gives you over a normal player, including up to {JACKPOT_PREMIUM_DAILY_TRIES} Jackpot tries a day instead of 1.\n"
+        f"/premiumadvantage - the full list of what Premium gives you over a normal player, including up to {JACKPOT_PREMIUM_DAILY_TRIES} Jackpot tries a day instead of 1 and {_mystery_limits()[1]} Mystery Box opens a day instead of {_mystery_limits()[0]}.\n"
         f"It doubles the {DOLLAR} you earn from Word Game and Word Scramble wins "
         f"It does not double purchased cash, the daily reward or tournament prizes. "
         f"Premium members do get a bigger daily reward: {DOLLAR}{fmt_coins(db.get_config('reward_daily_premium', db.DAILY_REWARD_PREMIUM))} instead of {DOLLAR}{fmt_coins(db.get_config('reward_daily', db.DAILY_REWARD))}.\n"
@@ -12989,6 +13031,46 @@ def _fullhelp_premium_page() -> str:
         f"/deleterequestprompt off|on [&lt;1-9&gt;s|m] - group admins choose whether answered request prompts are deleted "
         f"(default: on, after {REQUEST_PROMPT_DELETE_DEFAULT_SECONDS} seconds).\n"
         f"The other person must already be a player (they've pressed /start)."
+    )
+
+
+def _fullhelp_more_page() -> str:
+    normal, premium = _mystery_limits()
+    try:
+        import anagram
+        word_pay = fmt_coins(anagram.get_reward())
+    except Exception:
+        word_pay = "1"
+    try:
+        import hiddenletter
+        times = ", ".join(f"{h:02d}:{m:02d}" for h, m in hiddenletter.SLOTS) + " UTC"
+        prize = fmt_coins(hiddenletter.PRIZE)
+    except Exception:
+        times, prize = "07:00, 14:00, 20:00 UTC", "100"
+    return (
+        f"🎁 <b>More Games</b>\n\n"
+        f"🎁 <b>Mystery Box</b> (groups)\n"
+        f"/mysterybox - opens a box that stays for 2 minutes (one box per group).\n"
+        f"/open - anyone can open it once. Each open costs {DOLLAR}100 (Word Scramble money first, then Word Game money) "
+        f"and wins {DOLLAR}1,000, {DOLLAR}200, {DOLLAR}50, {DOLLAR}20 or {DOLLAR}10 - the big ones are rare. "
+        f"The prize goes to your Word Scramble balance.\n"
+        f"Limit: {normal} opens a day for normal players, up to {premium} for Premium, counted across all groups (resets 00:00 UTC). "
+        f"Not enough cash never costs you an open.\n"
+        f"If the 2 minutes pass, the box opens by itself for the person who started it (if they hadn't opened it yet).\n\n"
+        f"🔀 <b>Anagram</b> (groups)\n"
+        f"/anagram - I show a long word with its letters mixed up. For 3 minutes, type real English words (4+ letters) that use only those letters. "
+        f"Every new word pays {DOLLAR}{word_pay}; a word that was already found gets a 👎.\n"
+        f"/anagramwords - words found so far. /anagramscore - the scores so far. /anagramhelp - how to play. "
+        f"/stopanagram - group admins or the owner end the game.\n\n"
+        f"🔠 <b>Hidden Letter</b> (groups)\n"
+        f"Three times a day ({times}) I post \"I'm thinking of a letter from A to Z\" in active groups. "
+        f"The group has 10 guesses in total and each player has 1. Guess with /g K, /guess K or just type the letter. "
+        f"👎 means wrong, 👍 means you found it and win {DOLLAR}{prize}. A letter that was already tried is refused and costs no guess. "
+        f"If nobody finds it in 30 minutes (or after 10 guesses) I reveal the letter.\n"
+        f"/hiddenletter - shows whether it's on in this group; the group creator (or the bot owner) can use /hiddenletter on or /hiddenletter off. "
+        f"It waits while a Tournament, Elimination, Hack or Anagram is running in the group.\n\n"
+        f"💎 <b>Richest players</b>\n"
+        f"/richest - everyone ranked by combined balance, with a Global / This chat switch."
     )
 
 
@@ -13040,6 +13122,7 @@ _FULLHELP_BUILDERS = {
     "j": _fullhelp_jackpot_page,
     "p": _fullhelp_premium_page,
     "o": _fullhelp_other_page,
+    "m": _fullhelp_more_page,
 }
 
 
@@ -13057,7 +13140,7 @@ def _fullhelp_keyboard(user_id, current):
         [btn("g", labels["g"]), btn("s", labels["s"])],
         [btn("t", labels["t"]), btn("h", labels["h"])],
         [btn("j", labels["j"]), btn("p", labels["p"])],
-        [btn("o", labels["o"])],
+        [btn("o", labels["o"]), btn("m", labels["m"])],
     ])
 
 
@@ -13131,6 +13214,8 @@ _COMMANDS_MENU = (
      ("tournament", "settournament", "join"), False),
     ("jp", "Jackpot commands", "🎰 Jackpot commands",
      ("jackpot", "setjackpot", "setl", "editjackpot", "playgame"), False),
+    ("mg", "More games", "🎁 More games",
+     ("mysterybox", "open", "anagram", "anagramwords", "anagramscore", "stopanagram", "anagramhelp", "hiddenletter", "richest"), False),
     ("wg", "Word Game commands", "🎮 Word Game commands",
      ("start", "help", "wordgame", "hint", "stopvote", "stopgame", "autodelete", "leaderboard", "wordgameleaderboard", "chattop",
       "globaltop", "topplayers", "topgroups", "claimdailyreward", "settings", "autolead", "bal", "balance",
@@ -13186,7 +13271,7 @@ def _commands_menu_keyboard(user_id, current=None):
         shown = f"• {c[1]}" if c[0] == current else c[1]
         return InlineKeyboardButton(shown, callback_data=f"cmd:{user_id}:{c[0]}")
     b = {c[0]: btn(c) for c in _COMMANDS_MENU}
-    return InlineKeyboardMarkup([[b["sc"], b["hk"]], [b["el"], b["to"]], [b["wg"], b["jp"]]])
+    return InlineKeyboardMarkup([[b["sc"], b["hk"]], [b["el"], b["to"]], [b["wg"], b["jp"]], [b["mg"]]])
 
 
 def _split_text_parts(text, limit=3800):
@@ -14426,8 +14511,8 @@ def main():
     app.add_handler(CallbackQueryHandler(buydollar_button, pattern=r"^bd:\d+:\d+:\d+:\d+(:[crl])?$"))
     app.add_handler(CallbackQueryHandler(transfer_button, pattern=r"^tf:[yn]:[0-9a-f]+$"))
     app.add_handler(CallbackQueryHandler(request_button, pattern=r"^rq:[yn]:\d+$"))
-    app.add_handler(CallbackQueryHandler(fullhelp_button, pattern=r"^fh:\d+:[gstpohj]$"))
-    app.add_handler(CallbackQueryHandler(commands_menu_button, pattern=r"^cmd:\d+:(sc|hk|el|to|wg|jp)$"))
+    app.add_handler(CallbackQueryHandler(fullhelp_button, pattern=r"^fh:\d+:[gstpohjm]$"))
+    app.add_handler(CallbackQueryHandler(commands_menu_button, pattern=r"^cmd:\d+:(sc|hk|el|to|wg|jp|mg)$"))
     app.add_handler(CallbackQueryHandler(premium_players_page_button, pattern=r"^spp:\d+$"))
     app.add_handler(CommandHandler("profile", profile_command))
     app.add_handler(CommandHandler("inviteandearn", inviteandearn_command))
