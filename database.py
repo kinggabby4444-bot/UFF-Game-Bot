@@ -474,6 +474,15 @@ def create_tables():
             new_value BIGINT NOT NULL
         )
         """)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS balance_repair_undo (
+            run_id BIGINT PRIMARY KEY,
+            applied_by BIGINT,
+            created_at TEXT,
+            rows_restored INTEGER,
+            rows_skipped INTEGER
+        )
+        """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_scramble_group_stats_rounds ON scramble_group_stats (rounds_played DESC)")
 
         cursor.execute("""

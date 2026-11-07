@@ -2076,6 +2076,8 @@ def _scrambleallcommands_text() -> str:
 /auditbalances - read-only check that no 'in this chat' balance is higher than the global one
 /repairbalances - shows the fixes /auditbalances found and applies them only after you tap Apply
 /setanagramearnings &lt;amount&gt; - set what each Anagram word pays
+/balancetrace [user id] - read-only: every repair run, or one player's balance rows and what a repair changed for them (also works as a reply)
+/undorepair [run id] - put back the 'in this chat' figures a /repairbalances run lowered (shows a preview and asks first; global balances are never touched)
 /scramblestats - Word Scramble bot-wide statistics
 /scramblesetreward &lt;amount&gt; - set the win reward
 /setscrambleearnings &lt;amount&gt; - owner only: set the 💵 a player earns for winning a Word Scramble round (Premium players earn double; same as /scramblesetreward)
@@ -7225,6 +7227,8 @@ def _allcommands_text() -> str:
 /auditbalances - read-only check that no 'in this chat' balance is higher than the global one
 /repairbalances - shows the fixes /auditbalances found and applies them only after you tap Apply
 /setanagramearnings &lt;amount&gt; - set what each Anagram word pays
+/balancetrace [user id] - read-only: every repair run, or one player's balance rows and what a repair changed for them (also works as a reply)
+/undorepair [run id] - put back the 'in this chat' figures a /repairbalances run lowered (shows a preview and asks first; global balances are never touched)
 /stats - bot-wide statistics
 /botgroups (alias: /botsgroups) - groups only: total/current/removed groups, tappable, with per-group Word Game and Scramble activity
 /botusers - users who started the bot in DM: total/active/blocked, tappable, with per-user Word Game and Scramble activity (same layout as /botgroups)
@@ -7308,7 +7312,7 @@ OWNER_ONLY_COMMANDS = frozenset({
     "scramblemode", "scramblereloadwords", "scramblesetreward", "scramblestats", "scramblestopallgroups",
     "scrambletopup", "scrambletopupspecific", "scrambleusers", "seepremiumplayers", "sendgroupmessage",
     "setdollarpack", "setpremium", "setreward", "setsupport", "share", "shufflewords", "sponsoredad",
-    "starbalance", "stats", "stopelimination", "auditbalances", "repairbalances", "setanagramearnings", "stopallactivities", "supportstats", "topup", "users", "withdraw",
+    "starbalance", "stats", "stopelimination", "auditbalances", "balancetrace", "repairbalances", "setanagramearnings", "stopallactivities", "undorepair", "supportstats", "topup", "users", "withdraw",
 })
 
 
@@ -14520,6 +14524,12 @@ def main():
     app.add_handler(CallbackQueryHandler(richest_button, pattern=r"^rich_(chat|global)$"))
     app.add_handler(CallbackQueryHandler(stopall_button, pattern=r"^sa:[yn]:[0-9a-f]+$"))
     app.add_handler(CallbackQueryHandler(repair_button, pattern=r"^rb:[yn]:[0-9a-f]+$"))
+    try:   # owner balance tools (own file; must be registered before the generic button handler below)
+        import balancetools
+        balancetools.install(app, SimpleNamespace(db=db, is_owner=is_owner, fmt_coins=fmt_coins, DOLLAR=DOLLAR,
+                                                  reply_html_in_parts=reply_html_in_parts))
+    except Exception:
+        logger.exception("GAME BOT: balancetools could not be loaded - everything else keeps working")
     app.add_handler(CallbackQueryHandler(button))
 
     app.add_handler(MessageHandler(
