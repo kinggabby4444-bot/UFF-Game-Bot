@@ -9975,6 +9975,12 @@ async def hack_advance_callback(context: ContextTypes.DEFAULT_TYPE):
 async def guess_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/guess <number> (and the short /g <number>) - only joined players of the
     running Hack count; everyone else is ignored silently."""
+    try:   # Hidden Letter: only while a round runs in this chat AND the argument is a single letter
+        import hiddenletter
+        if await hiddenletter.handle_command_guess(update, context):
+            return
+    except Exception:
+        logger.exception("hiddenletter guess hook failed - continuing with Hack")
     raw = ((context.args or [""])[0] or "").strip()
     await _hack_process_guess(update, context, raw, from_text=False)
 
@@ -14487,6 +14493,17 @@ def main():
         ))
     except Exception:
         logger.exception("GAME BOT: Mystery Box could not be loaded - everything else keeps working")
+
+    # Hidden Letter game: its own file; if it cannot load, the rest of the bot is unaffected.
+    try:
+        import hiddenletter
+        hiddenletter.install(app, SimpleNamespace(
+            db=db, esc_name=esc_name, fmt_coins=fmt_coins, safe_send=safe_send, send_winner_message=send_winner_message,
+            is_owner=is_owner, is_chat_creator=is_chat_creator, resolve_group_arg=resolve_group_arg,
+            anagram_running=_anagram_running, register_stopall_hook=register_stopall_hook,
+        ))
+    except Exception:
+        logger.exception("GAME BOT: Hidden Letter could not be loaded - everything else keeps working")
 
     if app.job_queue is not None:
         # A timer that fires even 1-2 seconds late (event loop briefly busy)

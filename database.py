@@ -531,6 +531,44 @@ def create_tables():
         )
         """)
         cursor.execute("""
+        CREATE TABLE IF NOT EXISTS hidden_letter_rounds (
+            id BIGSERIAL PRIMARY KEY,
+            chat_id BIGINT NOT NULL,
+            letter TEXT NOT NULL,
+            slot_key TEXT,
+            started_at TEXT,
+            expires_at TEXT,
+            status TEXT NOT NULL DEFAULT 'active',
+            guesses INTEGER NOT NULL DEFAULT 0,
+            winner_id BIGINT,
+            ended_at TEXT
+        )
+        """)
+        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_hidden_letter_active ON hidden_letter_rounds (chat_id) WHERE status = 'active'")
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS hidden_letter_guesses (
+            round_id BIGINT NOT NULL,
+            user_id BIGINT NOT NULL,
+            letter TEXT,
+            created_at TEXT,
+            PRIMARY KEY (round_id, user_id)
+        )
+        """)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS hidden_letter_slots (
+            chat_id BIGINT NOT NULL,
+            slot_key TEXT NOT NULL,
+            created_at TEXT,
+            PRIMARY KEY (chat_id, slot_key)
+        )
+        """)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS hidden_letter_settings (
+            chat_id BIGINT PRIMARY KEY,
+            enabled INTEGER NOT NULL DEFAULT 1
+        )
+        """)
+        cursor.execute("""
         CREATE TABLE IF NOT EXISTS scramble_auto_release (
             chat_id BIGINT PRIMARY KEY,
             released_at TEXT
@@ -4616,6 +4654,229 @@ def set_scramble_slowmode(chat_id, interval_seconds, enabled: bool):
                 "INSERT INTO scramble_auto_release (chat_id, released_at) VALUES (%s, %s) ON CONFLICT DO NOTHING",
                 (chat_id, datetime.now().isoformat()),
             )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def hl_eligible_groups(active_since):
+    """Groups that may get a Hidden Letter: bot still a member, active since `active_since` (ISO text),
+    not banned, and not switched off with /hiddenletter off. One query for all groups."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM bot_config WHERE key='hiddenletter_global_off'")
+        g = cursor.fetchone()
+        if g and str(g[0]) == "1":
+            return []
+        cursor.execute("""
+            SELECT g.chat_id FROM groups g
+            LEFT JOIN hidden_letter_settings s ON s.chat_id = g.chat_id
+            WHERE g.left_at IS NULL AND g.last_active >= %s
+              AND NOT EXISTS (SELECT 1 FROM banned_groups b WHERE b.chat_id = g.chat_id)
+              AND COALESCE(s.enabled, 1) = 1
+            ORDER BY g.chat_id
+        """, (active_since,))
+        return [r[0] for r in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+def hl_busy_chats():
+    """chat_ids that have a tournament, elimination or hack open right now (one query)."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT chat_id FROM tournaments WHERE status IN ('lobby', 'active', 'paused')
+            UNION SELECT chat_id FROM eliminations WHERE status IN ('lobby', 'active')
+            UNION SELECT chat_id FROM hacks WHERE status IN ('lobby', 'active')
+        """)
+        return {r[0] for r in cursor.fetchall()}
+    finally:
+        conn.close()
+
+
+def hl_last_letter(chat_id):
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT letter FROM hidden_letter_rounds WHERE chat_id=%s ORDER BY id DESC LIMIT 1", (chat_id,))
+        row = cursor.fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def hl_start_round(chat_id, slot_key, letter, started_at, expires_at):
+    """Claims the (chat, slot) and creates the round in ONE transaction.
+    Returns ("ok", round_id), ("dup", None) when this slot was already sent to this chat,
+    or ("busy", None) when the chat already has an active round (the slot is then NOT claimed)."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE hidden_letter_rounds SET status='expired', ended_at=%s "
+                       "WHERE chat_id=%s AND status='active' AND expires_at < %s", (started_at, chat_id, started_at))
+        if slot_key:
+            cursor.execute("INSERT INTO hidden_letter_slots (chat_id, slot_key, created_at) VALUES (%s, %s, %s) "
+                           "ON CONFLICT DO NOTHING", (chat_id, slot_key, started_at))
+            if cursor.rowcount != 1:
+                conn.rollback()
+                return ("dup", None)
+        cursor.execute("INSERT INTO hidden_letter_rounds (chat_id, letter, slot_key, started_at, expires_at, status) "
+                       "VALUES (%s, %s, %s, %s, %s, 'active') ON CONFLICT (chat_id) WHERE status='active' DO NOTHING "
+                       "RETURNING id", (chat_id, letter, slot_key, started_at, expires_at))
+        row = cursor.fetchone()
+        if not row:
+            conn.rollback()
+            return ("busy", None)
+        conn.commit()
+        return ("ok", row[0])
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def hl_record_guess(round_id, user_id, letter):
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO hidden_letter_guesses (round_id, user_id, letter, created_at) VALUES (%s, %s, %s, %s) "
+                       "ON CONFLICT DO NOTHING", (round_id, user_id, letter, datetime.now().isoformat()))
+        if cursor.rowcount == 1:
+            cursor.execute("UPDATE hidden_letter_rounds SET guesses = guesses + 1 WHERE id=%s AND status='active'", (round_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def hl_win(round_id, user_id, name, prize):
+    """The correct guess: closes the round and pays the prize in ONE transaction (so it can never pay twice).
+    Returns the player's new combined balance, or None when the round was no longer active."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE hidden_letter_rounds SET status='won', winner_id=%s, ended_at=%s "
+                       "WHERE id=%s AND status='active' RETURNING chat_id", (user_id, datetime.now().isoformat(), round_id))
+        row = cursor.fetchone()
+        if not row:
+            conn.rollback()
+            return None
+        chat_id = row[0]
+        cursor.execute("INSERT INTO hidden_letter_guesses (round_id, user_id, letter, created_at) "
+                       "SELECT id, %s, letter, %s FROM hidden_letter_rounds WHERE id=%s ON CONFLICT DO NOTHING",
+                       (user_id, datetime.now().isoformat(), round_id))
+        _tx_lock_balances(cursor, [user_id])
+        _tx_credit(cursor, user_id, name, prize)
+        _tx_credit_chat_scramble(cursor, user_id, chat_id, name, prize)
+        balance = _tx_combined_total(cursor, user_id)
+        conn.commit()
+        return balance
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def hl_end(round_id, status):
+    """Ends an active round (once). Returns its letter, or None if it was not active any more."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE hidden_letter_rounds SET status=%s, ended_at=%s WHERE id=%s AND status='active' "
+                       "RETURNING letter", (status, datetime.now().isoformat(), round_id))
+        row = cursor.fetchone()
+        conn.commit()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def hl_stop_rounds(chat_ids=None):
+    """Stops active rounds (all, or only these chats) without any payout. Returns [(round_id, chat_id)]."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        now = datetime.now().isoformat()
+        if chat_ids is None:
+            cursor.execute("UPDATE hidden_letter_rounds SET status='stopped', ended_at=%s WHERE status='active' "
+                           "RETURNING id, chat_id", (now,))
+        else:
+            chat_ids = list(chat_ids)
+            if not chat_ids:
+                return []
+            marks = ",".join(["%s"] * len(chat_ids))
+            cursor.execute(f"UPDATE hidden_letter_rounds SET status='stopped', ended_at=%s WHERE status='active' "
+                           f"AND chat_id IN ({marks}) RETURNING id, chat_id", (now, *chat_ids))
+        rows = cursor.fetchall()
+        conn.commit()
+        return rows
+    finally:
+        conn.close()
+
+
+def hl_load_active():
+    """At startup: every round still marked active, with the letters already tried and who guessed."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, chat_id, letter, expires_at, guesses FROM hidden_letter_rounds WHERE status='active'")
+        rounds = cursor.fetchall()
+        out = []
+        for rid, chat_id, letter, expires_at, guesses in rounds:
+            cursor.execute("SELECT user_id, letter FROM hidden_letter_guesses WHERE round_id=%s", (rid,))
+            out.append({"id": rid, "chat_id": chat_id, "letter": letter, "expires_at": expires_at,
+                        "guessed": cursor.fetchall()})
+        return out
+    finally:
+        conn.close()
+
+
+def hl_get_setting(chat_id):
+    """(enabled_for_this_group, switched_off_everywhere)."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT enabled FROM hidden_letter_settings WHERE chat_id=%s", (chat_id,))
+        row = cursor.fetchone()
+        cursor.execute("SELECT value FROM bot_config WHERE key='hiddenletter_global_off'")
+        g = cursor.fetchone()
+        return (row is None or row[0] == 1), bool(g and str(g[0]) == "1")
+    finally:
+        conn.close()
+
+
+def hl_set_enabled(chat_ids, enabled):
+    """Per-group switch. ON removes the row (default is on); OFF stores it."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        for chat_id in chat_ids:
+            if enabled:
+                cursor.execute("DELETE FROM hidden_letter_settings WHERE chat_id=%s", (chat_id,))
+            else:
+                cursor.execute("INSERT INTO hidden_letter_settings (chat_id, enabled) VALUES (%s, 0) "
+                               "ON CONFLICT (chat_id) DO UPDATE SET enabled=0", (chat_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def hl_set_everywhere(enabled):
+    """/hiddenletter on|off allgroups: ON clears every per-group switch and the global switch; OFF sets the global one
+    (so groups the bot joins later stay off too)."""
+    conn = connect()
+    try:
+        cursor = conn.cursor()
+        if enabled:
+            cursor.execute("DELETE FROM hidden_letter_settings")
+            cursor.execute("DELETE FROM bot_config WHERE key='hiddenletter_global_off'")
+        else:
+            cursor.execute("INSERT INTO bot_config (key, value) VALUES ('hiddenletter_global_off', '1') "
+                           "ON CONFLICT (key) DO UPDATE SET value='1'")
         conn.commit()
     finally:
         conn.close()
