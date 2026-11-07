@@ -2068,6 +2068,7 @@ def _scrambleallcommands_text() -> str:
 /deleterequestprompt off|on [&lt;1-9&gt;s|m] - group admins (or the owner) can control whether resolved /request prompts are deleted here and after how long (default on, 30 seconds; no args shows the current setting)
 /gamedifficulty easy|easy3-6|medium|hard|off - group admins (or the owner) can choose which word lengths get picked in this group (shared with Word Game); the owner can also add a group, or leave it out to apply to ALL groups at once (and new groups)
 /gamedifficulty easyx|easy3x-6x|mediumx|hardx|offx - same as the modes above, but the scrambled letters are shown in lowercase so the first letter isn't given away
+/endscramblesession - group admins (or the owner): end this group's Word Scramble session for good - closes the running word and switches Slow Mode and Automatic Mode off here (admins switch them on again, members still use /wordscramble)
 /stopanagram - group admins (or the owner) can end a running Anagram game
 /hiddenletter [on|off] - 🔠 Hidden Letter: 3 times a day I post a secret letter in active groups; guess it with /g K, /guess K or just type the letter (10 guesses per group, 1 per player, the winner gets 💵100). Anyone can see the status; the group creator (or the owner) can switch it on or off here. The owner can use it in my DM with a group ID, @username or allgroups
 
@@ -2078,6 +2079,7 @@ def _scrambleallcommands_text() -> str:
 /setanagramearnings &lt;amount&gt; - set what each Anagram word pays
 /balancetrace [user id] - read-only: every repair run, or one player's balance rows and what a repair changed for them (also works as a reply)
 /undorepair [run id] - put back the 'in this chat' figures a /repairbalances run lowered (shows a preview and asks first; global balances are never touched)
+/dbwho - which copy of the bot answers: service, database, who holds the Telegram webhook, and the balance totals at each recent start (also alerts you privately if another copy takes over the webhook)
 /scramblestats - Word Scramble bot-wide statistics
 /scramblesetreward &lt;amount&gt; - set the win reward
 /setscrambleearnings &lt;amount&gt; - owner only: set the 💵 a player earns for winning a Word Scramble round (Premium players earn double; same as /scramblesetreward)
@@ -7219,6 +7221,7 @@ def _allcommands_text() -> str:
 /groupadminmode on|off &lt;group ID or @username&gt; - owner/Bot Admins only, works from my DM: require (or not) that I'm an admin here before games can start, overriding the global /adminmode default
 /gamedifficulty easy|easy3-6|medium|hard|off - group admins (or the owner) can choose which word lengths get picked in this group (shared with Word Game); the owner can also add a group, or leave it out to apply to ALL groups at once (and new groups)
 /gamedifficulty easyx|easy3x-6x|mediumx|hardx|offx - same as the modes above, but the scrambled letters are shown in lowercase so the first letter isn't given away
+/endscramblesession - group admins (or the owner): end this group's Word Scramble session for good - closes the running word and switches Slow Mode and Automatic Mode off here (admins switch them on again, members still use /wordscramble)
 /stopanagram - group admins (or the owner) can end a running Anagram game
 /hiddenletter [on|off] - 🔠 Hidden Letter: 3 times a day I post a secret letter in active groups; guess it with /g K, /guess K or just type the letter (10 guesses per group, 1 per player, the winner gets 💵100). Anyone can see the status; the group creator (or the owner) can switch it on or off here. The owner can use it in my DM with a group ID, @username or allgroups
 
@@ -7229,6 +7232,7 @@ def _allcommands_text() -> str:
 /setanagramearnings &lt;amount&gt; - set what each Anagram word pays
 /balancetrace [user id] - read-only: every repair run, or one player's balance rows and what a repair changed for them (also works as a reply)
 /undorepair [run id] - put back the 'in this chat' figures a /repairbalances run lowered (shows a preview and asks first; global balances are never touched)
+/dbwho - which copy of the bot answers: service, database, who holds the Telegram webhook, and the balance totals at each recent start (also alerts you privately if another copy takes over the webhook)
 /stats - bot-wide statistics
 /botgroups (alias: /botsgroups) - groups only: total/current/removed groups, tappable, with per-group Word Game and Scramble activity
 /botusers - users who started the bot in DM: total/active/blocked, tappable, with per-user Word Game and Scramble activity (same layout as /botgroups)
@@ -7312,7 +7316,7 @@ OWNER_ONLY_COMMANDS = frozenset({
     "scramblemode", "scramblereloadwords", "scramblesetreward", "scramblestats", "scramblestopallgroups",
     "scrambletopup", "scrambletopupspecific", "scrambleusers", "seepremiumplayers", "sendgroupmessage",
     "setdollarpack", "setpremium", "setreward", "setsupport", "share", "shufflewords", "sponsoredad",
-    "starbalance", "stats", "stopelimination", "auditbalances", "balancetrace", "repairbalances", "setanagramearnings", "stopallactivities", "undorepair", "supportstats", "topup", "users", "withdraw",
+    "starbalance", "stats", "stopelimination", "auditbalances", "balancetrace", "dbwho", "repairbalances", "setanagramearnings", "stopallactivities", "undorepair", "supportstats", "topup", "users", "withdraw",
 })
 
 
@@ -13219,7 +13223,7 @@ _COMMANDS_MENU = (
     ("jp", "Jackpot commands", "🎰 Jackpot commands",
      ("jackpot", "setjackpot", "setl", "editjackpot", "playgame"), False),
     ("mg", "More games", "🎁 More games",
-     ("mysterybox", "open", "anagram", "anagramwords", "anagramscore", "stopanagram", "anagramhelp", "hiddenletter", "richest"), False),
+     ("mysterybox", "open", "anagram", "anagramwords", "anagramscore", "stopanagram", "anagramhelp", "hiddenletter", "richest", "endscramblesession"), False),
     ("wg", "Word Game commands", "🎮 Word Game commands",
      ("start", "help", "wordgame", "hint", "stopvote", "stopgame", "autodelete", "leaderboard", "wordgameleaderboard", "chattop",
       "globaltop", "topplayers", "topgroups", "claimdailyreward", "settings", "autolead", "bal", "balance",
@@ -14530,6 +14534,21 @@ def main():
                                                   reply_html_in_parts=reply_html_in_parts))
     except Exception:
         logger.exception("GAME BOT: balancetools could not be loaded - everything else keeps working")
+    try:   # /dbwho: finds a second copy of the bot (same token) that holds the webhook or uses another database
+        import instancecheck
+        instancecheck.install(app, SimpleNamespace(db=db, is_owner=is_owner, esc=esc, fmt_coins=fmt_coins, DOLLAR=DOLLAR,
+                                                   safe_send=safe_send, reply_html_in_parts=reply_html_in_parts, owner_id=OWNER_ID))
+    except Exception:
+        logger.exception("GAME BOT: instancecheck could not be loaded - everything else keeps working")
+    try:   # /endscramblesession
+        import scramblesession
+        scramblesession.install(app, SimpleNamespace(
+            db=db, is_owner=is_owner, is_bot_admin_or_owner=is_bot_admin_or_owner, is_chat_admin=is_chat_admin,
+            safe_send=safe_send, esc_name=esc_name, compact_duration=_compact_duration,
+            scramble_timeout_job_name=_scramble_timeout_job_name, slowmode_next_job_name=_slowmode_next_job_name,
+            scramble_send_retry_job_name=_scramble_send_retry_job_name))
+    except Exception:
+        logger.exception("GAME BOT: scramblesession could not be loaded - everything else keeps working")
     app.add_handler(CallbackQueryHandler(button))
 
     app.add_handler(MessageHandler(

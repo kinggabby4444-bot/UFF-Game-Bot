@@ -483,6 +483,22 @@ def create_tables():
             rows_skipped INTEGER
         )
         """)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS instance_boots (
+            id BIGSERIAL PRIMARY KEY,
+            booted_at TEXT,
+            service TEXT,
+            instance TEXT,
+            commit_id TEXT,
+            ext_url TEXT,
+            db_target TEXT,
+            db_name TEXT,
+            sys_id TEXT,
+            players BIGINT,
+            wg_sum BIGINT,
+            sc_sum BIGINT
+        )
+        """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_scramble_group_stats_rounds ON scramble_group_stats (rounds_played DESC)")
 
         cursor.execute("""
