@@ -14532,7 +14532,7 @@ def main():
     # Specific callback patterns must be registered BEFORE the catch-all button handler.
     app.add_handler(CallbackQueryHandler(buypremium_button, pattern=r"^buypremium$"))
     app.add_handler(CallbackQueryHandler(support_button, pattern=r"^sup:(a:\d+|c)$"))
-    app.add_handler(CallbackQueryHandler(playgame_button, pattern=r"^pgm:(normal|slow|auto|tour|elim|hack|jackpot)$"))
+    app.add_handler(CallbackQueryHandler(playgame_button, pattern=r"^pgm:(normal|slow|auto|tour|elim|hack|jackpot|anagram)$"))
     app.add_handler(CallbackQueryHandler(premium_features_button, pattern=r"^pf:(show|back:\d+)$"))
     app.add_handler(CallbackQueryHandler(buydollar_button, pattern=r"^bd:\d+:\d+:\d+:\d+(:[crl])?$"))
     app.add_handler(CallbackQueryHandler(transfer_button, pattern=r"^tf:[yn]:[0-9a-f]+$"))
